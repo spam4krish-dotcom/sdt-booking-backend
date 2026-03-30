@@ -1,61 +1,40 @@
-const http = require(‘http’);
-const https = require(‘https’);
-const url = require(‘url’);
+var http = require(‘http’);
+var https = require(‘https’);
+var url = require(‘url’);
 
-// ── Config (set these as Railway environment variables) ──
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || ‘’;
-const GOOGLE_KEY    = process.env.GOOGLE_MAPS_API_KEY || ‘’;
-const NOOKAL_KEY    = process.env.NOOKAL_API_KEY || ‘’;
-const PORT          = process.env.PORT || 3000;
+var ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || ‘’;
+var GOOGLE_KEY = process.env.GOOGLE_MAPS_API_KEY || ‘’;
+var NOOKAL_KEY = process.env.NOOKAL_API_KEY || ‘’;
+var PORT = process.env.PORT || 3000;
 
-// ── CORS headers ──
-function cors(res) {
+function setCors(res) {
 res.setHeader(‘Access-Control-Allow-Origin’, ‘*’);
 res.setHeader(‘Access-Control-Allow-Methods’, ‘GET, POST, OPTIONS’);
 res.setHeader(‘Access-Control-Allow-Headers’, ‘Content-Type’);
 }
 
-// ── Simple HTTPS request helper ──
-function httpsPost(hostname, path, headers, body) {
+function httpsRequest(method, hostname, path, headers, body) {
 return new Promise(function(resolve, reject) {
-var data = JSON.stringify(body);
-var opts = {
-hostname: hostname,
-path: path,
-method: ‘POST’,
-headers: Object.assign({ ‘Content-Type’: ‘application/json’, ‘Content-Length’: Buffer.byteLength(data) }, headers)
-};
+var data = body ? JSON.stringify(body) : ‘’;
+var opts = { hostname: hostname, path: path, method: method, headers: headers };
+if (data) {
+opts.headers[‘Content-Type’] = ‘application/json’;
+opts.headers[‘Content-Length’] = Buffer.byteLength(data);
+}
 var req = https.request(opts, function(res) {
 var chunks = [];
 res.on(‘data’, function(c) { chunks.push(c); });
 res.on(‘end’, function() {
 try { resolve({ status: res.statusCode, body: JSON.parse(Buffer.concat(chunks).toString()) }); }
-catch(e) { reject(new Error(‘JSON parse error’)); }
+catch(e) { resolve({ status: res.statusCode, body: {} }); }
 });
 });
 req.on(‘error’, reject);
-req.write(data);
+if (data) req.write(data);
 req.end();
 });
 }
 
-function httpsGet(hostname, path, headers) {
-return new Promise(function(resolve, reject) {
-var opts = { hostname: hostname, path: path, method: ‘GET’, headers: headers || {} };
-var req = https.request(opts, function(res) {
-var chunks = [];
-res.on(‘data’, function(c) { chunks.push(c); });
-res.on(‘end’, function() {
-try { resolve({ status: res.statusCode, body: JSON.parse(Buffer.concat(chunks).toString()) }); }
-catch(e) { reject(new Error(‘JSON parse error’)); }
-});
-});
-req.on(‘error’, reject);
-req.end();
-});
-}
-
-// ── Read request body ──
 function readBody(req) {
 return new Promise(function(resolve, reject) {
 var chunks = [];
@@ -68,166 +47,125 @@ req.on(‘error’, reject);
 });
 }
 
-// ── Fetch Nookal diaries for all instructors ──
-async function getNookalDiaries() {
-var instructors = [‘Christian Lagos’, ‘Gabriel Lagos’, ‘Greg Ekkel’, ‘Jason Simmonds’, ‘Marc Seow’, ‘Sherri Simmonds’, ‘Yves Salzmann’];
-var today = new Date();
-var from = today.toISOString().split(‘T’)[0];
-var to = new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString().split(‘T’)[0];
-
-var results = {};
-for (var i = 0; i < instructors.length; i++) {
-try {
-var name = instructors[i];
-var path = ‘/api/v1/appointments?from=’ + from + ‘&to=’ + to + ‘&provider=’ + encodeURIComponent(name);
-var r = await httpsGet(‘app.nookal.com’, path, { ‘X-API-Key’: NOOKAL_KEY });
-results[name] = r.body;
-} catch(e) {
-results[instructors[i]] = { error: e.message };
-}
-}
-return results;
-}
-
-// ── Get drive time between two addresses ──
-async function getDriveTime(origin, destination) {
-try {
+function getDriveTime(origin, destination) {
 var path = ‘/maps/api/distancematrix/json?origins=’ +
 encodeURIComponent(origin + ‘, VIC, Australia’) +
 ‘&destinations=’ + encodeURIComponent(destination + ‘, VIC, Australia’) +
 ‘&mode=driving&key=’ + GOOGLE_KEY;
-var r = await httpsGet(‘maps.googleapis.com’, path, {});
-if (r.body.rows && r.body.rows[0] && r.body.rows[0].elements && r.body.rows[0].elements[0].status === ‘OK’) {
-return {
-duration: r.body.rows[0].elements[0].duration.text,
-durationSeconds: r.body.rows[0].elements[0].duration.value,
-distance: r.body.rows[0].elements[0].distance.text
-};
-}
+return httpsRequest(‘GET’, ‘maps.googleapis.com’, path, {}, null).then(function(r) {
+try {
+var el = r.body.rows[0].elements[0];
+if (el.status === ‘OK’) return { duration: el.duration.text, distance: el.distance.text };
+} catch(e) {}
 return null;
-} catch(e) {
-return null;
-}
+}).catch(function() { return null; });
 }
 
-// ── Ask Claude for recommendation ──
-async function getRecommendation(bookingData, diaryData, driveTimes) {
-var prompt = [
-‘You are a scheduling assistant for Specialised Driver Training (SDT), Melbourne. All clients are in Victoria, Australia.’,
-‘’,
-‘INSTRUCTOR ROSTER (with vehicle modifications):’,
-JSON.stringify(bookingData.instructors, null, 2),
-‘’,
-‘LIVE DIARY DATA FROM NOOKAL (next 30 days):’,
-JSON.stringify(diaryData, null, 2),
-‘’,
-‘DRIVE TIME DATA FROM GOOGLE MAPS:’,
-JSON.stringify(driveTimes, null, 2),
-‘’,
-‘NEW BOOKING REQUEST:’,
-’Client: ’ + bookingData.clientName,
-’Address: ’ + bookingData.clientAddress + ‘, VIC Australia’,
-’Service type: ’ + bookingData.serviceType,
-’Funding: ’ + bookingData.funding,
-’Referral: ’ + bookingData.referral,
-’Availability: ’ + bookingData.availability,
-’Duration: ’ + bookingData.duration,
-’Modifications required: ’ + bookingData.modifications,
-’Instructor preference: ’ + (bookingData.instructorPref || ‘None’),
-’Gender preference: ’ + (bookingData.genderPref || ‘None’),
-‘Pickup/lesson location: ’ + (bookingData.pickupLocation || ‘Client home’),
-‘Notes: ’ + (bookingData.notes || ‘None’),
-‘’,
-‘RULES:’,
-‘1. MODS FIRST - disqualify instructor if they lack a required modification’,
-‘2. ZONE - match instructor working area to client suburb’,
-‘3. ROUTING - use the Google Maps drive times to assess whether the new booking fits geographically into the instructor existing day without creating excessive dead runs’,
-‘4. Check diary for conflicts on the requested availability days/times’,
-‘5. Sherri has NO adaptive mods - standard lessons only’,
-‘6. Jason has ONLY left foot accelerator and standard spinner knob’,
-‘7. Christians Tuesdays often have Community OT Brunswick blocks’,
-‘’,
-‘Please respond with:’,
-‘1. RECOMMENDED INSTRUCTOR - name and clear justification’,
-‘2. GEOGRAPHIC ROUTING - how this fits their existing day with actual drive times’,
-‘3. SUGGESTED TIME SLOT - specific day and time based on diary gaps’,
-‘4. BACKUP OPTIONS - 1-2 alternatives’,
-‘5. FLAGS - anything to resolve before confirming’,
-‘6. NOOKAL BOOKING NOTE - ready-to-paste note in SDT style’
-].join(’\n’);
+function getNookalDiary() {
+var today = new Date();
+var from = today.toISOString().split(‘T’)[0];
+var future = new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000);
+var to = future.toISOString().split(‘T’)[0];
+var path = ‘/api/v1/appointments?from=’ + from + ‘&to=’ + to;
+return httpsRequest(‘GET’, ‘app.nookal.com’, path, { ‘X-API-Key’: NOOKAL_KEY }, null)
+.then(function(r) { return r.body; })
+.catch(function(e) { return { error: e.message }; });
+}
 
-var r = await httpsPost(‘api.anthropic.com’, ‘/v1/messages’,
-{ ‘x-api-key’: ANTHROPIC_KEY, ‘anthropic-version’: ‘2023-06-01’ },
-{ model: ‘claude-sonnet-4-20250514’, max_tokens: 1500, messages: [{ role: ‘user’, content: prompt }] }
-);
+function getRecommendation(booking, diary, driveTimes) {
+var prompt = ‘You are a scheduling assistant for Specialised Driver Training (SDT) in Melbourne, Victoria, Australia. Recommend the best instructor for this new booking.\n\n’
++ ‘INSTRUCTOR ROSTER:\n’ + JSON.stringify(booking.instructors, null, 2) + ‘\n\n’
++ ‘LIVE NOOKAL DIARY (next 30 days):\n’ + JSON.stringify(diary, null, 2) + ‘\n\n’
++ ‘GOOGLE MAPS DRIVE TIMES FROM CLIENT TO INSTRUCTOR BASES:\n’ + JSON.stringify(driveTimes, null, 2) + ‘\n\n’
++ ‘NEW BOOKING:\n’
++ ’Client: ’ + booking.clientName + ‘\n’
++ ’Address: ’ + booking.clientAddress + ‘, VIC Australia\n’
++ ’DOB: ’ + (booking.clientDOB || ‘Not provided’) + ‘\n’
++ ’Phone: ’ + (booking.clientPhone || ‘Not provided’) + ‘\n’
++ ’Email: ’ + (booking.clientEmail || ‘Not provided’) + ‘\n’
++ ’Service: ’ + booking.serviceType + ‘\n’
++ ’Funding: ’ + booking.funding + ‘\n’
++ ’Referral: ’ + booking.referral + ‘\n’
++ ’Availability: ’ + booking.availability + ‘\n’
++ ’Duration: ’ + booking.duration + ‘\n’
++ ’Pickup location: ’ + (booking.pickupLocation || ‘Client home’) + ‘\n’
++ ’Modifications: ’ + booking.modifications + ‘\n’
++ ’Instructor preference: ’ + (booking.instructorPref || ‘None’) + ‘\n’
++ ’Gender preference: ’ + (booking.genderPref || ‘None’) + ‘\n’
++ ’Notes: ’ + (booking.notes || ‘None’) + ‘\n\n’
++ ‘RULES:\n’
++ ‘1. MODS FIRST - disqualify if instructor lacks required mod\n’
++ ‘2. ZONE - match instructor area to client suburb\n’
++ ‘3. ROUTING - use drive times to check geographic fit, avoid dead runs\n’
++ ‘4. Check diary for conflicts\n’
++ ‘5. Sherri has NO adaptive mods - standard lessons only\n’
++ ‘6. Jason has ONLY left foot accelerator and standard spinner knob\n’
++ ‘7. Christians Tuesdays often have Community OT Brunswick blocks\n\n’
++ ‘Respond with:\n’
++ ‘1. RECOMMENDED INSTRUCTOR - name and justification\n’
++ ‘2. GEOGRAPHIC ROUTING - how this fits their day with drive times\n’
++ ‘3. SUGGESTED TIME SLOT - specific day and time based on diary\n’
++ ‘4. BACKUP OPTIONS - 1-2 alternatives\n’
++ ‘5. FLAGS - anything to resolve before confirming\n’
++ ‘6. NOOKAL BOOKING NOTE - ready-to-paste in SDT style’;
 
-if (r.status !== 200) throw new Error(’Anthropic error: ’ + JSON.stringify(r.body));
+return httpsRequest(‘POST’, ‘api.anthropic.com’, ‘/v1/messages’, {
+‘x-api-key’: ANTHROPIC_KEY,
+‘anthropic-version’: ‘2023-06-01’
+}, { model: ‘claude-sonnet-4-20250514’, max_tokens: 1500, messages: [{ role: ‘user’, content: prompt }] })
+.then(function(r) {
+if (r.status !== 200) throw new Error(’Anthropic error ’ + r.status + ’: ’ + JSON.stringify(r.body));
 var text = ‘’;
-if (r.body.content && r.body.content.length) {
-for (var i = 0; i < r.body.content.length; i++) {
-if (r.body.content[i].type === ‘text’) text += r.body.content[i].text;
+var content = r.body.content || [];
+for (var i = 0; i < content.length; i++) {
+if (content[i].type === ‘text’) text += content[i].text;
 }
-}
-return text;
+return text || ‘No response received.’;
+});
 }
 
-// ── HTTP server ──
-var server = http.createServer(async function(req, res) {
-cors(res);
-
+var server = http.createServer(function(req, res) {
+setCors(res);
 if (req.method === ‘OPTIONS’) { res.writeHead(204); res.end(); return; }
 
 var parsed = url.parse(req.url, true);
 
-// Health check
 if (parsed.pathname === ‘/health’) {
 res.writeHead(200, { ‘Content-Type’: ‘application/json’ });
-res.end(JSON.stringify({ status: ‘ok’, message: ‘SDT Booking Assistant backend running’ }));
+res.end(JSON.stringify({ status: ‘ok’, message: ‘SDT Booking Assistant running’ }));
 return;
 }
 
-// Main analyse endpoint
 if (parsed.pathname === ‘/analyse’ && req.method === ‘POST’) {
-try {
-var bookingData = await readBody(req);
-
-```
-  // Fetch diary data from Nookal
-  var diaryData;
-  try { diaryData = await getNookalDiaries(); }
-  catch(e) { diaryData = { error: 'Could not fetch Nookal data: ' + e.message }; }
-
-  // Get drive times from client address to each instructor base
-  var driveTimes = {};
-  var bases = {
-    'Christian': 'Montmorency',
-    'Gabriel': 'Croydon North',
-    'Greg': 'Kilsyth',
-    'Jason': 'Wandin North',
-    'Marc': 'Werribee',
-    'Sherri': 'Wandin North',
-    'Yves': 'Rye'
-  };
-  var names = Object.keys(bases);
-  for (var i = 0; i < names.length; i++) {
-    var name = names[i];
-    var dt = await getDriveTime(bookingData.clientAddress, bases[name]);
-    if (dt) driveTimes[name + ' (from client to instructor base)'] = dt;
-  }
-
-  // Get recommendation from Claude
-  var recommendation = await getRecommendation(bookingData, diaryData, driveTimes);
-
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ success: true, recommendation: recommendation, driveTimes: driveTimes }));
-
-} catch(e) {
-  res.writeHead(500, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ success: false, error: e.message }));
-}
+readBody(req).then(function(booking) {
+var bases = {
+‘Christian’: ‘Montmorency VIC’,
+‘Gabriel’: ‘Croydon North VIC’,
+‘Greg’: ‘Kilsyth VIC’,
+‘Jason’: ‘Wandin North VIC’,
+‘Marc’: ‘Werribee VIC’,
+‘Sherri’: ‘Wandin North VIC’,
+‘Yves’: ‘Rye VIC’
+};
+var driveTimes = {};
+var names = Object.keys(bases);
+var drivePromises = names.map(function(name) {
+return getDriveTime(booking.clientAddress, bases[name]).then(function(dt) {
+if (dt) driveTimes[name] = dt;
+});
+});
+return Promise.all(drivePromises)
+.then(function() { return getNookalDiary(); })
+.then(function(diary) { return getRecommendation(booking, diary, driveTimes); })
+.then(function(recommendation) {
+res.writeHead(200, { ‘Content-Type’: ‘application/json’ });
+res.end(JSON.stringify({ success: true, recommendation: recommendation, driveTimes: driveTimes }));
+});
+}).catch(function(e) {
+res.writeHead(500, { ‘Content-Type’: ‘application/json’ });
+res.end(JSON.stringify({ success: false, error: e.message }));
+});
 return;
-```
-
 }
 
 res.writeHead(404, { ‘Content-Type’: ‘application/json’ });
