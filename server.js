@@ -15,8 +15,8 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", message: "SDT running" });
 });
 
-// Get Nookal v3.0 access token using Basic Auth
-async function getNookalToken() {
+// Fetch Nookal appointments directly using Basic Auth
+async function getNookalDiary() {
   const clientId = process.env.NOOKAL_CLIENT_ID;
   const basickey = process.env.NOOKAL_BASIC_KEY;
 
@@ -27,27 +27,6 @@ async function getNookalToken() {
   // Basic auth base64 (clientId:basickey)
   const credentials = Buffer.from(clientId + ":" + basickey).toString("base64");
 
-  // FIXED TYPO: Changed 'auzonel' to 'auzone1'
-  const response = await fetch("https://auzone1.nookal.com/api/v3.0/token", {
-    method: "POST",
-    headers: {
-      "Authorization": "Basic " + credentials,
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
-    body: "grant_type=client_credentials"
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error("Nookal token error " + response.status + ": " + text.substring(0, 200));
-  }
-
-  const data = await response.json();
-  return data.access_token;
-}
-
-// Fetch appointments using GraphQL
-async function getNookalDiary(token) {
   const today = new Date();
   const from = today.toISOString().split("T")[0];
   const future = new Date(today.getTime() + (30 * 24 * 60 * 60 * 1000));
@@ -59,11 +38,10 @@ async function getNookalDiary(token) {
     }
   `;
 
-  // FIXED TYPO: Changed 'auzonel' to 'auzone1'
   const response = await fetch("https://auzone1.nookal.com/api/v3.0/graphql", {
     method: "POST",
     headers: {
-      "Authorization": "Bearer " + token,
+      "Authorization": "Basic " + credentials,
       "Content-Type": "application/json"
     },
     body: JSON.stringify({ query: query })
@@ -116,16 +94,16 @@ app.post("/analyse", async (req, res) => {
     }
 
     const booking = req.body;
-    const clientAddress = booking.clientAddress || "";
+    
+    // MATCHING HTML FIELDS: Looking for 'suburb' first, then falling back
+    const clientAddress = booking.suburb || booking.clientAddress || "";
 
-    // 1. Get Nookal token and fetch diary
+    // 1. Fetch Nookal diary directly
     let diary = null;
     let nookalStatus = "";
     try {
-      console.log("Getting Nookal token...");
-      const token = await getNookalToken();
-      console.log("Got token, fetching diary...");
-      diary = await getNookalDiary(token);
+      console.log("Fetching Nookal diary...");
+      diary = await getNookalDiary();
       const apptCount = diary?.data?.appointments?.data?.length || 0;
       nookalStatus = "OK " + apptCount + " appointments fetched";
       console.log("Nookal:", nookalStatus);
@@ -203,17 +181,13 @@ RULES (apply in this order):
 4. Be specific - name actual dates and times based on real diary gaps, not vague suggestions.`;
 
     const userMessage = `NEW BOOKING:
-Client: ${booking.clientName}
-Address: ${booking.clientAddress}
-DOB: ${booking.clientDOB || "Not provided"}
-Phone: ${booking.clientPhone || "Not provided"}
-Service: ${booking.serviceType}
-Funding: ${booking.funding}
-Referral: ${booking.referral}
-Availability: ${booking.availability}
-Duration: ${booking.duration}
-Pickup location: ${booking.pickupLocation || "Client home"}
-Modifications required: ${booking.modifications}
+Client: ${booking.clientName || "Not provided"}
+Address: ${clientAddress || "Not provided"}
+Service: ${booking.serviceType || "Standard Driver Training"}
+Funding: ${booking.funding || "Not provided"}
+Availability: ${booking.availability || "Not provided"}
+Duration: ${booking.duration || "Not provided"}
+Modifications required: ${booking.modifications || "None"}
 Mod notes: ${booking.modNotes || "None"}
 Instructor preference: ${booking.instructorPreference || "None"}
 Gender preference: ${booking.genderPreference || "None"}
@@ -241,7 +215,7 @@ Provide:
         "content-type": "application/json"
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-20250514", 
+        model: "claude-3-5-sonnet-latest", 
         max_tokens: 1500,
         system: systemPrompt,
         messages: [{ role: "user", content: userMessage }]
