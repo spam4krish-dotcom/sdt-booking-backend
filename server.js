@@ -7,7 +7,6 @@ const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
-[span_6](start_span)// 1. Root & Health Routes[span_6](end_span)
 app.get("/", (req, res) => {
   res.json({ status: "ok", message: "SDT Booking Assistant backend is live" });
 });
@@ -16,42 +15,55 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", message: "SDT running" });
 });
 
-[span_7](start_span)[span_8](start_span)// 2. Nookal GraphQL Fetcher[span_7](end_span)[span_8](end_span)
-async function getNookalDiary() {
+// Get Nookal v3.0 access token using Basic Auth
+async function getNookalToken() {
   const clientId = process.env.NOOKAL_CLIENT_ID;
   const basickey = process.env.NOOKAL_BASIC_KEY;
 
   if (!clientId || !basickey) {
-    throw new Error("Missing NOOKAL CLIENT ID or NOOKAL BASIC KEY");
+    throw new Error("Missing NOOKAL_CLIENT_ID or NOOKAL_BASIC_KEY");
   }
 
+  // Basic auth base64 (clientId:basickey)
   const credentials = Buffer.from(clientId + ":" + basickey).toString("base64");
+
+  // FIXED TYPO: Changed 'auzonel' to 'auzone1'
+  const response = await fetch("https://auzone1.nookal.com/api/v3.0/token", {
+    method: "POST",
+    headers: {
+      "Authorization": "Basic " + credentials,
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: "grant_type=client_credentials"
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error("Nookal token error " + response.status + ": " + text.substring(0, 200));
+  }
+
+  const data = await response.json();
+  return data.access_token;
+}
+
+// Fetch appointments using GraphQL
+async function getNookalDiary(token) {
   const today = new Date();
   const from = today.toISOString().split("T")[0];
   const future = new Date(today.getTime() + (30 * 24 * 60 * 60 * 1000));
   const to = future.toISOString().split("T")[0];
 
-  [span_9](start_span)// Defining the GraphQL query as a clean string[span_9](end_span)
   const query = `
     query {
-      appointments(filters: { dateFrom: "${from}", dateTo: "${to}" }, pagination: { data: { 
-        id: true, 
-        date: true, 
-        startTime: true, 
-        endTime: true, 
-        status: true, 
-        practitioner: { firstName: true, lastName: true }, 
-        client: { firstName: true, lastName: true }, 
-        location: { name: true }, 
-        service: { name: true } 
-      } })
+      appointments(filters: { dateFrom: "${from}", dateTo: "${to}" }, pagination: { data: { id: true, date: true, startTime: true, endTime: true, status: true, practitioner: { firstName: true, lastName: true }, client: { firstName: true, lastName: true }, location: { name: true }, service: { name: true } } })
     }
   `;
 
+  // FIXED TYPO: Changed 'auzonel' to 'auzone1'
   const response = await fetch("https://auzone1.nookal.com/api/v3.0/graphql", {
     method: "POST",
     headers: {
-      "Authorization": "Basic " + credentials,
+      "Authorization": "Bearer " + token,
       "Content-Type": "application/json"
     },
     body: JSON.stringify({ query: query })
@@ -59,7 +71,7 @@ async function getNookalDiary() {
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error("Nookal GraphQL error " + response.status + ": " + text.substring(0, 100));
+    throw new Error("Nookal GraphQL error " + response.status + ": " + text.substring(0, 200));
   }
 
   const data = await response.json();
@@ -70,11 +82,11 @@ async function getNookalDiary() {
   return data;
 }
 
-[span_10](start_span)// 3. Google Maps Drive Time Fetcher[span_10](end_span)
+// Get drive time from Google Maps
 async function getDriveTime(origin, destination) {
   try {
     const key = process.env.GOOGLE_MAPS_API_KEY;
-    const url = "https://maps.googleapis.com/maps/api/distancematrix/json?origins=" + 
+    const url = "https://maps.googleapis.com/maps/api/distancematrix/json?origins=" +
       encodeURIComponent(origin + ", VIC, Australia") +
       "&destinations=" + encodeURIComponent(destination + ", VIC, Australia") +
       "&mode=driving&key=" + key;
@@ -96,7 +108,6 @@ async function getDriveTime(origin, destination) {
   }
 }
 
-[span_11](start_span)[span_12](start_span)// 4. Main Analysis Route[span_11](end_span)[span_12](end_span)
 app.post("/analyse", async (req, res) => {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -107,18 +118,23 @@ app.post("/analyse", async (req, res) => {
     const booking = req.body;
     const clientAddress = booking.clientAddress || "";
 
-    [span_13](start_span)// A. Fetch Nookal diary[span_13](end_span)
+    // 1. Get Nookal token and fetch diary
     let diary = null;
     let nookalStatus = "";
     try {
-      diary = await getNookalDiary();
+      console.log("Getting Nookal token...");
+      const token = await getNookalToken();
+      console.log("Got token, fetching diary...");
+      diary = await getNookalDiary(token);
       const apptCount = diary?.data?.appointments?.data?.length || 0;
       nookalStatus = "OK " + apptCount + " appointments fetched";
+      console.log("Nookal:", nookalStatus);
     } catch (err) {
       nookalStatus = "ERROR: " + err.message;
+      console.error("Nookal failed:", err.message);
     }
 
-    [span_14](start_span)[span_15](start_span)// B. Get Google Maps drive times[span_14](end_span)[span_15](end_span)
+    // 2. Get Google Maps drive times
     const instructorBases = {
       "Christian": "Montmorency VIC",
       "Gabriel": "Croydon North VIC",
@@ -135,49 +151,87 @@ app.post("/analyse", async (req, res) => {
       if (dt) driveTimes[name] = dt;
     }
 
-    [span_16](start_span)// C. Format diary data for the AI[span_16](end_span)
+    // 3. Format diary for Claude
     let diaryText = "";
     if (diary && diary.data && diary.data.appointments && diary.data.appointments.data) {
       const appts = diary.data.appointments.data;
-      const byPractitioner = {};
 
+      // Group by practitioner and date
+      const byPractitioner = {};
       appts.forEach(a => {
         const name = (a.practitioner?.firstName || "") + " " + (a.practitioner?.lastName || "");
-        if (!byPractitioner[name]) byPractitioner[name] = [];
-        byPractitioner[name].push({
+        const trimmedName = name.trim();
+        if (!byPractitioner[trimmedName]) byPractitioner[trimmedName] = [];
+        byPractitioner[trimmedName].push({
           date: a.date,
           start: a.startTime,
           end: a.endTime,
+          client: (a.client?.firstName || "") + " " + (a.client?.lastName || ""),
           location: a.location?.name || "",
-          service: a.service?.name || ""
+          service: a.service?.name || "",
+          status: a.status
         });
       });
+
+      // Sort each practitioner's appointments by date/time
+      Object.keys(byPractitioner).forEach(name => {
+        byPractitioner[name].sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start));
+      });
+
       diaryText = JSON.stringify(byPractitioner, null, 2);
     } else {
-      diaryText = "UNAVAILABLE: " + nookalStatus;
+      diaryText = "UNAVAILABLE " + nookalStatus;
     }
 
-    [span_17](start_span)[span_18](start_span)// D. Anthropic System Prompt[span_17](end_span)[span_18](end_span)
-    const systemPrompt = `You are the SDT Booking Assistant. Use REAL live diary data and drive times.
-    
-    INSTRUCTOR ROSTER:
-    Christian Lagos (Montmorency): Comprehensive mods.
-    Gabriel Lagos (Croydon North): Comprehensive mods.
-    Greg Ekkel (Kilsyth): LFA, Indicator, Spinner.
-    Jason Simmonds (Wandin North): LFA, Spinner only.
-    Marc Seow (Werribee): LFA, Indicator, Extensions.
-    Sherri Simmonds (Wandin North): NO adaptive mods.
-    Yves Salzmann (Rye): LFA, Indicator, Spinner.`;
+    // 4. Build prompt with real data
+    const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training in Melbourne, Victoria, Australia.
+You have REAL live diary data from Nookal and REAL drive times from Google Maps.
 
-    const userMessage = `NEW BOOKING REQUEST:
-    Client: ${booking.clientName}
-    Address: ${clientAddress}
-    Availability: ${booking.availability}
-    Mods Needed: ${booking.modifications}
-    
-    DRIVE TIMES (To Base): ${JSON.stringify(driveTimes)}
-    
-    LIVE DIARY DATA: ${diaryText}`;
+INSTRUCTOR ROSTER AND VEHICLE MODIFICATIONS:
+- Christian Lagos (base: Montmorency) Most comprehensive mods: Fadiel FSK2005, satellite accelerator, e-radial, Easy Drive LHS, all steering aids, left foot accelerator, extension pedals.
+- Gabriel Lagos (base: Croydon North) Most comprehensive mods: Fadiel FSK2005, satellite accelerator, e-radial, over-ring accelerator, Monarch hand controls, all steering aids, left foot accelerator. Prefers East Melbourne. ON HOLIDAY 25-30 Apr 2026.
+- Greg Ekkel (base: Kilsyth) Left foot accelerator, indicator extension, lollipop grip, steering ball.
+- Jason Simmonds (base: Wandin North) ONLY left foot accelerator and standard spinner knob.
+- Marc Seow (base: Werribee) Left foot accelerator, indicator extension, extension pedals, lollipop grip, steering ball.
+- Sherri Simmonds (base: Wandin North) NO adaptive mods whatsoever. Standard lessons only.
+- Yves Salzmann (base: Rye) Left foot accelerator, indicator extension, lollipop grip, steering ball.
+
+RULES (apply in this order):
+1. MODS FIRST Disqualify any instructor who does not have the required modifications.
+2. ZONE Match instructor working area to client suburb
+3. ROUTING Look at the actual diary. Find where the instructor is on each day and check drive times.
+4. Be specific - name actual dates and times based on real diary gaps, not vague suggestions.`;
+
+    const userMessage = `NEW BOOKING:
+Client: ${booking.clientName}
+Address: ${booking.clientAddress}
+DOB: ${booking.clientDOB || "Not provided"}
+Phone: ${booking.clientPhone || "Not provided"}
+Service: ${booking.serviceType}
+Funding: ${booking.funding}
+Referral: ${booking.referral}
+Availability: ${booking.availability}
+Duration: ${booking.duration}
+Pickup location: ${booking.pickupLocation || "Client home"}
+Modifications required: ${booking.modifications}
+Mod notes: ${booking.modNotes || "None"}
+Instructor preference: ${booking.instructorPreference || "None"}
+Gender preference: ${booking.genderPreference || "None"}
+Notes: ${booking.schedulingNotes || ""} ${booking.otherNotes || ""}
+
+GOOGLE MAPS DRIVE TIMES (client to instructor home base):
+${Object.entries(driveTimes).map(([k, v]) => k + ": " + v.duration + "/" + v.distance).join("\n")}
+
+LIVE NOOKAL DIARY (grouped by instructor, next 30 days):
+${diaryText}
+
+Provide:
+1. RECOMMENDED INSTRUCTOR - name and justification based on actual mods, actual drive times, and actual diary availability
+2. GEOGRAPHIC ROUTING - using real Google Maps times and real diary locations
+3. SUGGESTED TIME SLOT - specific date and time based on actual diary gaps
+4. BACKUP OPTIONS - 1-2 alternatives with real reasoning
+5. FLAGS - anything to resolve before confirming
+6. NOOKAL BOOKING NOTE - ready-to-paste in SDT style`;
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -187,7 +241,7 @@ app.post("/analyse", async (req, res) => {
         "content-type": "application/json"
       },
       body: JSON.stringify({
-        [span_19](start_span)model: "claude-3-5-sonnet-latest", // Updated to a stable, current model ID[span_19](end_span)
+        model: "claude-3-5-sonnet-latest", 
         max_tokens: 1500,
         system: systemPrompt,
         messages: [{ role: "user", content: userMessage }]
@@ -195,16 +249,27 @@ app.post("/analyse", async (req, res) => {
     });
 
     const data = await response.json();
-    if (!response.ok) return res.status(response.status).json({ error: data.error?.message || "AI Error" });
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: data.error?.message || "AI Error" });
+    }
 
     res.json({
       ...data,
-      debug: { nookal: nookalStatus, driveTimes: Object.keys(driveTimes).length }
+      _debug: {
+        nookal: nookalStatus,
+        driveTimes: Object.keys(driveTimes).length + " of 7 instructors"
+      }
     });
 
   } catch (error) {
+    console.error("Server error:", error);
     res.status(500).json({ error: "Internal server error: " + error.message });
   }
+});
+
+app.use((req, res) => {
+  res.status(404).json({ error: "Route not found" });
 });
 
 app.listen(PORT, () => {
