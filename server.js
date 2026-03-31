@@ -7,12 +7,9 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Health check for Railway
+// Health check
 app.get("/health", (req, res) => {
-  res.json({
-    "status": "ok",
-    "message": "SDT running"
-  });
+  res.json({ "status": "ok", "message": "SDT running" });
 });
 
 app.post("/analyse", async (req, res) => {
@@ -20,13 +17,10 @@ app.post("/analyse", async (req, res) => {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     
     if (!apiKey) {
-      return res.status(500).json({
-        "error": "Missing ANTHROPIC_API_KEY environment variable"
-      });
+      return res.status(500).json({ "error": "Missing ANTHROPIC_API_KEY in Railway Variables" });
     }
 
-    // This is the "AI Brain" logic you requested
-    const systemPrompt = "You are the SDT Booking Assistant for Specialised Driver Training in Melbourne. Your job is to analyze client needs (vehicle mods like hand controls/foot accelerators), instructor equipment, and Melbourne geography. Recommend the best instructor, provide a routing rationale based on drive times, suggest a time slot, and provide a professional booking note for the Nookal system.";
+    const systemPrompt = "You are the SDT Booking Assistant. Analyze the provided client and instructor data to suggest the best match for Specialised Driver Training in Melbourne. Provide a routing rationale and a Nookal booking note.";
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       "method": "POST",
@@ -36,13 +30,13 @@ app.post("/analyse", async (req, res) => {
         "content-type": "application/json"
       },
       "body": JSON.stringify({
-        "model": "claude-sonnet-4-20250514",
+        "model": "claude-3-5-sonnet-20240620", // Use this known stable model ID
         "max_tokens": 1500,
         "system": systemPrompt,
         "messages": [
           {
             "role": "user",
-            "content": JSON.stringify(req.body)
+            "content": "Analyze this booking data: " + JSON.stringify(req.body)
           }
         ]
       })
@@ -51,21 +45,23 @@ app.post("/analyse", async (req, res) => {
     const data = await response.json();
     
     if (!response.ok) {
-      return res.status(response.status).json(data);
+      // This part prevents the [object Object] error by sending back a clear string
+      const errorMessage = data.error?.message || JSON.stringify(data.error) || "Unknown Anthropic Error";
+      return res.status(response.status).json({ "error": errorMessage });
     }
 
-    // Extract just the AI's text response for the frontend
     res.json(data);
   } catch (error) {
-    console.error("Server Error:", error);
-    res.status(500).json({
-      "error": "Internal server error",
-      "details": error.message
-    });
+    console.error("Server Crash:", error);
+    res.status(500).json({ "error": "Internal Server Error: " + error.message });
   }
 });
 
-// Handle 404s
+// Root route to prevent the "Route not found" confusion
+app.get("/", (req, res) => {
+  res.send("SDT Backend is Live. Use /health or /analyse.");
+});
+
 app.use((req, res) => {
   res.status(404).json({ "error": "Route not found" });
 });
