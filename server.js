@@ -2,36 +2,52 @@ const express = require("express");
 const cors = require("cors");
 
 const app = express();
-// Railway uses 8080 by default, but we'll accept whatever they provide
 const PORT = process.env.PORT || 8080;
 
 app.use(cors());
 app.use(express.json());
 
-// 1. Root Route - Check if the server is alive
 app.get("/", (req, res) => {
-  res.send("SDT Backend is Live. If you see this, the server is running correctly.");
+  res.json({ status: "ok", message: "SDT Booking Assistant backend is live" });
 });
 
-// 2. Health Check Route
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", message: "SDT Server is healthy" });
+  res.json({ status: "ok", message: "SDT running" });
 });
 
-// 3. The Main Analysis Route
 app.post("/analyse", async (req, res) => {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
-    
-    // Check if the API key is missing from Railway Variables
     if (!apiKey) {
-      console.error("Error: ANTHROPIC_API_KEY is not set in Railway.");
       return res.status(500).json({ error: "Missing ANTHROPIC_API_KEY in server settings." });
     }
 
-    const systemPrompt = "You are the SDT Booking Assistant. Analyze the provided client data to suggest the best match for Specialised Driver Training. Provide a routing rationale and a Nookal booking note.";
+    const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training in Melbourne, Victoria, Australia.
 
-    // Call Anthropic API
+Your job is to recommend the best instructor for a new client booking based on:
+
+1. MODS FIRST - If a client needs vehicle modifications, the instructor must have those mods in their car. Disqualify any instructor who lacks a required mod.
+2. ZONE - Match the instructor working area to the client suburb.
+3. ROUTING - The new booking should fit geographically into the instructor existing day without creating dead runs between distant locations.
+
+INSTRUCTOR ROSTER:
+
+- Christian (base: Montmorency) - Most comprehensive mods including Fadiel FSK2005, satellite accelerator, e-radial, Easy Drive LHS, all steering aids, left foot accelerator, extension pedals. Covers all areas. Tuesdays often held for Community OT Brunswick.
+- Gabriel (base: Croydon North) - Most comprehensive mods, prefers East Melbourne. ON HOLIDAY 25-30 Apr 2026.
+- Greg (base: Kilsyth) - Left foot accelerator, indicator extension, lollipop grip, steering ball. East and South-East specialist. Regular Frankston Ax days.
+- Jason (base: Wandin North) - ONLY left foot accelerator and standard spinner knob. East and SE to Bayside.
+- Marc (base: Werribee) - Left foot accelerator, indicator extension, extension pedals, lollipop grip, steering ball. West Melbourne specialist.
+- Sherri (base: Wandin North) - NO adaptive mods at all. Standard lessons only. Wandin to Ringwood corridor and Warragul.
+- Yves (base: Rye) - Left foot accelerator, indicator extension, lollipop grip, steering ball. Mornington Peninsula only.
+
+Respond with these 5 sections:
+
+1. RECOMMENDED INSTRUCTOR - Name and clear justification covering mods, zone and routing
+2. GEOGRAPHIC ROUTING - How this booking fits their existing day
+3. SUGGESTED TIME SLOT - Specific recommendation based on availability provided
+4. BACKUP OPTIONS - 1-2 alternatives with brief reasoning
+5. NOOKAL BOOKING NOTE - A ready-to-paste booking note in professional SDT style`;
+
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -41,12 +57,12 @@ app.post("/analyse", async (req, res) => {
       },
       body: JSON.stringify({
         model: "claude-3-5-sonnet-latest",
-        max_tokens: 1024,
+        max_tokens: 1500,
         system: systemPrompt,
         messages: [
           {
             role: "user",
-            content: "Analyze this booking data: " + JSON.stringify(req.body)
+            content: "New booking request:\n" + JSON.stringify(req.body, null, 2)
           }
         ]
       })
@@ -54,25 +70,21 @@ app.post("/analyse", async (req, res) => {
 
     const data = await response.json();
 
-    // If Anthropic sends an error (like credits or model issues)
     if (!response.ok) {
       console.error("Anthropic API Error:", data.error);
-      const errorMsg = data.error?.message || "The AI service is currently unavailable.";
-      return res.status(response.status).json({ error: errorMsg });
+      return res.status(response.status).json({ error: data.error?.message || "AI service error" });
     }
 
-    // Success: Send the AI response back to the website
     res.json(data);
 
   } catch (error) {
-    console.error("Server Crash Error:", error);
-    res.status(500).json({ error: "Internal Server Error: " + error.message });
+    console.error("Server error:", error);
+    res.status(500).json({ error: "Internal server error: " + error.message });
   }
 });
 
-// 4. Handle 404 for any other routes
 app.use((req, res) => {
-  res.status(404).json({ error: "Route not found. Ensure you are posting to /analyse" });
+  res.status(404).json({ error: "Route not found" });
 });
 
 app.listen(PORT, () => {
