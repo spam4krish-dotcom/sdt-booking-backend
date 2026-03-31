@@ -7,51 +7,113 @@ const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
+// 1. Health Check & Root
 app.get("/", (req, res) => {
-  res.json({ status: "ok", message: "SDT Booking Assistant backend is live" });
+  res.json({ status: "ok", message: "SDT Booking Assistant with Nookal & Google Maps is live" });
 });
 
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", message: "SDT running" });
-});
+// 2. Nookal Integration: Fetch Live Appointments
+async function getNookalDiary() {
+  try {
+    const today = new Date();
+    const fromDate = today.toISOString().split("T")[0];
+    const futureDate = new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const toDate = futureDate.toISOString().split("T")[0];
 
+    const url = `https://auzone1.nookal.com/api/v1/appointments?from=${fromDate}&to=${toDate}&length=500`;
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "X-API-Key": process.env.NOOKAL_API_KEY,
+        "Content-Type": "application/json"
+      }
+    });
+
+    if (!response.ok) return { error: "Nookal API unreachable" };
+    return await response.json();
+  } catch (error) {
+    return { error: error.message };
+  }
+}
+
+// 3. Google Maps Integration: Calculate Drive Times
+async function getDriveTimes(clientSuburb, instructorBases) {
+  try {
+    const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+    const origins = [clientSuburb];
+    const destinations = Object.values(instructorBases).join("|");
+
+    const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${encodeURIComponent(origins)}&destinations=${encodeURIComponent(destinations)}&key=${apiKey}`;
+
+    const response = await fetch(url);
+    const data = await response.json();
+    
+    if (data.status !== "OK") return { error: "Google Maps Error: " + data.status };
+    return data;
+  } catch (error) {
+    return { error: error.message };
+  }
+}
+
+// 4. The Main Route
 app.post("/analyse", async (req, res) => {
   try {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      return res.status(500).json({ error: "Missing ANTHROPIC_API_KEY in server settings." });
-    }
+    const anthropicKey = process.env.ANTHROPIC_API_KEY;
+    
+    // Define instructor base locations for Google Maps calculation
+    const instructorBases = {
+      Christian: "Montmorency, VIC",
+      Gabriel: "Croydon North, VIC",
+      Greg: "Kilsyth, VIC",
+      Jason: "Wandin North, VIC",
+      Marc: "Werribee, VIC",
+      Sherri: "Wandin North, VIC",
+      Yves: "Rye, VIC"
+    };
 
-    const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training in Melbourne, Victoria, Australia.
+    // Step A: Fetch Live Data in Parallel
+    const [diary, driveTimes] = await Promise.all([
+      getNookalDiary(),
+      getDriveTimes(req.body.suburb, instructorBases)
+    ]);
 
-Your job is to recommend the best instructor for a new client booking based on:
+    // Step B: Build the AI Message
+    const systemPrompt = `You are the SDT Booking Assistant. 
+    You have access to:
+    1. LIVE NOOKAL DIARY: Actual appointments for the next 30 days.
+    2. LIVE DRIVE TIMES: Real-world travel time from the client to instructor bases.
+    
+    CRITICAL RULES:
+    - Disqualify instructors missing required vehicle modifications.
+    - Prioritize instructors already working near the client's suburb on that day.
+    - Minimize "dead runs" (unpaid travel time).
+    
+    INSTRUCTOR ROSTER & MODS:
+    - Christian: Full Mods (Fadiel, Satellite, etc.). All areas.
+    - Gabriel: Full Mods. East specialist.
+    - Greg: LFA, Spinner, Indicator. East/SE.
+    - Jason: LFA, Spinner only. East/Bayside.
+    - Marc: LFA, Spinner, Extensions. West specialist.
+    - Sherri: NO MODS. Standard lessons only.
+    - Yves: LFA, Spinner, Indicator. Peninsula only.`;
 
-1. MODS FIRST - If a client needs vehicle modifications, the instructor must have those mods in their car. Disqualify any instructor who lacks a required mod.
-2. ZONE - Match the instructor working area to the client suburb.
-3. ROUTING - The new booking should fit geographically into the instructor existing day without creating dead runs between distant locations.
+    const userMessage = `
+    CLIENT REQUEST:
+    ${JSON.stringify(req.body, null, 2)}
 
-INSTRUCTOR ROSTER:
+    LIVE DIARY DATA (Nookal):
+    ${JSON.stringify(diary).substring(0, 5000)} 
 
-- Christian (base: Montmorency) - Most comprehensive mods including Fadiel FSK2005, satellite accelerator, e-radial, Easy Drive LHS, all steering aids, left foot accelerator, extension pedals. Covers all areas. Tuesdays often held for Community OT Brunswick.
-- Gabriel (base: Croydon North) - Most comprehensive mods, prefers East Melbourne. ON HOLIDAY 25-30 Apr 2026.
-- Greg (base: Kilsyth) - Left foot accelerator, indicator extension, lollipop grip, steering ball. East and South-East specialist. Regular Frankston Ax days.
-- Jason (base: Wandin North) - ONLY left foot accelerator and standard spinner knob. East and SE to Bayside.
-- Marc (base: Werribee) - Left foot accelerator, indicator extension, extension pedals, lollipop grip, steering ball. West Melbourne specialist.
-- Sherri (base: Wandin North) - NO adaptive mods at all. Standard lessons only. Wandin to Ringwood corridor and Warragul.
-- Yves (base: Rye) - Left foot accelerator, indicator extension, lollipop grip, steering ball. Mornington Peninsula only.
+    DRIVE TIME ESTIMATES (Google Maps):
+    ${JSON.stringify(driveTimes)}
+    `;
 
-Respond with these 5 sections:
-
-1. RECOMMENDED INSTRUCTOR - Name and clear justification covering mods, zone and routing
-2. GEOGRAPHIC ROUTING - How this booking fits their existing day
-3. SUGGESTED TIME SLOT - Specific recommendation based on availability provided
-4. BACKUP OPTIONS - 1-2 alternatives with brief reasoning
-5. NOOKAL BOOKING NOTE - A ready-to-paste booking note in professional SDT style`;
-
+    // Step C: Call Anthropic
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
-        "x-api-key": apiKey,
+        "x-api-key": anthropicKey,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json"
       },
@@ -59,34 +121,19 @@ Respond with these 5 sections:
         model: "claude-sonnet-4-20250514",
         max_tokens: 1500,
         system: systemPrompt,
-        messages: [
-          {
-            role: "user",
-            content: "New booking request:\n" + JSON.stringify(req.body, null, 2)
-          }
-        ]
+        messages: [{ role: "user", content: userMessage }]
       })
     });
 
     const data = await response.json();
-
-    if (!response.ok) {
-      console.error("Anthropic API Error:", data.error);
-      return res.status(response.status).json({ error: data.error?.message || "AI service error" });
-    }
+    if (!response.ok) return res.status(response.status).json({ error: data.error?.message });
 
     res.json(data);
 
   } catch (error) {
-    console.error("Server error:", error);
-    res.status(500).json({ error: "Internal server error: " + error.message });
+    console.error("Analysis Error:", error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-app.use((req, res) => {
-  res.status(404).json({ error: "Route not found" });
-});
-
-app.listen(PORT, () => {
-  console.log("SDT Server active on port " + PORT);
-});
+app.listen(PORT, () => { console.log(`SDT Server active on port ${PORT}`); });
