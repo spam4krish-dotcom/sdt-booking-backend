@@ -2,20 +2,20 @@ const express = require("express");
 const cors = require("cors");
 
 const app = express();
-// Railway provides the PORT automatically, 8080 is a safe backup
+// Railway uses 8080 by default, but we'll accept whatever they provide
 const PORT = process.env.PORT || 8080;
 
 app.use(cors());
 app.use(express.json());
 
-// 1. Root Route - Shows when you visit the Railway URL directly
+// 1. Root Route - Check if the server is alive
 app.get("/", (req, res) => {
   res.send("SDT Backend is Live. If you see this, the server is running correctly.");
 });
 
-// 2. Health Check
+// 2. Health Check Route
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", message: "SDT running" });
+  res.json({ status: "ok", message: "SDT Server is healthy" });
 });
 
 // 3. The Main Analysis Route
@@ -23,13 +23,15 @@ app.post("/analyse", async (req, res) => {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     
+    // Check if the API key is missing from Railway Variables
     if (!apiKey) {
-      return res.status(500).json({ error: "Missing ANTHROPIC_API_KEY in Railway Variables" });
+      console.error("Error: ANTHROPIC_API_KEY is not set in Railway.");
+      return res.status(500).json({ error: "Missing ANTHROPIC_API_KEY in server settings." });
     }
 
     const systemPrompt = "You are the SDT Booking Assistant. Analyze the provided client data to suggest the best match for Specialised Driver Training. Provide a routing rationale and a Nookal booking note.";
 
-    // Using the 'Haiku' model which is faster and available immediately upon adding credits
+    // Call Anthropic API
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -38,7 +40,7 @@ app.post("/analyse", async (req, res) => {
         "content-type": "application/json"
       },
       body: JSON.stringify({
-        model: "claude-3-haiku-20240307", 
+        model: "claude-3-5-sonnet-latest",
         max_tokens: 1024,
         system: systemPrompt,
         messages: [
@@ -51,24 +53,26 @@ app.post("/analyse", async (req, res) => {
     });
 
     const data = await response.json();
-    
+
+    // If Anthropic sends an error (like credits or model issues)
     if (!response.ok) {
-      const msg = data.error?.message || JSON.stringify(data.error) || "Anthropic API Error";
-      return res.status(response.status).json({ error: msg });
+      console.error("Anthropic API Error:", data.error);
+      const errorMsg = data.error?.message || "The AI service is currently unavailable.";
+      return res.status(response.status).json({ error: errorMsg });
     }
 
-    // Send the successful AI response back to your website
+    // Success: Send the AI response back to the website
     res.json(data);
 
   } catch (error) {
-    console.error("Server Error:", error);
+    console.error("Server Crash Error:", error);
     res.status(500).json({ error: "Internal Server Error: " + error.message });
   }
 });
 
-// 4. Handle 404s for any other mistyped routes
+// 4. Handle 404 for any other routes
 app.use((req, res) => {
-  res.status(404).send("Route not found. Make sure your website is hitting /analyse");
+  res.status(404).json({ error: "Route not found. Ensure you are posting to /analyse" });
 });
 
 app.listen(PORT, () => {
