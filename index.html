@@ -1,236 +1,116 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>SDT Booking Assistant</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-:root {
-  --bg: #f4f6f9;
-  --white: #ffffff;
-  --teal: #2B9EB3;
-  --teal-dark: #1E6F8A;
-  --teal-light: #e8f6f9;
-  --teal-mid: #d0edf3;
-  --navy: #1A2B4A;
-  --orange: #F5A623;
-  --orange-light: #fef6e7;
-  --border: #dde3ea;
-  --border-focus: #2B9EB3;
-  --txt: #1A2B4A;
-  --muted: #6b7a8d;
-  --warn: #e05a2b;
-  --warn-bg: #fef0eb;
-  --warn-bdr: #f5b69a;
-  --success: #1a9b6c;
-  --success-bg: #e8f7f2;
-  --success-bdr: #a3ddc9;
-  --shadow: 0 1px 3px rgba(26,43,74,.08),0 4px 12px rgba(26,43,74,.05);
-  --rad: 10px;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--txt); line-height: 1.5; padding: 20px; }
-.container { max-width: 800px; margin: 0 auto; }
-.header { text-align: center; margin-bottom: 25px; }
-.header h1 { color: var(--navy); font-size: 24px; font-weight: 700; letter-spacing: -0.5px; }
-.header p { color: var(--muted); font-size: 14px; margin-top: 5px; }
-.card { background: var(--white); border-radius: var(--rad); box-shadow: var(--shadow); padding: 25px; margin-bottom: 20px; }
-.section-title { font-size: 16px; font-weight: 600; color: var(--navy); margin-bottom: 15px; display: flex; align-items: center; gap: 8px; border-bottom: 2px solid var(--teal-light); padding-bottom: 8px; }
-.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
-.full { grid-column: 1 / -1; }
-.form-group { display: flex; flex-direction: column; gap: 6px; }
-label { font-size: 13px; font-weight: 500; color: var(--navy); }
-input, select, textarea { width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; font-family: inherit; font-size: 14px; color: var(--txt); transition: all 0.2s; background: var(--white); }
-input:focus, select:focus, textarea:focus { outline: none; border-color: var(--border-focus); box-shadow: 0 0 0 3px var(--teal-light); }
-textarea { resize: vertical; min-height: 80px; }
-.btn { width: 100%; padding: 14px; background: var(--teal); color: var(--white); border: none; border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s; display: flex; justify-content: center; align-items: center; gap: 8px; }
-.btn:hover { background: var(--teal-dark); }
-.btn:disabled { background: var(--muted); cursor: not-allowed; opacity: 0.7; }
-.spinner { display: none; width: 18px; height: 18px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: var(--white); animation: spin 1s linear infinite; }
-@keyframes spin { to { transform: rotate(360deg); } }
-#aiOut { margin-top: 20px; }
-.res { background: var(--white); border: 1px solid var(--success-bdr); border-radius: var(--rad); overflow: hidden; }
-.rh { background: var(--success-bg); color: var(--success); padding: 12px 15px; font-weight: 600; font-size: 14px; border-bottom: 1px solid var(--success-bdr); }
-.rb { padding: 15px; font-size: 14px; white-space: pre-wrap; line-height: 1.6; }
-.err { border-color: var(--warn-bdr); }
-.err .rh { background: var(--warn-bg); color: var(--warn); border-color: var(--warn-bdr); }
-@media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SDT Booking Assistant</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f4f7f6; margin: 0; padding: 0; color: #333; }
+        .header { background-color: #1a2b4a; color: white; padding: 20px; text-align: center; }
+        .header h1 { margin: 0; font-size: 22px; }
+        .container { max-width: 600px; margin: 20px auto; background: white; padding: 25px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; font-size: 14px; }
+        input, select, textarea { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; font-size: 14px; }
+        textarea { height: 80px; }
+        .btn { background-color: #2b9eb3; color: white; border: none; padding: 15px; width: 100%; border-radius: 4px; font-size: 16px; font-weight: bold; cursor: pointer; }
+        .btn:disabled { background-color: #ccc; }
+        #aiOut { margin-top: 20px; }
+        .res-box { padding: 15px; border-radius: 4px; border-left: 5px solid #2b9eb3; background: #eef7f9; line-height: 1.5; }
+        .err-box { padding: 15px; border-radius: 4px; border-left: 5px solid #e05a2b; background: #fef0eb; color: #b0411d; }
+    </style>
 </head>
 <body>
 
-<div class="container">
-  <div class="header">
+<div class="header">
     <h1>SDT Booking Assistant</h1>
-    <p>Intelligent instructor matching & routing</p>
-  </div>
+</div>
 
-  <div class="card">
+<div class="container">
     <form id="bookingForm">
-      
-      <div class="section-title">Client Details</div>
-      <div class="grid" style="margin-bottom: 25px;">
         <div class="form-group">
-          <label>Client Name</label>
-          <input type="text" id="clientName" required placeholder="e.g. Jane Doe">
+            <label>Client Name</label>
+            <input type="text" id="clientName" required>
         </div>
         <div class="form-group">
-          <label>Suburb (Location)</label>
-          <input type="text" id="suburb" required placeholder="e.g. Ringwood">
+            <label>Location (Suburb)</label>
+            <input type="text" id="suburb" required>
         </div>
         <div class="form-group">
-          <label>Phone</label>
-          <input type="text" id="phone" placeholder="Optional">
+            <label>Funding Body</label>
+            <select id="funding">
+                <option value="NDIS">NDIS</option>
+                <option value="TAC">TAC</option>
+                <option value="WorkCover">WorkCover</option>
+                <option value="Private">Private</option>
+            </select>
         </div>
         <div class="form-group">
-          <label>Email</label>
-          <input type="email" id="email" placeholder="Optional">
-        </div>
-      </div>
-
-      <div class="section-title">Driving & Medical Info</div>
-      <div class="grid" style="margin-bottom: 25px;">
-        <div class="form-group">
-          <label>Funding Body</label>
-          <select id="funding">
-            <option value="NDIS">NDIS</option>
-            <option value="TAC">TAC</option>
-            <option value="WorkCover">WorkCover</option>
-            <option value="Private">Private</option>
-            <option value="Other">Other</option>
-          </select>
+            <label>License Status</label>
+            <input type="text" id="licenseStatus">
         </div>
         <div class="form-group">
-          <label>License Status</label>
-          <select id="licenseStatus">
-            <option value="Learner">Learner</option>
-            <option value="Probationary">Probationary</option>
-            <option value="Full (Medical Review)">Full (Medical Review)</option>
-            <option value="Unlicensed">Unlicensed</option>
-          </select>
+            <label>Vehicle Modifications</label>
+            <input type="text" id="vehicleMods" placeholder="e.g. Standard Auto">
         </div>
-        <div class="form-group full">
-          <label>Vehicle Modifications Required</label>
-          <input type="text" id="vehicleMods" placeholder="e.g. Spinner knob, Left foot accelerator, Standard auto...">
+        <div class="form-group">
+            <label>Availability</label>
+            <input type="text" id="availability">
         </div>
-      </div>
-
-      <div class="section-title">Scheduling Details</div>
-      <div class="grid">
-        <div class="form-group full">
-          <label>Availability / Preferred Times</label>
-          <input type="text" id="availability" placeholder="e.g. Mondays after 2pm, or Wednesday mornings">
+        <div class="form-group">
+            <label>Additional Notes</label>
+            <textarea id="notes"></textarea>
         </div>
-        <div class="form-group full">
-          <label>Additional Notes</label>
-          <textarea id="notes" placeholder="Any specific requirements, OT reports, or behavioral notes..."></textarea>
-        </div>
-      </div>
-
-      <div style="margin-top: 25px;">
-        <button type="submit" id="submitBtn" class="btn">
-          <span class="spinner" id="spinner"></span>
-          <span id="btnText">Analyse & Recommend Instructor</span>
-        </button>
-      </div>
+        <button type="submit" id="submitBtn" class="btn">Analyse & Recommend Instructor</button>
     </form>
-  </div>
 
-  <div id="aiOut"></div>
-
+    <div id="aiOut"></div>
 </div>
 
 <script>
 document.getElementById('bookingForm').addEventListener('submit', function(e) {
-  e.preventDefault();
-  
-  var btn = document.getElementById('submitBtn');
-  var spinner = document.getElementById('spinner');
-  var btnText = document.getElementById('btnText');
-  var output = document.getElementById('aiOut');
-  
-  // 1. Gather form data
-  var payload = {
-    clientName: document.getElementById('clientName').value,
-    suburb: document.getElementById('suburb').value,
-    phone: document.getElementById('phone').value,
-    email: document.getElementById('email').value,
-    funding: document.getElementById('funding').value,
-    licenseStatus: document.getElementById('licenseStatus').value,
-    vehicleMods: document.getElementById('vehicleMods').value,
-    availability: document.getElementById('availability').value,
-    notes: document.getElementById('notes').value
-  };
-
-  // 2. Set loading state
-  btn.disabled = true;
-  spinner.style.display = 'inline-block';
-  btnText.innerText = 'Analyzing Match...';
-  output.innerHTML = '';
-
-  // 3. Call Railway Backend
-  var API_URL = "https://sdt-booking-backend-production.up.railway.app/analyse";
-
-  fetch(API_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  })
-  .then(function(res) {
-    // Check if the server responded with an error status (like 400 or 500)
-    if (!res.ok) {
-      return res.json().then(function(errData) {
-        throw new Error(errData.error || "Server responded with status " + res.status);
-      }).catch(function(parseErr) {
-        throw new Error("Server Error " + res.status + ". Could not parse error details.");
-      });
-    }
-    return res.json();
-  })
-  .then(function(data) {
-    var text = "";
+    e.preventDefault();
+    var btn = document.getElementById('submitBtn');
+    var out = document.getElementById('aiOut');
     
-    // Safely extract Anthropic's response
-    if (data.content && data.content[0] && data.content[0].text) {
-      text = data.content[0].text;
-    } else if (data.error) {
-      throw new Error(typeof data.error === 'string' ? data.error : JSON.stringify(data.error));
-    } else {
-      throw new Error("Received an unexpected data format from the AI.");
-    }
+    btn.disabled = true;
+    btn.innerText = 'Analyzing...';
+    out.innerHTML = '';
 
-    // Display Success
-    output.innerHTML = 
-      "<div class='res'>" +
-      "<div class='rh'>Match Recommended</div>" +
-      "<div class='rb'>" + escapeHTML(text) + "</div>" +
-      "</div>";
-  })
-  .catch(function(err) {
-    // Display Error clearly
-    output.innerHTML = 
-      "<div class='res err'>" +
-      "<div class='rh'>Analysis Failed</div>" +
-      "<div class='rb'><strong>Error Details:</strong><br><br>" + escapeHTML(err.message) + "</div>" +
-      "</div>";
-  })
-  .finally(function() {
-    // Reset button
-    btn.disabled = false;
-    spinner.style.display = 'none';
-    btnText.innerText = 'Analyse & Recommend Instructor';
-  });
+    // IMPORTANT: Make sure this URL matches your Railway Public URL exactly!
+    var API_URL = "https://sdt-booking-backend-production.up.railway.app/analyse";
+
+    var payload = {
+        clientName: document.getElementById('clientName').value,
+        suburb: document.getElementById('suburb').value,
+        funding: document.getElementById('funding').value,
+        licenseStatus: document.getElementById('licenseStatus').value,
+        vehicleMods: document.getElementById('vehicleMods').value,
+        availability: document.getElementById('availability').value,
+        notes: document.getElementById('notes').value
+    };
+
+    fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    })
+    .then(function(res) {
+        if (!res.ok) return res.json().then(function(err) { throw err; });
+        return res.json();
+    })
+    .then(function(data) {
+        var text = (data.content && data.content[0]) ? data.content[0].text : "No response from AI.";
+        out.innerHTML = "<div class='res-box'><strong>Recommendation:</strong><br><br>" + text + "</div>";
+    })
+    .catch(function(err) {
+        out.innerHTML = "<div class='err-box'><strong>Error:</strong> " + (err.error || err.message || "Server Error") + "</div>";
+    })
+    .finally(function() {
+        btn.disabled = false;
+        btn.innerText = 'Analyse & Recommend Instructor';
+    });
 });
-
-// Helper function to prevent HTML injection and format line breaks
-function escapeHTML(str) {
-  return str.replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;")
-            .replace(/"/g, "&quot;")
-            .replace(/'/g, "&#039;");
-}
 </script>
 
 </body>
