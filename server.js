@@ -403,6 +403,94 @@ function filterInstructors(booking) {
   return qualified;
 }
 
+// ─── SERVER-SIDE OPTION VALIDATOR ────────────────────────────────────────────
+// Parses the AI text response and removes options that are provably invalid:
+//  1. Gap check line says NOT OK
+//  2. Gap check shows arrives_next > next_appt (even if AI wrote OK)
+//  3. Lesson finishes after 6:00pm
+//  4. "Appointment after" start time is before or equal to lesson start time
+//    (means AI picked the wrong adjacent appointment)
+// Re-numbers the surviving options 1..N.
+
+function parseTimeToMinutes(str) {
+  if (!str) return null;
+  const m = str.toLowerCase().trim().match(/(\d+):(\d+)\s*(am|pm)/);
+  if (!m) return null;
+  let h = parseInt(m[1]);
+  const min = parseInt(m[2]);
+  if (m[3] === "pm" && h !== 12) h += 12;
+  if (m[3] === "am" && h === 12) h = 0;
+  return h * 60 + min;
+}
+
+function filterAIOptions(text, lessonMinutes) {
+  // Split text on OPTION N boundaries, keeping any preamble
+  const parts = text.split(/(?=\nOPTION \d)/);
+  const preamble = parts[0].replace(/\nOPTION \d[\s\S]*/, "").trim();
+  const optionBlocks = text.match(/OPTION \d[\s\S]*?(?=\nOPTION \d|$)/g) || [];
+
+  const passing = [];
+  for (const block of optionBlocks) {
+    let reject = false;
+    let reason = "";
+
+    // 1. Explicit NOT OK in gap check line
+    if (/gap check:.*not ok/i.test(block)) {
+      reject = true; reason = "gap check NOT OK";
+    }
+
+    // 2. Parse gap check times and verify arithmetic
+    if (!reject) {
+      const gc = block.match(/arrives next at (\d+:\d+\s*[ap]m) vs next appt (\d+:\d+\s*[ap]m)/i);
+      if (gc) {
+        const arrives = parseTimeToMinutes(gc[1]);
+        const nextAppt = parseTimeToMinutes(gc[2]);
+        if (arrives !== null && nextAppt !== null && arrives > nextAppt) {
+          reject = true; reason = `arrives ${gc[1]} > next appt ${gc[2]}`;
+        }
+      }
+    }
+
+    // 3. Lesson must finish by 18:00 (6pm)
+    if (!reject) {
+      const timeLine = block.match(/,\s*(\d+:\d+[ap]m) to (\d+:\d+[ap]m)/i);
+      if (timeLine) {
+        const endMins = parseTimeToMinutes(timeLine[2]);
+        if (endMins !== null && endMins > 18 * 60) {
+          reject = true; reason = `lesson ends after 6pm (${timeLine[2]})`;
+        }
+      }
+    }
+
+    // 4. "Appointment after" must start AFTER the lesson ends
+    if (!reject) {
+      const lessonMatch = block.match(/,\s*(\d+:\d+[ap]m) to (\d+:\d+[ap]m)/i);
+      const afterMatch  = block.match(/appointment after:.*starts (\d+:\d+[ap]m)/i);
+      if (lessonMatch && afterMatch) {
+        const lessonEnd = parseTimeToMinutes(lessonMatch[2]);
+        const afterStart = parseTimeToMinutes(afterMatch[1]);
+        if (lessonEnd !== null && afterStart !== null && afterStart < lessonEnd) {
+          reject = true; reason = `appointment after (${afterMatch[1]}) is before lesson end (${lessonMatch[2]})`;
+        }
+      }
+    }
+
+    if (reject) {
+      console.log(`Filtered AI option: ${reason} — ${block.split("\n")[0]}`);
+    } else {
+      passing.push(block);
+    }
+  }
+
+  // Re-number options 1..N
+  const renumbered = passing.map((b, i) =>
+    b.replace(/^OPTION \d+/, `OPTION ${i + 1}`)
+  );
+
+  const prefix = preamble ? preamble + "\n\n" : "";
+  return prefix + renumbered.join("\n");
+}
+
 // ─── MAIN ANALYSIS ROUTE ──────────────────────────────────────────────────────
 app.post("/analyse", async (req, res) => {
   try {
@@ -543,6 +631,13 @@ RULES
 7. Map the client's availability (e.g. "Mon AM") to real upcoming calendar dates from today's date.
 8. Never suggest a time that overlaps with a [BUSY] block.
 9. Try to spread recommendations across different instructors. Do not default to the same instructor for all options — check every qualified instructor's schedule before deciding.
+10. No lesson may finish after 6:00pm. The lesson end time must be 6:00pm or earlier.
+11. ADJACENT APPOINTMENT SELECTION — this is critical:
+    "Appointment before" = the last [BUSY] block that ENDS before the lesson start time.
+    "Appointment after"  = the first [BUSY] block that STARTS after the lesson END time.
+    The "appointment after" start time MUST be later than the lesson end time.
+    If you find yourself writing an "appointment after" that starts before the lesson ends, you have the wrong appointment — look further forward in the day.
+12. GAP CHECK COMPARISON: if "arrives next" time is even 1 minute later than "next appt" time, that is NOT OK. Do not write OK unless arrives_next <= next_appt exactly.
 
 OUTPUT RULES
 Do all slot validity and date-verification checks silently — never print rejected candidates, never show your working.
@@ -584,6 +679,15 @@ Gap check: arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
     }
 
     const data = await aiResponse.json();
+
+    // ── Server-side sanity filter ──────────────────────────────────────────
+    // The AI sometimes produces options that fail their own gap check, have
+    // the wrong adjacent appointments, or breach the 6pm finish rule.
+    // Parse each option and remove any that are provably wrong.
+    const rawText = data?.content?.[0]?.text || "";
+    const filteredText = filterAIOptions(rawText, parseInt(booking.duration) || 60);
+    if (data?.content?.[0]) data.content[0].text = filteredText;
+
     res.json(data);
 
   } catch (error) {
