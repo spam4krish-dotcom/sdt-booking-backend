@@ -546,25 +546,22 @@ Gap check: EARLIEST_START [HH:MM] + lesson [X min] + travel out [X min] + buffer
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 8000,
-        thinking: { type: "enabled", budget_tokens: 6000 },
+        max_tokens: 3000,
         system: systemPrompt,
         messages: [{
           role: "user",
-          content: `Find the best ${booking.duration}-min booking options for ${booking.clientName} in ${clientSuburb}. Availability: ${booking.availability}. Modifications: ${booking.modifications || "none"}.\n\nFor every candidate slot, work through the SLOT VALIDITY formula step by step before accepting or rejecting it. Only output options that pass the check.`
+          content: `Find the best ${booking.duration}-min booking options for ${booking.clientName} in ${clientSuburb}. Availability: ${booking.availability}. Modifications: ${booking.modifications || "none"}.\n\nFor every candidate slot you consider, run the SLOT VALIDITY formula explicitly. Only output options that pass.`
         }]
       })
     });
 
-    const data = await aiResponse.json();
-
-    // Extended thinking returns mixed content blocks (thinking + text).
-    // Strip thinking blocks before sending to the frontend — the client
-    // only needs the final text output.
-    if (data.content && Array.isArray(data.content)) {
-      data.content = data.content.filter(block => block.type !== "thinking");
+    if (!aiResponse.ok) {
+      const errText = await aiResponse.text();
+      console.error(`Anthropic API error ${aiResponse.status}: ${errText}`);
+      return res.status(502).json({ error: `AI service error: ${aiResponse.status}` });
     }
 
+    const data = await aiResponse.json();
     res.json(data);
 
   } catch (error) {
