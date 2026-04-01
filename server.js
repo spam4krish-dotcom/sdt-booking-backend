@@ -18,7 +18,7 @@ const INSTRUCTORS = [
     mods: ["LFA", "Spinner", "Hand Controls", "Satellite", "Indicator Extension", "Extension Pedals"],
     base: "Montmorency",
     notes: "Covers all areas by arrangement. Full modifications vehicle.",
-    icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fnXpnN%2FtMeidfD9E6WmLBWsPF881mF4%2FDKjqX6mENEnlggTWF2jMn8Em8aKgSGXA%3D%3D"
+    icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fnXpnN%2FtMeidfD9E6WmLBWPsPF881mF4%2FDKjqX6mENEnlggTWF2jMn8Em8aKgSGXA%3D%3D"
   },
   {
     name: "Gabriel",
@@ -116,11 +116,27 @@ async function fetchInstructorCalendar(instructor) {
           hour12: true
         }),
         summary: event.summary || "Appointment",
-        location: event.location || ""
+        location: event.location || "",
+        notes: (event.description || "").replace(/\n/g, " ").trim()
       });
     }
 
     appts.sort((a, b) => new Date(a.startISO) - new Date(b.startISO));
+
+    // Post-process: resolve home suburb for "from home" appointments.
+    // If the ICS location field already has a value, use that (it's the client's
+    // registered address from Nookal). If it's empty, call the Nookal API.
+    for (const appt of appts) {
+      if (appointmentIsFromHome(appt.notes)) {
+        if (appt.location) {
+          appt.lessonLocation = appt.location + " (client home)";
+        } else {
+          const suburb = await getNookalClientSuburb(appt.summary);
+          if (suburb) appt.lessonLocation = suburb + " (client home, from Nookal)";
+        }
+      }
+    }
+
     console.log(`ICS OK: ${instructor.name} — ${appts.length} appointments fetched`);
     return appts;
 
@@ -149,14 +165,95 @@ function formatDiaryForAI(diary) {
     const sorted = [...appts].sort((a, b) => new Date(a.startISO) - new Date(b.startISO));
     text += `  ${date}:\n`;
     for (const appt of sorted) {
-      const loc = appt.location ? ` | ${appt.location}` : "";
-      text += `    [BUSY] ${appt.startTime} – ${appt.endTime}: ${appt.summary}${loc}\n`;
+      // lessonLocation = resolved actual meeting point (home addr or notes-derived suburb)
+      // location = raw ICS field (client's Nookal address, not always the lesson pickup)
+      const lessonLoc = appt.lessonLocation ? ` | LESSON LOCATION: ${appt.lessonLocation}` : "";
+      const addrField = (!appt.lessonLocation && appt.location) ? ` | addr: ${appt.location}` : "";
+      const notesField = appt.notes ? ` | notes: ${appt.notes}` : "";
+      text += `    [BUSY] ${appt.startTime} – ${appt.endTime}: ${appt.summary}${lessonLoc}${addrField}${notesField}\n`;
     }
   }
   return text;
 }
 
-// ─── GOOGLE MAPS TRAVEL TIME ──────────────────────────────────────────────────
+// ─── NOOKAL CLIENT ADDRESS LOOKUP ────────────────────────────────────────────
+// Used when appointment notes say "from home" and we need the client's suburb.
+// Results are cached in-memory for the life of the process.
+const clientSuburbCache = {};
+
+async function getNookalClientSuburb(rawSummary) {
+  // Strip Nookal display prefixes ($ ★ ☆ emoji) from the client name
+  const name = rawSummary.replace(/^[\$\★\☆\u{1F300}-\u{1FFFF}\s]+/u, "").trim();
+  if (!name || name.length < 3) return null;
+
+  if (clientSuburbCache[name] !== undefined) return clientSuburbCache[name];
+
+  try {
+    const cid = process.env.NOOKAL_CLIENT_ID;
+    const key = process.env.NOOKAL_BASIC_KEY;
+    if (!cid || !key) return null;
+
+    const creds = Buffer.from(`${cid}:${key}`).toString("base64");
+    const parts = name.split(/\s+/);
+    const firstName = parts[0];
+    const lastName = parts.slice(1).join(" ");
+
+    const query = `{
+      clients(filters: { firstName: "${firstName}", lastName: "${lastName}" }) {
+        data {
+          firstName
+          lastName
+          address { suburb }
+        }
+      }
+    }`;
+
+    const resp = await fetch("https://auzone1.nookal.com/api/v3.0/graphql", {
+      method: "POST",
+      headers: {
+        "Authorization": "Basic " + creds,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ query }),
+      signal: AbortSignal.timeout(8000)
+    });
+
+    if (!resp.ok) {
+      console.error(`Nookal client lookup HTTP ${resp.status} for "${name}"`);
+      clientSuburbCache[name] = null;
+      return null;
+    }
+
+    const result = await resp.json();
+
+    if (result.errors) {
+      console.error(`Nookal GraphQL error for "${name}":`, JSON.stringify(result.errors[0]));
+      clientSuburbCache[name] = null;
+      return null;
+    }
+
+    const suburb = result?.data?.clients?.data?.[0]?.address?.suburb || null;
+    clientSuburbCache[name] = suburb;
+    console.log(`Nookal address lookup: "${name}" → ${suburb || "not found"}`);
+    return suburb;
+
+  } catch (err) {
+    console.error(`Nookal client lookup error for "${name}": ${err.message}`);
+    clientSuburbCache[name] = null;
+    return null;
+  }
+}
+
+// Detect "from home" / "pickup from home" type notes
+function appointmentIsFromHome(notes) {
+  const l = (notes || "").toLowerCase();
+  return l.includes("from home") || l.includes("p/u from home") ||
+         l.includes("pickup from home") || l.includes("pick up from home") ||
+         l.includes("start at home") || l.includes("start from home") ||
+         l.includes("lesson from home") || l.includes("lesson at home");
+}
+
+
 async function getDriveTime(origin, destination) {
   try {
     const key = process.env.GOOGLE_MAPS_API_KEY;
@@ -294,10 +391,14 @@ RULES
 3. Gabriel is on holiday 25–30 Apr 2026. Do not suggest him on those dates.
 4. A proposed slot is only valid if the gap between appointments is large enough for: travel time in + lesson duration + travel time out (to next appointment).
 5. TRAVEL ORIGIN: Look at what appointment ends immediately before the proposed slot. Travel comes FROM that appointment's location. If the proposed slot is the instructor's FIRST appointment of the day, travel comes from their home base.
-6. Use the Google Maps times above for base→client travel. For mid-day travel between suburbs, use your Melbourne geography knowledge.
-7. Map the client's availability (e.g. "Mon AM") to real upcoming calendar dates from today's date.
-8. Never suggest a time that overlaps with a [BUSY] block.
-9. Multiple options can be the same instructor on different days if that is genuinely the best fit.
+6. LOCATION PRIORITY for each appointment (use the first available):
+   a. "LESSON LOCATION:" field — this is the confirmed pickup/meeting point. Always use this if present.
+   b. If no LESSON LOCATION, check the "notes:" field for a suburb or place name (e.g. "from ActiveOne FRANKSTON" → Frankston).
+   c. If neither, use the "addr:" field as a last resort (it is the client's home address from Nookal).
+7. Use the Google Maps times above for base→client travel. For mid-day travel between suburbs, use your Melbourne geography knowledge.
+8. Map the client's availability (e.g. "Mon AM") to real upcoming calendar dates from today's date.
+9. Never suggest a time that overlaps with a [BUSY] block.
+10. Multiple options can be the same instructor on different days if that is genuinely the best fit.
 
 OUTPUT RULES
 Plain text only. No asterisks, no bold, no bullet symbols.
@@ -337,6 +438,15 @@ Travel to next: ~[X] min to [next appointment suburb] OR [n/a]`;
     console.error("Server Error:", error.message);
     res.status(500).json({ error: error.message });
   }
+});
+
+// ─── DEBUG: verify Nookal client lookup ──────────────────────────────────────
+// GET /debug-client?name=John+Mitford
+app.get("/debug-client", async (req, res) => {
+  const name = req.query.name;
+  if (!name) return res.status(400).json({ error: "Pass ?name=First+Last" });
+  const suburb = await getNookalClientSuburb(name);
+  res.json({ queried: name, suburb });
 });
 
 // ─── DEBUG: verify ICS fetch for one instructor ───────────────────────────────
