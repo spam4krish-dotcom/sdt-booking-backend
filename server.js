@@ -123,9 +123,15 @@ async function fetchInstructorCalendar(instructor) {
 
     appts.sort((a, b) => new Date(a.startISO) - new Date(b.startISO));
 
-    // Post-process: resolve home suburb for "from home" appointments.
-    // If the ICS location field already has a value, use that (it's the client's
-    // registered address from Nookal). If it's empty, call the Nookal API.
+    // Post-process: resolve lesson location for each appointment.
+    //
+    // Priority order:
+    //  1. "from home" wording in notes → use ICS location field if populated
+    //     (Nookal auto-fills it with the client's registered address), otherwise
+    //     look the client up in Nookal by name.
+    //  2. A Melbourne suburb name appears in the notes (e.g. "Preston") →
+    //     look the client up in Nookal to get their registered address; fall back
+    //     to the suburb extracted from the notes if Nookal returns nothing.
     for (const appt of appts) {
       if (appointmentIsFromHome(appt.notes)) {
         if (appt.location) {
@@ -133,6 +139,20 @@ async function fetchInstructorCalendar(instructor) {
         } else {
           const suburb = await getNookalClientSuburb(appt.summary);
           if (suburb) appt.lessonLocation = suburb + " (client home, from Nookal)";
+        }
+      } else if (!appt.lessonLocation) {
+        // Suburb mentioned in notes but not an explicit "from home" phrase
+        const suburbInNotes = extractNoteSuburb(appt.notes);
+        if (suburbInNotes) {
+          // Try Nookal first for the registered street/suburb; fall back to the
+          // suburb name found in the notes.
+          const nookalSuburb = await getNookalClientSuburb(appt.summary);
+          if (nookalSuburb) {
+            appt.lessonLocation = nookalSuburb + " (from Nookal)";
+          } else {
+            appt.lessonLocation = suburbInNotes + " (from notes)";
+          }
+          console.log(`Location from notes: "${suburbInNotes}" → resolved to "${appt.lessonLocation}" for ${appt.summary}`);
         }
       }
     }
@@ -177,7 +197,9 @@ function formatDiaryForAI(diary) {
 }
 
 // ─── NOOKAL CLIENT ADDRESS LOOKUP ────────────────────────────────────────────
-// Used when appointment notes say "from home" and we need the client's suburb.
+// Looks up the client's registered suburb in Nookal by their name (parsed from
+// the ICS summary line). Used both for "from home" appointments and when notes
+// mention a suburb name — in both cases we want the actual registered address.
 // Results are cached in-memory for the life of the process.
 const clientSuburbCache = {};
 
@@ -247,10 +269,84 @@ async function getNookalClientSuburb(rawSummary) {
 // Detect "from home" / "pickup from home" type notes
 function appointmentIsFromHome(notes) {
   const l = (notes || "").toLowerCase();
-  return l.includes("from home") || l.includes("p/u from home") ||
-         l.includes("pickup from home") || l.includes("pick up from home") ||
-         l.includes("start at home") || l.includes("start from home") ||
-         l.includes("lesson from home") || l.includes("lesson at home");
+  return l.includes("from home") || l.includes("p/u home") ||
+         l.includes("p/u from home") || l.includes("pickup from home") ||
+         l.includes("pick up from home") || l.includes("start at home") ||
+         l.includes("start from home") || l.includes("lesson from home") ||
+         l.includes("lesson at home") || l.includes("at home") ||
+         l.includes("home lesson") || l.includes("home pickup");
+}
+
+// ─── MELBOURNE SUBURB DETECTION ───────────────────────────────────────────────
+// When notes mention a suburb (e.g. "Preston") instead of "from home",
+// extract it so we can resolve the client's full address via Nookal.
+const MELBOURNE_SUBURBS = new Set([
+  // Inner / CBD
+  "Melbourne","CBD","Docklands","Southbank","South Yarra","Toorak","Prahran",
+  "Windsor","Fitzroy","Collingwood","Abbotsford","Richmond","Cremorne",
+  "Hawthorn","Camberwell","Glen Iris","Malvern","Caulfield","Carnegie",
+  // North
+  "Carlton","Parkville","Kensington","Flemington","Moonee Ponds","Ascot Vale",
+  "Brunswick","Coburg","Preston","Thornbury","Northcote","Reservoir","Bundoora",
+  "Heidelberg","Ivanhoe","Doncaster","Templestowe","Eltham","Greensborough",
+  "Diamond Creek","Hurstbridge","Epping","South Morang","Mill Park","Lalor",
+  "Thomastown","Kingsbury","Macleod","Watsonia","Montmorency","Eltham North",
+  "Craigieburn","Broadmeadows","Glenroy","Pascoe Vale","Essendon","Keilor",
+  // East
+  "Box Hill","Mitcham","Nunawading","Blackburn","Forest Hill","Ringwood",
+  "Croydon","Bayswater","Boronia","Ferntree Gully","Knoxfield","Wantirna",
+  "Vermont","Balwyn","Kew","Doncaster East","Warrandyte","Lilydale","Mooroolbark",
+  "Kilsyth","Wandin North","Wandin","Yarra Glen","Healesville",
+  // South / Bayside
+  "Oakleigh","Clayton","Springvale","Mulgrave","Wheelers Hill","Rowville",
+  "Glen Waverley","Burwood","Mount Waverley","Syndal","Glen Iris","Ashwood",
+  "Cheltenham","Moorabbin","Mentone","Parkdale","Mordialloc","Sandringham",
+  "Hampton","Beaumaris","Brighton","Elwood","St Kilda","Port Melbourne",
+  "South Melbourne","Middle Park","Albert Park",
+  // South-East
+  "Dandenong","Noble Park","Keysborough","Hallam","Narre Warren","Berwick",
+  "Officer","Pakenham","Cranbourne","Lyndhurst","Bangholme","Seaford",
+  "Carrum Downs","Langwarrin","Patterson Lakes","Chelsea","Bonbeach",
+  "Edithvale","Aspendale","Braeside","Dingley Village",
+  // Frankston / Peninsula
+  "Frankston","Karingal","Carrum Downs","Skye","Baxter","Somerville",
+  "Mornington","Mount Eliza","Mt Eliza","Rosebud","Rye","Sorrento","McCrae",
+  "Safety Beach","Dromana","Hastings","Tyabb","Pearcedale","Tooradin",
+  // West
+  "Williamstown","Newport","Altona","Laverton","Hoppers Crossing","Werribee",
+  "Point Cook","Tarneit","Wyndham Vale","Melton","Caroline Springs",
+  "Sunshine","Footscray","Yarraville","Seddon","Kingsville","Maribyrnong",
+  // Geelong direction
+  "Little River","Lara","Norlane","Corio","Geelong",
+]);
+
+/**
+ * Scans appointment notes for a Melbourne suburb name.
+ * Handles patterns like "Preston", "at Preston", "pickup Preston",
+ * "from Preston", "lesson in Preston", etc.
+ * Returns the suburb string if found, otherwise null.
+ */
+function extractNoteSuburb(notes) {
+  if (!notes || notes.trim().length === 0) return null;
+
+  // Try explicit preposition patterns first: "at X", "from X", "in X", "pickup X"
+  const prepPattern = /\b(?:at|from|in|pickup|pick\s*up|p\/u)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\b/g;
+  let m;
+  while ((m = prepPattern.exec(notes)) !== null) {
+    const candidate = m[1].trim();
+    if (MELBOURNE_SUBURBS.has(candidate)) return candidate;
+    // Try just the first word (e.g. "Mount Eliza" where only "Mount" starts the match)
+    const firstWord = candidate.split(/\s+/)[0];
+    if (MELBOURNE_SUBURBS.has(firstWord)) return firstWord;
+  }
+
+  // Fall back: scan all Title-Case words/phrases in the notes
+  const words = notes.match(/\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?\b/g) || [];
+  for (const word of words) {
+    if (MELBOURNE_SUBURBS.has(word)) return word;
+  }
+
+  return null;
 }
 
 
@@ -392,8 +488,8 @@ RULES
 4. A proposed slot is only valid if the gap between appointments is large enough for: travel time in + lesson duration + travel time out (to next appointment).
 5. TRAVEL ORIGIN: Look at what appointment ends immediately before the proposed slot. Travel comes FROM that appointment's location. If the proposed slot is the instructor's FIRST appointment of the day, travel comes from their home base.
 6. LOCATION PRIORITY for each appointment (use the first available):
-   a. "LESSON LOCATION:" field — this is the confirmed pickup/meeting point. Always use this if present.
-   b. If no LESSON LOCATION, check the "notes:" field for a suburb or place name (e.g. "from ActiveOne FRANKSTON" → Frankston).
+   a. "LESSON LOCATION:" field — this is the confirmed pickup/meeting point resolved by the server (from Nookal address or notes). Always use this if present.
+   b. If no LESSON LOCATION, check the "notes:" field for a suburb or place name (e.g. "from ActiveOne FRANKSTON" → Frankston, "Berwick" → Berwick).
    c. If neither, use the "addr:" field as a last resort (it is the client's home address from Nookal).
 7. Use the Google Maps times above for base→client travel. For mid-day travel between suburbs, use your Melbourne geography knowledge.
 8. Map the client's availability (e.g. "Mon AM") to real upcoming calendar dates from today's date.
