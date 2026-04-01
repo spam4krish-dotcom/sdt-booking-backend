@@ -500,12 +500,14 @@ RULES
 
    Calculations:
      EARLIEST_START = PREV_END + TRAVEL_IN + BUFFER
-     LESSON_END     = EARLIEST_START + LESSON
+     EARLIEST_START must then be rounded UP to the next quarter-hour (:00, :15, :30, or :45).
+     Examples: 1:25pm → 1:30pm, 2:50pm → 3:00pm, 10:08am → 10:15am, 9:00am → 9:00am (already on quarter).
+     LESSON_END     = rounded EARLIEST_START + LESSON
      ARRIVE_NEXT    = LESSON_END + TRAVEL_OUT + BUFFER
 
    Validity check:
      ARRIVE_NEXT must be <= NEXT_START.
-     If ARRIVE_NEXT > NEXT_START, the slot is IMPOSSIBLE. Discard it. Do not suggest it.
+     If ARRIVE_NEXT > NEXT_START, the slot is IMPOSSIBLE. Discard it silently. Do not mention it in the output.
      If there is no next appointment, ARRIVE_NEXT does not need to meet any deadline.
      If there is no previous appointment, PREV_END = start of day; TRAVEL_IN comes from instructor home base.
 
@@ -524,9 +526,10 @@ RULES
 9. Multiple options can be the same instructor on different days if that is genuinely the best fit.
 
 OUTPUT RULES
+Do all slot validity calculations silently — never print rejected candidates, never show your working.
 Plain text only. No asterisks, no bold, no bullet symbols.
-Give 3 to 5 options, best first. Only include options where the slot validity calculation confirms they work.
-Each option must follow this exact format — no extra lines, no commentary between options:
+Give 3 to 5 valid options, best first.
+Each option must follow this exact format with no extra lines or commentary between options:
 
 OPTION [N]
 [Instructor] — [Day] [Date] [Month], [Start time] to [End time]
@@ -534,7 +537,7 @@ Appointment before: [client name, ends HH:MM at suburb] OR [no appointment — t
 Appointment after: [client name, starts HH:MM at suburb] OR [no appointment after]
 Travel to client: from [suburb] ~[X] min
 Travel to next: ~[X] min to [next appointment suburb] OR [n/a]
-Gap check: EARLIEST_START [HH:MM] + lesson [X min] + travel out [X min] + buffer = arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
+Gap check: arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
 
     // 6. Call Claude
     const aiResponse = await fetch("https://api.anthropic.com/v1/messages", {
@@ -550,7 +553,7 @@ Gap check: EARLIEST_START [HH:MM] + lesson [X min] + travel out [X min] + buffer
         system: systemPrompt,
         messages: [{
           role: "user",
-          content: `Find the best ${booking.duration}-min booking options for ${booking.clientName} in ${clientSuburb}. Availability: ${booking.availability}. Modifications: ${booking.modifications || "none"}.\n\nFor every candidate slot you consider, run the SLOT VALIDITY formula explicitly. Only output options that pass.`
+          content: `Find the best ${booking.duration}-min booking options for ${booking.clientName} in ${clientSuburb}. Availability: ${booking.availability}. Modifications: ${booking.modifications || "none"}. Check every candidate slot against the SLOT VALIDITY formula before including it. Only output passing options in the required format.`
         }]
       })
     });
