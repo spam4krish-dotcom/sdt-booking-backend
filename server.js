@@ -442,11 +442,50 @@ Travel to next: ~[X] min to [next appointment suburb] OR [n/a]`;
 
 // ─── DEBUG: verify Nookal client lookup ──────────────────────────────────────
 // GET /debug-client?name=John+Mitford
+// Returns the raw Nookal API response so we can see the exact field structure.
 app.get("/debug-client", async (req, res) => {
   const name = req.query.name;
   if (!name) return res.status(400).json({ error: "Pass ?name=First+Last" });
-  const suburb = await getNookalClientSuburb(name);
-  res.json({ queried: name, suburb });
+
+  const parts = name.replace(/^[$★☆\s]+/, "").trim().split(/\s+/);
+  const firstName = parts[0];
+  const lastName = parts.slice(1).join(" ");
+
+  try {
+    const cid = process.env.NOOKAL_CLIENT_ID;
+    const key = process.env.NOOKAL_BASIC_KEY;
+    const creds = Buffer.from(`${cid}:${key}`).toString("base64");
+
+    const query = `{
+      clients(filters: { firstName: "${firstName}", lastName: "${lastName}" }) {
+        data {
+          firstName
+          lastName
+          address { suburb }
+        }
+      }
+    }`;
+
+    const resp = await fetch("https://auzone1.nookal.com/api/v3.0/graphql", {
+      method: "POST",
+      headers: { "Authorization": "Basic " + creds, "Content-Type": "application/json" },
+      body: JSON.stringify({ query }),
+      signal: AbortSignal.timeout(8000)
+    });
+
+    const raw = await resp.json();
+    // Return everything: HTTP status, full Nookal response, and our extracted suburb
+    res.json({
+      httpStatus: resp.status,
+      queriedName: name,
+      firstName,
+      lastName,
+      rawNookalResponse: raw,
+      extractedSuburb: raw?.data?.clients?.data?.[0]?.address?.suburb || null
+    });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
 });
 
 // ─── DEBUG: verify ICS fetch for one instructor ───────────────────────────────
