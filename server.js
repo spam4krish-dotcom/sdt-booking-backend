@@ -487,7 +487,7 @@ function parseTimeToMinutes(str) {
   return h * 60 + min;
 }
 
-function filterAIOptions(text, lessonMinutes) {
+function filterAIOptions(text, lessonMinutes, diaries) {
   // Preamble = everything before the first "OPTION N" occurrence.
   const firstOptionPos = text.search(/\bOPTION \d\b/);
   const preamble = firstOptionPos > 0 ? text.slice(0, firstOptionPos).trim() : "";
@@ -557,6 +557,65 @@ function filterAIOptions(text, lessonMinutes) {
         const lessonStart = parseTimeToMinutes(lessonMatch[1]);
         if (prevEnd !== null && lessonStart !== null && lessonStart <= prevEnd) {
           reject = true; reason = `lesson starts at ${lessonMatch[1]} but prev appt ends at ${prevMatch[1]}`;
+        }
+      }
+    }
+
+    // 6. Lesson start must respect travel time from previous appointment
+    //    Parse "Travel to client: from X ~N min" and enforce
+    //    lessonStart >= prevEnd + travelIn + 10 min buffer
+    if (!reject) {
+      const prevMatch2   = block.match(/appointment before:.*ends (\d+:\d+[ap]m)/i);
+      const travelMatch  = block.match(/travel to client:.*~(\d+)\s*min/i);
+      const startMatch2  = block.match(/,\s*(\d+:\d+[ap]m) to/i);
+      if (prevMatch2 && travelMatch && startMatch2) {
+        const prevEnd2    = parseTimeToMinutes(prevMatch2[1]);
+        const travelIn    = parseInt(travelMatch[1]);
+        const lessonStart2 = parseTimeToMinutes(startMatch2[1]);
+        if (prevEnd2 !== null && lessonStart2 !== null) {
+          const minStart = prevEnd2 + travelIn + 10;
+          if (lessonStart2 < minStart) {
+            const minH = Math.floor(minStart / 60);
+            const minM = String(minStart % 60).padStart(2, "0");
+            const ampm = minH >= 12 ? "pm" : "am";
+            const h12  = minH > 12 ? minH - 12 : (minH === 0 ? 12 : minH);
+            reject = true;
+            reason = `lesson starts ${startMatch2[1]} but earliest valid start is ${h12}:${minM}${ampm} (prev ends ${prevMatch2[1]} + ${travelIn}min travel + 10min buffer)`;
+          }
+        }
+      }
+    }
+
+    // 7. Cross-check against actual diary BUSY blocks for the named instructor/date
+    //    Catches cases where the AI wrote "no appointment after" but a BUSY block
+    //    exists during the lesson window (e.g. an ignored HOLD entry)
+    if (!reject && diaries) {
+      const headerMatch = block.match(/^OPTION \d+\n(\w+) — [^\d]*(\d+)\s+(\w+)/im);
+      const timeMatch   = block.match(/,\s*(\d+:\d+[ap]m) to (\d+:\d+[ap]m)/i);
+      if (headerMatch && timeMatch) {
+        const instrName   = headerMatch[1].toLowerCase();
+        const optDay      = parseInt(headerMatch[2]);
+        const optMonthStr = headerMatch[3].toLowerCase().substring(0, 3);
+        const lessonS     = parseTimeToMinutes(timeMatch[1]);
+        const lessonE     = parseTimeToMinutes(timeMatch[2]);
+        const diary = diaries.find(d => d.name.toLowerCase() === instrName);
+        if (diary && lessonS !== null && lessonE !== null) {
+          for (const appt of diary.appointments) {
+            // Match day + month from the appointment date string
+            const apptDm = appt.date.toLowerCase().match(/(\d+)\s+(\w{3})/);
+            if (!apptDm) continue;
+            if (parseInt(apptDm[1]) !== optDay) continue;
+            if (apptDm[2].substring(0, 3) !== optMonthStr) continue;
+            const apptS = parseTimeToMinutes(appt.startTime);
+            const apptE = parseTimeToMinutes(appt.endTime);
+            if (apptS === null || apptE === null) continue;
+            // Overlap: lesson starts before appt ends AND lesson ends after appt starts
+            if (lessonS < apptE && lessonE > apptS) {
+              reject = true;
+              reason = `overlaps ${appt.summary} (${appt.startTime}–${appt.endTime}) in diary`;
+              break;
+            }
+          }
         }
       }
     }
@@ -796,7 +855,7 @@ Gap check: arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
     // the wrong adjacent appointments, or breach the 6pm finish rule.
     // Parse each option and remove any that are provably wrong.
     const rawText = data?.content?.[0]?.text || "";
-    const filteredText = filterAIOptions(rawText, parseInt(booking.duration) || 60);
+    const filteredText = filterAIOptions(rawText, parseInt(booking.duration) || 60, diaries);
     if (data?.content?.[0]) data.content[0].text = filteredText;
 
     res.json(data);
