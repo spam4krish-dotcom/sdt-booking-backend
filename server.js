@@ -23,38 +23,45 @@ async function getNookalDiary() {
   const clientSecret = process.env.NOOKAL_BASIC_KEY;
 
   if (!clientId || !clientSecret) {
-    throw new Error("Missing NOOKAL_CLIENT_ID or NOOKAL_BASIC_KEY in Railway environment.");
+    throw new Error("Missing NOOKAL_CLIENT_ID or NOOKAL_BASIC_KEY in Railway.");
   }
 
-  // 1. EXCHANGE CLIENT ID AND SECRET FOR AN ACCESS TOKEN
+  // 1. EXCHANGE CREDENTIALS FOR AN ACCESS TOKEN
   const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
   
+  // Removed 'scope=all' as it can sometimes cause 400 errors if the client isn't configured for it
   const tokenResponse = await fetch("https://auzone1.nookal.com/api/v3.0/token", {
     method: "POST",
     headers: {
       "Authorization": `Basic ${credentials}`,
       "Content-Type": "application/x-www-form-urlencoded"
     },
-    body: "grant_type=client_credentials&scope=all"
+    body: "grant_type=client_credentials"
   });
 
   if (!tokenResponse.ok) {
     const errText = await tokenResponse.text();
-    throw new Error(`Auth Failed (${tokenResponse.status}): Ensure the Basic Key is the v3 Client Secret.`);
+    throw new Error(`Token Auth Failed (${tokenResponse.status}): ${errText}`);
   }
 
   const tokenData = await tokenResponse.json();
   const accessToken = tokenData.access_token;
 
-  // 2. FETCH DIARY VIA GRAPHQL (Next 30 Days)
+  if (!accessToken) {
+    throw new Error("Nookal did not return an access token.");
+  }
+
+  // 2. FETCH APPOINTMENTS VIA GRAPHQL
   const today = new Date();
   const from = today.toISOString().split("T")[0];
   const future = new Date(today.getTime() + (30 * 24 * 60 * 60 * 1000));
   const to = future.toISOString().split("T")[0];
 
+  // Stripped out pagination wrappers that might violate Nookal's strict GraphQL schema.
+  // We are requesting exactly what you gave the API key permission to access.
   const query = `
     query {
-      appointments(filters: { dateFrom: "${from}", dateTo: "${to}" }, pagination: { data: { limit: 250 } }) {
+      appointments(filters: { dateFrom: "${from}", dateTo: "${to}" }) {
         data {
           id
           date
@@ -80,8 +87,9 @@ async function getNookalDiary() {
   });
 
   const result = await response.json();
+  
   if (result.errors) {
-    throw new Error(`Nookal Data Error: ${result.errors[0].message}`);
+    throw new Error(`GraphQL Error: ${JSON.stringify(result.errors)}`);
   }
 
   return result;
@@ -121,7 +129,7 @@ app.post("/analyse", async (req, res) => {
     const booking = req.body;
     const clientAddress = booking.suburb || booking.clientAddress || "Melbourne, VIC";
 
-    // 1. Get Diary
+    // 1. Get Appointments (Diary)
     let diaryData = null;
     let diaryStatus = "";
     try {
@@ -162,7 +170,7 @@ INSTRUCTOR MODS:
 - Sherri: NO MODS. Standard only.
 - Yves: LFA, spinner, lollipop.
 
-DIARY DATA: Analyze the provided diary to identify gaps. 
+DIARY DATA: Analyze the provided appointment data to identify scheduling gaps. 
 If status is "DIARY ERROR", provide recommendations based on location and vehicle modifications only.`;
 
     const userMessage = `
@@ -176,10 +184,10 @@ Availability: ${booking.availability}
 TRAVEL TIMES (Base to Client):
 ${JSON.stringify(travelResults, null, 2)}
 
-DIARY DATA (Status: ${diaryStatus}):
+APPOINTMENT DATA (Status: ${diaryStatus}):
 ${JSON.stringify(diaryData, null, 2)}
 
-Respond with: Recommended Instructor, Geographic Routing, Suggested Time Slot (if diary available), Backup, and a Booking Note.`;
+Respond with: Recommended Instructor, Geographic Routing, Suggested Time Slot (if appointment data is available), Backup, and a Booking Note.`;
 
     const aiResponse = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
