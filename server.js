@@ -15,7 +15,7 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", message: "SDT running" });
 });
 
-// Fetch Nookal appointments directly using Basic Auth
+// Fetch Nookal appointments using Token Exchange + GraphQL
 async function getNookalDiary() {
   const clientId = process.env.NOOKAL_CLIENT_ID;
   const basickey = process.env.NOOKAL_BASIC_KEY;
@@ -24,24 +24,56 @@ async function getNookalDiary() {
     throw new Error("Missing NOOKAL_CLIENT_ID or NOOKAL_BASIC_KEY");
   }
 
-  // Basic auth base64 (clientId:basickey)
+  // 1. Get Access Token via Basic Auth
   const credentials = Buffer.from(clientId + ":" + basickey).toString("base64");
+  
+  const tokenResponse = await fetch("https://auzone1.nookal.com/api/v3.0/token", {
+    method: "POST",
+    headers: {
+      "Authorization": "Basic " + credentials,
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: "grant_type=client_credentials"
+  });
 
+  if (!tokenResponse.ok) {
+    const errText = await tokenResponse.text();
+    throw new Error("Nookal token error " + tokenResponse.status + ": " + errText);
+  }
+
+  const tokenData = await tokenResponse.json();
+  const accessToken = tokenData.access_token;
+
+  if (!accessToken) {
+    throw new Error("Failed to retrieve Nookal access token.");
+  }
+
+  // 2. Fetch Appointments via GraphQL with Bearer Token
   const today = new Date();
   const from = today.toISOString().split("T")[0];
   const future = new Date(today.getTime() + (30 * 24 * 60 * 60 * 1000));
   const to = future.toISOString().split("T")[0];
 
-  const query = `
-    query {
-      appointments(filters: { dateFrom: "${from}", dateTo: "${to}" }, pagination: { data: { id: true, date: true, startTime: true, endTime: true, status: true, practitioner: { firstName: true, lastName: true }, client: { firstName: true, lastName: true }, location: { name: true }, service: { name: true } } })
+  const query = `query {
+    appointments(filters: { dateFrom: "${from}", dateTo: "${to}" }, pagination: { limit: 200 }) {
+      data {
+        id
+        date
+        startTime
+        endTime
+        status
+        practitioner { firstName lastName }
+        client { firstName lastName }
+        location { name }
+        service { name }
+      }
     }
-  `;
+  }`;
 
   const response = await fetch("https://auzone1.nookal.com/api/v3.0/graphql", {
     method: "POST",
     headers: {
-      "Authorization": "Basic " + credentials,
+      "Authorization": "Bearer " + accessToken,
       "Content-Type": "application/json"
     },
     body: JSON.stringify({ query: query })
@@ -94,11 +126,9 @@ app.post("/analyse", async (req, res) => {
     }
 
     const booking = req.body;
-    
-    // MATCHING HTML FIELDS: Looking for 'suburb' first, then falling back
     const clientAddress = booking.suburb || booking.clientAddress || "";
 
-    // 1. Fetch Nookal diary directly
+    // 1. Fetch Nookal diary
     let diary = null;
     let nookalStatus = "";
     try {
@@ -134,7 +164,6 @@ app.post("/analyse", async (req, res) => {
     if (diary && diary.data && diary.data.appointments && diary.data.appointments.data) {
       const appts = diary.data.appointments.data;
 
-      // Group by practitioner and date
       const byPractitioner = {};
       appts.forEach(a => {
         const name = (a.practitioner?.firstName || "") + " " + (a.practitioner?.lastName || "");
@@ -151,7 +180,6 @@ app.post("/analyse", async (req, res) => {
         });
       });
 
-      // Sort each practitioner's appointments by date/time
       Object.keys(byPractitioner).forEach(name => {
         byPractitioner[name].sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start));
       });
@@ -161,7 +189,7 @@ app.post("/analyse", async (req, res) => {
       diaryText = "UNAVAILABLE " + nookalStatus;
     }
 
-    // 4. Build prompt with real data
+    // 4. Build prompt
     const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training in Melbourne, Victoria, Australia.
 You have REAL live diary data from Nookal and REAL drive times from Google Maps.
 
