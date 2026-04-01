@@ -133,26 +133,26 @@ async function fetchInstructorCalendar(instructor) {
     //     look the client up in Nookal to get their registered address; fall back
     //     to the suburb extracted from the notes if Nookal returns nothing.
     for (const appt of appts) {
-      if (appointmentIsFromHome(appt.notes)) {
+      // Priority 1: Explicit suburb in notes (handles ALL CAPS entries like "PASCOE VALE",
+      // "HEIDELBERG HEIGHTS", etc. and overrides any "from home" phrase in the same note —
+      // e.g. "PASCOE VALE Initial Ax with OT, Matthew White from home address" → Pascoe Vale)
+      const suburbInNotes = extractNoteSuburb(appt.notes);
+      if (suburbInNotes) {
+        const nookalSuburb = await getNookalClientSuburb(appt.summary);
+        if (nookalSuburb) {
+          appt.lessonLocation = nookalSuburb + " (from Nookal)";
+        } else {
+          appt.lessonLocation = suburbInNotes + " (from notes)";
+        }
+        console.log(`Location from notes: "${suburbInNotes}" → resolved to "${appt.lessonLocation}" for ${appt.summary}`);
+      } else if (appointmentIsFromHome(appt.notes)) {
+        // Priority 2: No suburb in notes, but "from home" / "pickup home" phrase present.
+        // Use the ICS location field (Nookal auto-fills it), or fall back to Nookal lookup.
         if (appt.location) {
           appt.lessonLocation = appt.location + " (client home)";
         } else {
           const suburb = await getNookalClientSuburb(appt.summary);
           if (suburb) appt.lessonLocation = suburb + " (client home, from Nookal)";
-        }
-      } else if (!appt.lessonLocation) {
-        // Suburb mentioned in notes but not an explicit "from home" phrase
-        const suburbInNotes = extractNoteSuburb(appt.notes);
-        if (suburbInNotes) {
-          // Try Nookal first for the registered street/suburb; fall back to the
-          // suburb name found in the notes.
-          const nookalSuburb = await getNookalClientSuburb(appt.summary);
-          if (nookalSuburb) {
-            appt.lessonLocation = nookalSuburb + " (from Nookal)";
-          } else {
-            appt.lessonLocation = suburbInNotes + " (from notes)";
-          }
-          console.log(`Location from notes: "${suburbInNotes}" → resolved to "${appt.lessonLocation}" for ${appt.summary}`);
         }
       }
     }
@@ -329,21 +329,27 @@ const MELBOURNE_SUBURBS = new Set([
 function extractNoteSuburb(notes) {
   if (!notes || notes.trim().length === 0) return null;
 
-  // Try explicit preposition patterns first: "at X", "from X", "in X", "pickup X"
-  const prepPattern = /\b(?:at|from|in|pickup|pick\s*up|p\/u)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\b/g;
+  // Notes can be ALL CAPS (e.g. "PASCOE VALE Initial Ax") or Title Case or mixed.
+  // Normalise to Title Case so the MELBOURNE_SUBURBS set can match either style.
+  function toTitle(str) {
+    return str.split(/\s+/).map(w => w ? w[0].toUpperCase() + w.slice(1).toLowerCase() : "").join(" ");
+  }
+
+  // Try explicit preposition patterns first (case-insensitive)
+  const prepPattern = /\b(?:at|from|in|pickup|pick\s*up|p\/u)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)\b/gi;
   let m;
   while ((m = prepPattern.exec(notes)) !== null) {
-    const candidate = m[1].trim();
+    const candidate = toTitle(m[1].trim());
     if (MELBOURNE_SUBURBS.has(candidate)) return candidate;
-    // Try just the first word (e.g. "Mount Eliza" where only "Mount" starts the match)
     const firstWord = candidate.split(/\s+/)[0];
     if (MELBOURNE_SUBURBS.has(firstWord)) return firstWord;
   }
 
-  // Fall back: scan all Title-Case words/phrases in the notes
-  const words = notes.match(/\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?\b/g) || [];
+  // Fall back: scan all word/phrase tokens (case-insensitive via title-case normalisation)
+  const words = notes.match(/\b[A-Za-z]+(?:\s+[A-Za-z]+)?\b/g) || [];
   for (const word of words) {
-    if (MELBOURNE_SUBURBS.has(word)) return word;
+    const titleCase = toTitle(word);
+    if (MELBOURNE_SUBURBS.has(titleCase)) return titleCase;
   }
 
   return null;
@@ -586,9 +592,10 @@ function filterAIOptions(text, lessonMinutes, diaries) {
       }
     }
 
-    // 7. Cross-check against actual diary BUSY blocks for the named instructor/date
-    //    Catches cases where the AI wrote "no appointment after" but a BUSY block
-    //    exists during the lesson window (e.g. an ignored HOLD entry)
+    // 7. Cross-check against actual diary BUSY blocks for the named instructor/date.
+    //    7a. Overlapping appointment (e.g. an ignored HOLD entry inside the lesson window).
+    //    7b. AI claimed "no appointment before" but diary shows an appointment ending
+    //        before the lesson start on the same day — means the AI fabricated a gap.
     if (!reject && diaries) {
       const headerMatch = block.match(/^OPTION \d+\n(\w+) — [^\d]*(\d+)\s+(\w+)/im);
       const timeMatch   = block.match(/,\s*(\d+:\d+[ap]m) to (\d+:\d+[ap]m)/i);
@@ -598,10 +605,10 @@ function filterAIOptions(text, lessonMinutes, diaries) {
         const optMonthStr = headerMatch[3].toLowerCase().substring(0, 3);
         const lessonS     = parseTimeToMinutes(timeMatch[1]);
         const lessonE     = parseTimeToMinutes(timeMatch[2]);
+        const noApptBefore = /appointment before:\s*no appointment/i.test(block);
         const diary = diaries.find(d => d.name.toLowerCase() === instrName);
         if (diary && lessonS !== null && lessonE !== null) {
           for (const appt of diary.appointments) {
-            // Match day + month from the appointment date string
             const apptDm = appt.date.toLowerCase().match(/(\d+)\s+(\w{3})/);
             if (!apptDm) continue;
             if (parseInt(apptDm[1]) !== optDay) continue;
@@ -609,10 +616,16 @@ function filterAIOptions(text, lessonMinutes, diaries) {
             const apptS = parseTimeToMinutes(appt.startTime);
             const apptE = parseTimeToMinutes(appt.endTime);
             if (apptS === null || apptE === null) continue;
-            // Overlap: lesson starts before appt ends AND lesson ends after appt starts
+            // 7a. Overlap: lesson window intersects a BUSY block
             if (lessonS < apptE && lessonE > apptS) {
               reject = true;
               reason = `overlaps ${appt.summary} (${appt.startTime}–${appt.endTime}) in diary`;
+              break;
+            }
+            // 7b. AI said "no appointment before" but diary has one ending before lesson start
+            if (noApptBefore && apptE <= lessonS) {
+              reject = true;
+              reason = `AI claimed no prior appointment but diary shows ${appt.summary} ending at ${appt.endTime}`;
               break;
             }
           }
@@ -715,6 +728,8 @@ app.post("/analyse", async (req, res) => {
 
     // 4. Format diary as readable text (not raw JSON) so AI can reason about busy/free times
     const diaryText = diaries.map(formatDiaryForAI).join("\n");
+    console.log("=== DIARY TEXT SENT TO AI ===\n" + diaryText);
+    console.log("=== TRAVEL TABLE SENT TO AI ===\n" + (interApptTravelTable || "(empty)"));
 
     // 5. Prompt
     const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training in Melbourne, Australia.
