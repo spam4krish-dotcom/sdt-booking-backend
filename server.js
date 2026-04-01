@@ -71,62 +71,89 @@ const INSTRUCTORS = [
 ];
 
 // ─── ICS CALENDAR FETCH ───────────────────────────────────────────────────────
+// node-ical 0.20.x fromURL is an async function — must be awaited, not called with a callback.
 async function fetchInstructorCalendar(instructor) {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      console.error(`ICS timeout for ${instructor.name}`);
-      resolve([]);
-    }, 12000);
+  try {
+    const rawData = await Promise.race([
+      ical.async.fromURL(instructor.icsUrl),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("ICS timeout")), 12000)
+      )
+    ]);
 
-    ical.fromURL(instructor.icsUrl, {}, (err, rawData) => {
-      clearTimeout(timer);
-      if (err) {
-        console.error(`ICS fetch failed for ${instructor.name}: ${err.message}`);
-        return resolve([]);
-      }
+    const now = new Date();
+    const future = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const appts = [];
 
-      const now = new Date();
-      const future = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-      const appts = [];
+    for (const key in rawData) {
+      const event = rawData[key];
+      if (event.type !== "VEVENT") continue;
 
-      for (const key in rawData) {
-        const event = rawData[key];
-        if (event.type !== "VEVENT") continue;
+      const start = new Date(event.start);
+      const end = new Date(event.end);
+      if (isNaN(start.getTime()) || start < now || start > future) continue;
 
-        const start = new Date(event.start);
-        const end = new Date(event.end);
-        if (isNaN(start.getTime()) || start < now || start > future) continue;
+      appts.push({
+        startISO: start.toISOString(),
+        endISO: end.toISOString(),
+        date: start.toLocaleDateString("en-AU", {
+          timeZone: "Australia/Melbourne",
+          weekday: "short",
+          day: "numeric",
+          month: "short",
+          year: "numeric"
+        }),
+        startTime: start.toLocaleTimeString("en-AU", {
+          timeZone: "Australia/Melbourne",
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: true
+        }),
+        endTime: end.toLocaleTimeString("en-AU", {
+          timeZone: "Australia/Melbourne",
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: true
+        }),
+        summary: event.summary || "Appointment",
+        location: event.location || ""
+      });
+    }
 
-        appts.push({
-          _sort: start.getTime(),
-          date: start.toLocaleDateString("en-AU", {
-            timeZone: "Australia/Melbourne",
-            weekday: "short",
-            day: "numeric",
-            month: "short",
-            year: "numeric"
-          }),
-          startTime: start.toLocaleTimeString("en-AU", {
-            timeZone: "Australia/Melbourne",
-            hour: "2-digit",
-            minute: "2-digit",
-            hour12: true
-          }),
-          endTime: end.toLocaleTimeString("en-AU", {
-            timeZone: "Australia/Melbourne",
-            hour: "2-digit",
-            minute: "2-digit",
-            hour12: true
-          }),
-          summary: event.summary || "Appointment",
-          location: event.location || ""
-        });
-      }
+    appts.sort((a, b) => new Date(a.startISO) - new Date(b.startISO));
+    console.log(`ICS OK: ${instructor.name} — ${appts.length} appointments fetched`);
+    return appts;
 
-      appts.sort((a, b) => a._sort - b._sort);
-      resolve(appts.map(({ _sort, ...rest }) => rest));
-    });
-  });
+  } catch (err) {
+    console.error(`ICS fetch error for ${instructor.name}: ${err.message}`);
+    return [];
+  }
+}
+
+// ─── FORMAT DIARY AS READABLE TEXT FOR AI ────────────────────────────────────
+// Converts appointment arrays into a clear per-day schedule the AI can reason about.
+function formatDiaryForAI(diary) {
+  if (!diary.appointments || diary.appointments.length === 0) {
+    return `${diary.name} (base: ${diary.base}): No appointments on record for the next 30 days — fully available.\n`;
+  }
+
+  // Group by date label
+  const byDate = {};
+  for (const appt of diary.appointments) {
+    if (!byDate[appt.date]) byDate[appt.date] = [];
+    byDate[appt.date].push(appt);
+  }
+
+  let text = `${diary.name} (base: ${diary.base}):\n`;
+  for (const [date, appts] of Object.entries(byDate)) {
+    const sorted = [...appts].sort((a, b) => new Date(a.startISO) - new Date(b.startISO));
+    text += `  ${date}:\n`;
+    for (const appt of sorted) {
+      const loc = appt.location ? ` | ${appt.location}` : "";
+      text += `    [BUSY] ${appt.startTime} – ${appt.endTime}: ${appt.summary}${loc}\n`;
+    }
+  }
+  return text;
 }
 
 // ─── GOOGLE MAPS TRAVEL TIME ──────────────────────────────────────────────────
@@ -231,11 +258,14 @@ app.post("/analyse", async (req, res) => {
       .map(t => `${t.name}: ${t.fromBase ? t.fromBase.duration + " / " + t.fromBase.distance : "unknown"} from base to ${clientSuburb}`)
       .join("\n");
 
-    // 4. Prompt
+    // 4. Format diary as readable text (not raw JSON) so AI can reason about busy/free times
+    const diaryText = diaries.map(formatDiaryForAI).join("\n");
+
+    // 5. Prompt
     const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training in Melbourne, Australia.
 
 CURRENT MELBOURNE DATE & TIME: ${melbTime}
-Use this as today. Do not recalculate or guess the date.
+Use this exact date/time as now. Do not recalculate it.
 
 CLIENT
 Name: ${booking.clientName}
@@ -249,36 +279,39 @@ Scheduling notes: ${booking.schedulingNotes || ""}
 Other notes: ${booking.otherNotes || ""}
 Instructor preference: ${booking.instructorPreference || "None"}
 
-TRAVEL TIMES FROM INSTRUCTOR HOME BASE TO CLIENT SUBURB
+TRAVEL TIMES (instructor home base → client suburb, from Google Maps)
 ${travelSummary}
 
-QUALIFIED INSTRUCTOR DIARIES (next 30 days)
-Every instructor in this list has the required vehicle modifications. Do not suggest anyone outside this list.
-${JSON.stringify(diaries, null, 2)}
+INSTRUCTOR SCHEDULES — NEXT 30 DAYS
+Every instructor listed has already been confirmed capable of the required modifications.
+[BUSY] lines are confirmed appointments. Any time NOT marked [BUSY] is potentially free.
+
+${diaryText}
 
 RULES
-1. Only recommend instructors from the list above.
-2. Sherri has no modifications — she only appears if no modifications were requested.
+1. Only suggest instructors shown above.
+2. Sherri has no vehicle modifications — she only appears here if the client needs no modifications.
 3. Gabriel is on holiday 25–30 Apr 2026. Do not suggest him on those dates.
-4. A slot is only valid if it fits the lesson duration PLUS travel time.
-5. Travel origin: if the instructor has a lesson ending before the proposed slot, travel comes FROM that lesson's location. If it is their first lesson of the day, travel comes FROM their home base.
-6. Use real travel times from the TRAVEL TIMES section above where available. For travel from mid-day locations, estimate using your Melbourne geography knowledge.
-7. Match the client's availability to real upcoming dates (day-of-week → next actual calendar date).
-8. Do not suggest a slot already blocked in the diary.
-9. Multiple options can be the same instructor on different days — pick whatever is genuinely optimal.
+4. A proposed slot is only valid if the gap between appointments is large enough for: travel time in + lesson duration + travel time out (to next appointment).
+5. TRAVEL ORIGIN: Look at what appointment ends immediately before the proposed slot. Travel comes FROM that appointment's location. If the proposed slot is the instructor's FIRST appointment of the day, travel comes from their home base.
+6. Use the Google Maps times above for base→client travel. For mid-day travel between suburbs, use your Melbourne geography knowledge.
+7. Map the client's availability (e.g. "Mon AM") to real upcoming calendar dates from today's date.
+8. Never suggest a time that overlaps with a [BUSY] block.
+9. Multiple options can be the same instructor on different days if that is genuinely the best fit.
 
-OUTPUT
-Plain text only. No asterisks, no bold, no bullet points, no filler sentences.
-Give 3 to 5 options ranked best-first. Start each directly with the slot details.
-
-Format each option exactly like this:
+OUTPUT RULES
+Plain text only. No asterisks, no bold, no bullet symbols.
+Give 3 to 5 options, best first.
+Each option must follow this exact format — no extra lines, no commentary between options:
 
 OPTION [N]
 [Instructor] — [Day] [Date] [Month], [Start time] to [End time]
-Travel: from [location] (~[X] min drive)
-Previous appointment: [ends HH:MM at Location] or [first appointment of the day]`;
+Appointment before: [client name, ends HH:MM at suburb] OR [no appointment — travelling from base]
+Appointment after: [client name, starts HH:MM at suburb] OR [no appointment after]
+Travel to client: from [suburb] ~[X] min
+Travel to next: ~[X] min to [next appointment suburb] OR [n/a]`;
 
-    // 5. Call Claude
+    // 6. Call Claude
     const aiResponse = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -304,6 +337,16 @@ Previous appointment: [ends HH:MM at Location] or [first appointment of the day]
     console.error("Server Error:", error.message);
     res.status(500).json({ error: error.message });
   }
+});
+
+// ─── DEBUG: verify ICS fetch for one instructor ───────────────────────────────
+// GET /debug?name=Christian  (or Greg, Gabriel, etc.)
+app.get("/debug", async (req, res) => {
+  const name = req.query.name || "Christian";
+  const instructor = INSTRUCTORS.find(i => i.name.toLowerCase() === name.toLowerCase());
+  if (!instructor) return res.status(404).json({ error: `Unknown instructor: ${name}` });
+  const appts = await fetchInstructorCalendar(instructor);
+  res.json({ instructor: instructor.name, count: appts.length, appointments: appts });
 });
 
 app.get("/health", (req, res) => res.json({ status: "ok" }));
