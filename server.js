@@ -1,6 +1,5 @@
 const express = require("express");
 const cors = require("cors");
-const ical = require("node-ical");
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -8,66 +7,77 @@ const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
-const INSTRUCTOR_FEEDS = {
-  "Greg": "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fgA7lzqZCrNH6P0mJPZWpJqu4G4d87qHmXHYUUq3ZhplneSIXp12lfHZzfvGyQdDw%3D%3D",
-  "Christian": "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fnXpnN%2FtMeidfD9E6WmLBWPsPF881mF4%2FDKjqX6mENEnlggTWF2jMn8Em8aKgSGXA%3D%3D",
-  "Gabriel": "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2a52GEgwyPVJ%2B0I6mOab2rD4%2Bmqr7EYvQGR9ykfeKAj%2F",
-  "Yves": "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaJ6xepUO6AS0mQIBuSqW%2BOWjh2dEdLM2ryJYQBbgLemmcR6jFHgrJeGdQCO3yfSW7dInaTI63gFq7aNCi2ArGCg%3D%3D",
-  "Marc": "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2ecoRZN2xzdtmsUYY9vDrAuMuEJAzQSivaNXrwqSOqrMT982Jq4gficfE9XDNSVl0A%3D%3D",
-  "Jason": "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Sks8REnxfIzFLWWhJgXRykKsTkQKIlND6Q3P8UWc8WWFJCS5Y5gIU0xiqPfnSz%2FkQ%3D%3D",
-  "Sherri": "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Qm9F8eQzb%2B6bu2IC%2FLaNBOOWmK9yskJZYl8guOGtP67bXXfuA0nBVLMaaPL2rsqew%3D%3D"
-};
+// Set your credentials in Railway Environment Variables:
+// NOOKAL_CLIENT_ID, NOOKAL_BASIC_KEY, ANTHROPIC_API_KEY, GOOGLE_MAPS_API_KEY
+
+async function getNookalDiary() {
+  const clientId = process.env.NOOKAL_CLIENT_ID;
+  const basickey = process.env.NOOKAL_BASIC_KEY;
+
+  if (!clientId || !basickey) throw new Error("Missing Nookal Credentials");
+
+  const credentials = Buffer.from(clientId + ":" + basickey).toString("base64");
+  
+  // Calculate date range in Melbourne Time
+  const now = new Date();
+  const melbNow = new Date(now.toLocaleString("en-US", {timeZone: "Australia/Melbourne"}));
+  const from = melbNow.toISOString().split("T")[0];
+  const future = new Date(melbNow.getTime() + (14 * 24 * 60 * 60 * 1000));
+  const to = future.toISOString().split("T")[0];
+
+  // We explicitly request 'notes' and 'comments' here to find locations like "Berwick"
+  const query = `
+    query {
+      appointments(filters: { dateFrom: "${from}", dateTo: "${to}" }, pagination: { data: { 
+        id: true, 
+        date: true, 
+        startTime: true, 
+        endTime: true, 
+        notes: true,
+        comments: true,
+        practitioner: { firstName: true, lastName: true }, 
+        location: { name: true },
+        service: { name: true }
+      } })
+    }
+  `;
+
+  const response = await fetch("https://auzone1.nookal.com/api/v3.0/graphql", {
+    method: "POST",
+    headers: {
+      "Authorization": "Basic " + credentials,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ query: query })
+  });
+
+  const result = await response.json();
+  if (result.errors) throw new Error(JSON.stringify(result.errors));
+  return result.data.appointments.data;
+}
 
 app.post("/analyse", async (req, res) => {
   try {
     const booking = req.body;
+    const diaryData = await getNookalDiary();
     
-    // Fix Timezone: Get Melbourne Date/Time
-    const now = new Date();
-    const melbTime = now.toLocaleString("en-AU", { timeZone: "Australia/Melbourne" });
-    const melbDay = now.toLocaleDateString("en-AU", { weekday: 'long', timeZone: "Australia/Melbourne" });
-
-    // Fetch Diaries
-    const diaries = {};
-    for (const [name, url] of Object.entries(INSTRUCTOR_FEEDS)) {
-      const data = await ical.fromURL(url);
-      diaries[name] = Object.values(data)
-        .filter(ev => ev.type === 'VEVENT')
-        .map(ev => ({
-          start: ev.start,
-          end: ev.end,
-          location: ev.location || "Unknown",
-          summary: ev.summary
-        }));
-    }
+    // Get Current Melbourne Time for the AI
+    const melbTime = new Date().toLocaleString("en-AU", {
+      timeZone: "Australia/Melbourne",
+      dateStyle: "full",
+      timeStyle: "short"
+    });
 
     const systemPrompt = `You are the SDT Booking Assistant. 
-STRICT RULES:
-1. NO MARKDOWN BOLDING (**). Use plain text or simple dashes.
-2. NO EXTRA FLUFF. Do not list mods the instructor has if they aren't the ones requested.
-3. START WITH THE OPTIONS. Put the best 3-5 specific time slots first.
-4. CHAIN ROUTING: Check the "location" of the appointment immediately before and after a gap. If an instructor is in Brunswick and the client is in Templestowe, factor in 30 mins travel.
-
-CURRENT MELBOURNE CONTEXT:
-Date/Time: ${melbTime} (${melbDay})
-
-INSTRUCTOR MODS:
-- Christian: LFA, Fadiel, satellite acc, e-radial.
-- Gabriel: LFA, Fadiel, Monarch. (Holiday 25-30 Apr)
-- Greg: LFA, spinner.
-- Jason: LFA, spinner.
-- Marc: LFA, extension pedals.
-- Sherri: Standard only.
-- Yves: LFA, spinner.`;
+Today is ${melbTime}. 
+CRITICAL: Use the "notes" and "comments" fields in the diary data to identify if an instructor is in a specific suburb (e.g., Berwick). 
+If the notes say "Berwick," assume the instructor is there for that time slot.
+If a day is Thursday April 2nd, do not call it April 3rd.`;
 
     const userMessage = `
-CLIENT: ${booking.clientName}
-SUBURB: ${booking.suburb}
-MODS: ${booking.modifications}
-AVAILABILITY PREFERENCE: ${booking.availability}
-DIARY DATA: ${JSON.stringify(diaries)}
-
-Task: Provide 3-5 specific booking options. Mention travel time between their previous appointment location and the client's suburb.`;
+NEW BOOKING: ${booking.suburb}
+DIARY DATA: ${JSON.stringify(diaryData)}
+Provide 3 specific options based on these gaps. No bold text.`;
 
     const aiResponse = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -84,12 +94,12 @@ Task: Provide 3-5 specific booking options. Mention travel time between their pr
       })
     });
 
-    const result = await aiResponse.json();
-    res.json(result);
+    const data = await aiResponse.json();
+    res.json(data);
 
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.listen(PORT, () => console.log(`SDT Server Active`));
+app.listen(PORT, () => console.log(`Server running on ${PORT}`));
