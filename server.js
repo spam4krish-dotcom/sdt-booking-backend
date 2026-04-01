@@ -439,12 +439,26 @@ app.post("/analyse", async (req, res) => {
       )
     ]);
 
-    // 3. Authoritative Melbourne time
-    const melbTime = new Date().toLocaleString("en-AU", {
+    // 3. Authoritative Melbourne time + reference calendar for day-of-week verification
+    const nowMelb = new Date(new Date().toLocaleString("en-US", { timeZone: "Australia/Melbourne" }));
+    const melbTime = nowMelb.toLocaleString("en-AU", {
       timeZone: "Australia/Melbourne",
       dateStyle: "full",
       timeStyle: "short"
     });
+
+    // Generate the next 30 days with correct day labels so the AI can verify
+    // its own day-of-week calculations and never suggest dates outside this window.
+    const calendarRef = Array.from({ length: 30 }, (_, i) => {
+      const d = new Date(nowMelb);
+      d.setDate(d.getDate() + i);
+      return d.toLocaleDateString("en-AU", {
+        timeZone: "Australia/Melbourne",
+        weekday: "short",
+        day: "numeric",
+        month: "short"
+      });
+    }).join(", ");
 
     // Build travel lookup string for the prompt
     const travelSummary = travelTimes
@@ -459,6 +473,10 @@ app.post("/analyse", async (req, res) => {
 
 CURRENT MELBOURNE DATE & TIME: ${melbTime}
 Use this exact date/time as now. Do not recalculate it.
+
+REFERENCE CALENDAR — next 30 days (correct day/date pairs, Melbourne time):
+${calendarRef}
+You MUST verify every date you suggest against this list. If the day-of-week you wrote does not match this calendar, correct it before outputting. Never suggest a date that does not appear in this list.
 
 CLIENT
 Name: ${booking.clientName}
@@ -507,9 +525,10 @@ RULES
 
    Validity check:
      ARRIVE_NEXT must be <= NEXT_START.
-     If ARRIVE_NEXT > NEXT_START, the slot is IMPOSSIBLE. Discard it silently. Do not mention it in the output.
-     If there is no next appointment, ARRIVE_NEXT does not need to meet any deadline.
-     If there is no previous appointment, PREV_END = start of day; TRAVEL_IN comes from instructor home base.
+     If ARRIVE_NEXT > NEXT_START, the slot is IMPOSSIBLE — do not output it under any circumstances.
+     A slot that fails the gap check must NEVER appear in your response, even if you label it NOT OK.
+     The only options you output are ones where ARRIVE_NEXT <= NEXT_START (or there is no next appointment).
+     If there is no previous appointment, PREV_END = start of day (earliest 8:00am); TRAVEL_IN comes from instructor home base.
 
 5. TRAVEL TIMES:
    a. Use the Google Maps figures provided above for instructor base → client suburb.
@@ -523,12 +542,12 @@ RULES
 
 7. Map the client's availability (e.g. "Mon AM") to real upcoming calendar dates from today's date.
 8. Never suggest a time that overlaps with a [BUSY] block.
-9. Multiple options can be the same instructor on different days if that is genuinely the best fit.
+9. Try to spread recommendations across different instructors. Do not default to the same instructor for all options — check every qualified instructor's schedule before deciding.
 
 OUTPUT RULES
-Do all slot validity calculations silently — never print rejected candidates, never show your working.
+Do all slot validity and date-verification checks silently — never print rejected candidates, never show your working.
 Plain text only. No asterisks, no bold, no bullet symbols.
-Give 3 to 5 valid options, best first.
+Give 3 to 5 valid options, best first. Aim for at least 2 different instructors across the options.
 Each option must follow this exact format with no extra lines or commentary between options:
 
 OPTION [N]
