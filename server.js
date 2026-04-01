@@ -466,23 +466,32 @@ app.get("/debug-client", async (req, res) => {
       }
     }`;
 
-    const resp = await fetch("https://auzone1.nookal.com/api/v3.0/graphql", {
-      method: "POST",
-      headers: { "Authorization": "Basic " + creds, "Content-Type": "application/json" },
-      body: JSON.stringify({ query }),
-      signal: AbortSignal.timeout(8000)
-    });
+    // Try three plausible Nookal endpoint formats and return all results
+    const endpoints = [
+      { label: "GraphQL POST", url: "https://auzone1.nookal.com/api/v3.0/graphql", method: "POST", body: JSON.stringify({ query }) },
+      { label: "REST GET clients", url: `https://auzone1.nookal.com/api/v3.0/clients/?firstName=${encodeURIComponent(firstName)}&lastName=${encodeURIComponent(lastName)}`, method: "GET", body: null },
+      { label: "REST POST clients", url: "https://auzone1.nookal.com/api/v3.0/clients/", method: "POST", body: JSON.stringify({ firstName, lastName }) }
+    ];
 
-    const raw = await resp.json();
-    // Return everything: HTTP status, full Nookal response, and our extracted suburb
-    res.json({
-      httpStatus: resp.status,
-      queriedName: name,
-      firstName,
-      lastName,
-      rawNookalResponse: raw,
-      extractedSuburb: raw?.data?.clients?.data?.[0]?.address?.suburb || null
-    });
+    const results = [];
+    for (const ep of endpoints) {
+      try {
+        const r = await fetch(ep.url, {
+          method: ep.method,
+          headers: { "Authorization": "Basic " + creds, "Content-Type": "application/json" },
+          ...(ep.body ? { body: ep.body } : {}),
+          signal: AbortSignal.timeout(8000)
+        });
+        const text = await r.text();
+        let parsed = null;
+        try { parsed = JSON.parse(text); } catch {}
+        results.push({ label: ep.label, httpStatus: r.status, rawText: text.slice(0, 500), parsed });
+      } catch (err) {
+        results.push({ label: ep.label, error: err.message });
+      }
+    }
+
+    res.json({ queriedName: name, firstName, lastName, results });
   } catch (err) {
     res.json({ error: err.message });
   }
