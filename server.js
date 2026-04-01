@@ -18,7 +18,7 @@ const INSTRUCTORS = [
     mods: ["LFA", "Spinner", "Hand Controls", "Satellite", "Indicator Extension", "Extension Pedals"],
     base: "Montmorency",
     notes: "Covers all areas by arrangement. Full modifications vehicle.",
-    icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fnXpnN%2FtMeidfD9E6WmLBWsPF881mF4%2FDKjqX6mENEnlggTWF2jMn8Em8aKgSGXA%3D%3D"
+    icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fnXpnN%2FtMeidfD9E6WmLBWPsPF881mF4%2FDKjqX6mENEnlggTWF2jMn8Em8aKgSGXA%3D%3D"
   },
   {
     name: "Gabriel",
@@ -116,7 +116,8 @@ async function fetchInstructorCalendar(instructor) {
           hour12: true
         }),
         summary: event.summary || "Appointment",
-        location: event.location || ""
+        location: event.location || "",
+        notes: (event.description || "").replace(/\n/g, " ").trim()
       });
     }
 
@@ -149,8 +150,9 @@ function formatDiaryForAI(diary) {
     const sorted = [...appts].sort((a, b) => new Date(a.startISO) - new Date(b.startISO));
     text += `  ${date}:\n`;
     for (const appt of sorted) {
-      const loc = appt.location ? ` | ${appt.location}` : "";
-      text += `    [BUSY] ${appt.startTime} – ${appt.endTime}: ${appt.summary}${loc}\n`;
+        const loc = appt.location ? ` | addr: ${appt.location}` : "";
+      const notes = appt.notes ? ` | notes: ${appt.notes}` : "";
+      text += `    [BUSY] ${appt.startTime} – ${appt.endTime}: ${appt.summary}${loc}${notes}\n`;
     }
   }
   return text;
@@ -294,10 +296,11 @@ RULES
 3. Gabriel is on holiday 25–30 Apr 2026. Do not suggest him on those dates.
 4. A proposed slot is only valid if the gap between appointments is large enough for: travel time in + lesson duration + travel time out (to next appointment).
 5. TRAVEL ORIGIN: Look at what appointment ends immediately before the proposed slot. Travel comes FROM that appointment's location. If the proposed slot is the instructor's FIRST appointment of the day, travel comes from their home base.
-6. Use the Google Maps times above for base→client travel. For mid-day travel between suburbs, use your Melbourne geography knowledge.
-7. Map the client's availability (e.g. "Mon AM") to real upcoming calendar dates from today's date.
-8. Never suggest a time that overlaps with a [BUSY] block.
-9. Multiple options can be the same instructor on different days if that is genuinely the best fit.
+6. LOCATION NOTE: The "addr:" field in appointments is the client's home address from Nookal. The actual lesson pickup/meeting location is often in the "notes:" field (e.g. "from ActiveOne FRANKSTON" means the lesson starts at Frankston, not the client's home). Use the notes field as the actual travel origin/destination when it contains a suburb or location name.
+7. Use the Google Maps times above for base→client travel. For mid-day travel between suburbs, use your Melbourne geography knowledge.
+8. Map the client's availability (e.g. "Mon AM") to real upcoming calendar dates from today's date.
+9. Never suggest a time that overlaps with a [BUSY] block.
+10. Multiple options can be the same instructor on different days if that is genuinely the best fit.
 
 OUTPUT RULES
 Plain text only. No asterisks, no bold, no bullet symbols.
