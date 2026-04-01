@@ -488,13 +488,17 @@ function parseTimeToMinutes(str) {
 }
 
 function filterAIOptions(text, lessonMinutes) {
-  // Preamble = everything before the first "OPTION N" line.
-  // Using parts[0] with the old split was wrong: when the AI starts directly
-  // with "OPTION 1" (no preceding newline) the entire first block ended up in
-  // preamble and bypassed all filtering.
-  const firstOptionPos = text.search(/^OPTION \d/m);
+  // Preamble = everything before the first "OPTION N" occurrence.
+  const firstOptionPos = text.search(/\bOPTION \d\b/);
   const preamble = firstOptionPos > 0 ? text.slice(0, firstOptionPos).trim() : "";
-  const optionBlocks = text.match(/^OPTION \d[\s\S]*?(?=\nOPTION \d|$)/gm) || [];
+
+  // Split at every "OPTION N" boundary (lookahead keeps the delimiter in each chunk),
+  // then filter to only keep chunks that actually start with an OPTION header.
+  // This avoids the gm/$-matches-end-of-line bug that stripped block content.
+  const optionBlocks = text
+    .split(/(?=\bOPTION \d\b)/)
+    .map(b => b.trim())
+    .filter(b => /^OPTION \d/.test(b));
 
   const passing = [];
   for (const block of optionBlocks) {
