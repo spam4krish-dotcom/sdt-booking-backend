@@ -424,10 +424,13 @@ function parseTimeToMinutes(str) {
 }
 
 function filterAIOptions(text, lessonMinutes) {
-  // Split text on OPTION N boundaries, keeping any preamble
-  const parts = text.split(/(?=\nOPTION \d)/);
-  const preamble = parts[0].replace(/\nOPTION \d[\s\S]*/, "").trim();
-  const optionBlocks = text.match(/OPTION \d[\s\S]*?(?=\nOPTION \d|$)/g) || [];
+  // Preamble = everything before the first "OPTION N" line.
+  // Using parts[0] with the old split was wrong: when the AI starts directly
+  // with "OPTION 1" (no preceding newline) the entire first block ended up in
+  // preamble and bypassed all filtering.
+  const firstOptionPos = text.search(/^OPTION \d/m);
+  const preamble = firstOptionPos > 0 ? text.slice(0, firstOptionPos).trim() : "";
+  const optionBlocks = text.match(/^OPTION \d[\s\S]*?(?=\nOPTION \d|$)/gm) || [];
 
   const passing = [];
   for (const block of optionBlocks) {
@@ -471,6 +474,21 @@ function filterAIOptions(text, lessonMinutes) {
         const afterStart = parseTimeToMinutes(afterMatch[1]);
         if (lessonEnd !== null && afterStart !== null && afterStart < lessonEnd) {
           reject = true; reason = `appointment after (${afterMatch[1]}) is before lesson end (${lessonMatch[2]})`;
+        }
+      }
+    }
+
+    // 5. Lesson must start AFTER the previous appointment ends
+    //    (catches cases where the AI starts the lesson at the exact moment
+    //     the previous client ends, before any travel time has elapsed)
+    if (!reject) {
+      const lessonMatch = block.match(/,\s*(\d+:\d+[ap]m) to/i);
+      const prevMatch   = block.match(/appointment before:.*ends (\d+:\d+[ap]m)/i);
+      if (lessonMatch && prevMatch) {
+        const prevEnd    = parseTimeToMinutes(prevMatch[1]);
+        const lessonStart = parseTimeToMinutes(lessonMatch[1]);
+        if (prevEnd !== null && lessonStart !== null && lessonStart <= prevEnd) {
+          reject = true; reason = `lesson starts at ${lessonMatch[1]} but prev appt ends at ${prevMatch[1]}`;
         }
       }
     }
