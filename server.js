@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const ical = require("node-ical");
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -7,105 +8,71 @@ const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
-app.get("/", (req, res) => {
-  res.json({ status: "ok", message: "SDT Booking Assistant backend is live" });
-});
+// The ICS feeds you provided
+const INSTRUCTOR_FEEDS = {
+  "Greg": "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fgA7lzqZCrNH6P0mJPZWpJqu4G4d87qHmXHYUUq3ZhplneSIXp12lfHZzfvGyQdDw%3D%3D",
+  "Christian": "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fnXpnN%2FtMeidfD9E6WmLBWPsPF881mF4%2FDKjqX6mENEnlggTWF2jMn8Em8aKgSGXA%3D%3D",
+  "Gabriel": "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2a52GEgwyPVJ%2B0I6mOab2rD4%2Bmqr7EYvQGR9ykfeKAj%2F",
+  "Yves": "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaJ6xepUO6AS0mQIBuSqW%2BOWjh2dEdLM2ryJYQBbgLemmcR6jFHgrJeGdQCO3yfSW7dInaTI63gFq7aNCi2ArGCg%3D%3D",
+  "Marc": "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2ecoRZN2xzdtmsUYY9vDrAuMuEJAzQSivaNXrwqSOqrMT982Jq4gficfE9XDNSVl0A%3D%3D",
+  "Jason": "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Sks8REnxfIzFLWWhJgXRykKsTkQKIlND6Q3P8UWc8WWFJCS5Y5gIU0xiqPfnSz%2FkQ%3D%3D",
+  "Sherri": "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Qm9F8eQzb%2B6bu2IC%2FLaNBOOWmK9yskJZYl8guOGtP67bXXfuA0nBVLMaaPL2rsqew%3D%3D"
+};
 
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", message: "SDT running" });
-});
+const INSTRUCTOR_BASES = {
+  "Christian": "Montmorency VIC",
+  "Gabriel": "Croydon North VIC",
+  "Greg": "Kilsyth VIC",
+  "Jason": "Wandin North VIC",
+  "Marc": "Werribee VIC",
+  "Sherri": "Wandin North VIC",
+  "Yves": "Rye VIC"
+};
 
-/**
- * NOOKAL V3 AUTH & DATA FETCH
- */
-async function getNookalDiary() {
-  const clientId = process.env.NOOKAL_CLIENT_ID;
-  const clientSecret = process.env.NOOKAL_BASIC_KEY;
+// Helper to fetch and clean diary events
+async function getAllDiaries() {
+  const allEvents = {};
+  const now = new Date();
+  const thirtyDaysLater = new Date();
+  thirtyDaysLater.setDate(now.getDate() + 30);
 
-  if (!clientId || !clientSecret) {
-    throw new Error("Missing NOOKAL_CLIENT_ID or NOOKAL_BASIC_KEY in Railway.");
-  }
-
-  // 1. EXCHANGE CREDENTIALS FOR AN ACCESS TOKEN
-  const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
-  
-  // Removed 'scope=all' as it can sometimes cause 400 errors if the client isn't configured for it
-  const tokenResponse = await fetch("https://auzone1.nookal.com/api/v3.0/token", {
-    method: "POST",
-    headers: {
-      "Authorization": `Basic ${credentials}`,
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
-    body: "grant_type=client_credentials"
-  });
-
-  if (!tokenResponse.ok) {
-    const errText = await tokenResponse.text();
-    throw new Error(`Token Auth Failed (${tokenResponse.status}): ${errText}`);
-  }
-
-  const tokenData = await tokenResponse.json();
-  const accessToken = tokenData.access_token;
-
-  if (!accessToken) {
-    throw new Error("Nookal did not return an access token.");
-  }
-
-  // 2. FETCH APPOINTMENTS VIA GRAPHQL
-  const today = new Date();
-  const from = today.toISOString().split("T")[0];
-  const future = new Date(today.getTime() + (30 * 24 * 60 * 60 * 1000));
-  const to = future.toISOString().split("T")[0];
-
-  // Stripped out pagination wrappers that might violate Nookal's strict GraphQL schema.
-  // We are requesting exactly what you gave the API key permission to access.
-  const query = `
-    query {
-      appointments(filters: { dateFrom: "${from}", dateTo: "${to}" }) {
-        data {
-          id
-          date
-          startTime
-          endTime
-          status
-          practitioner { firstName lastName }
-          client { firstName lastName }
-          location { name }
-          service { name }
+  for (const [name, url] of Object.entries(INSTRUCTOR_FEEDS)) {
+    try {
+      const data = await ical.fromURL(url);
+      const events = [];
+      
+      for (const k in data) {
+        if (data.hasOwnProperty(k)) {
+          const ev = data[k];
+          if (ev.type === 'VEVENT') {
+            const start = new Date(ev.start);
+            // Only grab events in the next 30 days to keep the AI prompt small
+            if (start >= now && start <= thirtyDaysLater) {
+              events.push({
+                start: ev.start,
+                end: ev.end,
+                summary: ev.summary || "Busy",
+                location: ev.location || "On Road"
+              });
+            }
+          }
         }
       }
+      allEvents[name] = events.sort((a, b) => new Date(a.start) - new Date(b.start));
+    } catch (e) {
+      allEvents[name] = "Error fetching diary: " + e.message;
     }
-  `;
-
-  const response = await fetch("https://auzone1.nookal.com/api/v3.0/graphql", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ query })
-  });
-
-  const result = await response.json();
-  
-  if (result.errors) {
-    throw new Error(`GraphQL Error: ${JSON.stringify(result.errors)}`);
   }
-
-  return result;
+  return allEvents;
 }
 
-/**
- * GOOGLE MAPS DRIVE TIME HELPER
- */
+// Google Maps travel time helper
 async function getDriveTime(origin, destination) {
   try {
     const key = process.env.GOOGLE_MAPS_API_KEY;
-    const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${encodeURIComponent(origin + ", VIC, Australia")}&destinations=${encodeURIComponent(destination + ", VIC, Australia")}&mode=driving&key=${key}`;
-
+    const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${encodeURIComponent(origin + ", VIC")}&destinations=${encodeURIComponent(destination + ", VIC")}&mode=driving&key=${key}`;
     const response = await fetch(url);
     const data = await response.json();
-
     if (data.rows?.[0]?.elements?.[0]?.status === "OK") {
       return {
         duration: data.rows[0].elements[0].duration.text,
@@ -113,81 +80,53 @@ async function getDriveTime(origin, destination) {
       };
     }
     return null;
-  } catch (err) {
-    return null;
-  }
+  } catch (err) { return null; }
 }
 
-/**
- * MAIN ANALYSIS ENDPOINT
- */
 app.post("/analyse", async (req, res) => {
   try {
     const anthropicKey = process.env.ANTHROPIC_API_KEY;
-    if (!anthropicKey) return res.status(500).json({ error: "Missing ANTHROPIC_API_KEY" });
-
     const booking = req.body;
-    const clientAddress = booking.suburb || booking.clientAddress || "Melbourne, VIC";
+    const clientAddress = booking.suburb || "Melbourne, VIC";
 
-    // 1. Get Appointments (Diary)
-    let diaryData = null;
-    let diaryStatus = "";
-    try {
-      const result = await getNookalDiary();
-      diaryData = result.data?.appointments?.data || [];
-      diaryStatus = `OK: Found ${diaryData.length} records.`;
-    } catch (err) {
-      diaryStatus = `DIARY ERROR: ${err.message}`;
-    }
+    // 1. Fetch all ICS Diaries
+    const diaries = await getAllDiaries();
 
-    // 2. Get Travel Times
-    const bases = {
-      "Christian": "Montmorency VIC",
-      "Gabriel": "Croydon North VIC",
-      "Greg": "Kilsyth VIC",
-      "Jason": "Wandin North VIC",
-      "Marc": "Werribee VIC",
-      "Sherri": "Wandin North VIC",
-      "Yves": "Rye VIC"
-    };
-
+    // 2. Fetch Travel Times
     const travelResults = {};
-    for (const [name, addr] of Object.entries(bases)) {
+    for (const [name, addr] of Object.entries(INSTRUCTOR_BASES)) {
       const dt = await getDriveTime(clientAddress, addr);
       if (dt) travelResults[name] = dt;
     }
 
-    // 3. Prepare AI Prompt
-    const systemPrompt = `You are the SDT Booking Assistant. 
-MODEL LOCK: claude-sonnet-4-20250514.
+    // 3. AI Analysis
+    const systemPrompt = `You are the SDT Booking Assistant.
+MODEL: claude-sonnet-4-20250514.
 
 INSTRUCTOR MODS:
-- Christian: Most comprehensive (Fadiel, satellite acc, e-radial, LFA, etc.)
-- Gabriel: Comprehensive (Fadiel, Monarch, LFA). HOLIDAY 25-30 Apr 2026.
+- Christian: Fadiel, satellite acc, e-radial, LFA, etc. (High level)
+- Gabriel: Fadiel, Monarch, LFA. (Holiday 25-30 Apr 2026)
 - Greg: LFA, spinner, lollipop.
-- Jason: LFA, spinner only.
+- Jason: LFA, spinner.
 - Marc: LFA, extension pedals, spinner.
-- Sherri: NO MODS. Standard only.
+- Sherri: Standard only (No mods).
 - Yves: LFA, spinner, lollipop.
 
-DIARY DATA: Analyze the provided appointment data to identify scheduling gaps. 
-If status is "DIARY ERROR", provide recommendations based on location and vehicle modifications only.`;
+TASK: Find the best instructor based on:
+1. Required modifications.
+2. Proximity (travel time).
+3. Diary Gaps (Check the 'start' and 'end' times provided in the DIARY DATA).`;
 
     const userMessage = `
-CLIENT INFO:
-Name: ${booking.clientName}
-Location: ${clientAddress}
-Mods Needed: ${booking.modifications}
-Notes: ${booking.modNotes}
-Availability: ${booking.availability}
+CLIENT: ${booking.clientName}
+LOCATION: ${clientAddress}
+MODS NEEDED: ${booking.modifications}
+AVAILABILITY: ${booking.availability}
 
-TRAVEL TIMES (Base to Client):
-${JSON.stringify(travelResults, null, 2)}
+TRAVEL FROM BASE: ${JSON.stringify(travelResults)}
+DIARY DATA (Next 30 Days): ${JSON.stringify(diaries)}
 
-APPOINTMENT DATA (Status: ${diaryStatus}):
-${JSON.stringify(diaryData, null, 2)}
-
-Respond with: Recommended Instructor, Geographic Routing, Suggested Time Slot (if appointment data is available), Backup, and a Booking Note.`;
+Respond with: Recommended Instructor, Geographic Routing, Suggested Time Slot, Backup, and a Booking Note.`;
 
     const aiResponse = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -198,7 +137,7 @@ Respond with: Recommended Instructor, Geographic Routing, Suggested Time Slot (i
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 1500,
+        max_tokens: 2000,
         system: systemPrompt,
         messages: [{ role: "user", content: userMessage }]
       })
@@ -212,4 +151,4 @@ Respond with: Recommended Instructor, Geographic Routing, Suggested Time Slot (i
   }
 });
 
-app.listen(PORT, () => console.log(`SDT Assistant running on ${PORT}`));
+app.listen(PORT, () => console.log(`SDT running on ${PORT}`));
