@@ -485,20 +485,47 @@ RULES
 1. Only suggest instructors shown above.
 2. Sherri has no vehicle modifications — she only appears here if the client needs no modifications.
 3. Gabriel is on holiday 25–30 Apr 2026. Do not suggest him on those dates.
-4. A proposed slot is only valid if the gap between appointments is large enough for: travel time in + lesson duration + travel time out (to next appointment).
-5. TRAVEL ORIGIN: Look at what appointment ends immediately before the proposed slot. Travel comes FROM that appointment's location. If the proposed slot is the instructor's FIRST appointment of the day, travel comes from their home base.
-6. LOCATION PRIORITY for each appointment (use the first available):
-   a. "LESSON LOCATION:" field — this is the confirmed pickup/meeting point resolved by the server (from Nookal address or notes). Always use this if present.
-   b. If no LESSON LOCATION, check the "notes:" field for a suburb or place name (e.g. "from ActiveOne FRANKSTON" → Frankston, "Berwick" → Berwick).
-   c. If neither, use the "addr:" field as a last resort (it is the client's home address from Nookal).
-7. Use the Google Maps times above for base→client travel. For mid-day travel between suburbs, use your Melbourne geography knowledge.
-8. Map the client's availability (e.g. "Mon AM") to real upcoming calendar dates from today's date.
-9. Never suggest a time that overlaps with a [BUSY] block.
-10. Multiple options can be the same instructor on different days if that is genuinely the best fit.
+
+4. SLOT VALIDITY — run this exact calculation for EVERY candidate slot. Reject it if the numbers do not work out.
+
+   Definitions:
+     PREV_END    = clock time the appointment before the slot ends
+     PREV_LOC    = suburb/location of that appointment
+     TRAVEL_IN   = driving minutes from PREV_LOC to the client's suburb
+     LESSON      = lesson duration in minutes (given above)
+     NEXT_START  = clock time the appointment after the slot begins
+     NEXT_LOC    = suburb/location of that next appointment
+     TRAVEL_OUT  = driving minutes from client's suburb to NEXT_LOC
+     BUFFER      = 10 minutes (mandatory padding on each travel leg for parking/delays)
+
+   Calculations:
+     EARLIEST_START = PREV_END + TRAVEL_IN + BUFFER
+     LESSON_END     = EARLIEST_START + LESSON
+     ARRIVE_NEXT    = LESSON_END + TRAVEL_OUT + BUFFER
+
+   Validity check:
+     ARRIVE_NEXT must be <= NEXT_START.
+     If ARRIVE_NEXT > NEXT_START, the slot is IMPOSSIBLE. Discard it. Do not suggest it.
+     If there is no next appointment, ARRIVE_NEXT does not need to meet any deadline.
+     If there is no previous appointment, PREV_END = start of day; TRAVEL_IN comes from instructor home base.
+
+5. TRAVEL TIMES:
+   a. Use the Google Maps figures provided above for instructor base → client suburb.
+   b. For travel between two mid-day appointments in different suburbs, use your knowledge of Melbourne geography. Be conservative — add 5 min to any estimate you are uncertain about.
+   c. Travel IN (to client) always comes FROM wherever the instructor's previous appointment is located, not from their home base (unless it is the first appointment of the day).
+
+6. LOCATION PRIORITY for each existing appointment (use the first available field):
+   a. "LESSON LOCATION:" — confirmed pickup/meeting point. Always use this if present.
+   b. "notes:" field — look for a suburb or place name (e.g. "from ActiveOne FRANKSTON" → Frankston).
+   c. "addr:" field — client's registered Nookal address, last resort.
+
+7. Map the client's availability (e.g. "Mon AM") to real upcoming calendar dates from today's date.
+8. Never suggest a time that overlaps with a [BUSY] block.
+9. Multiple options can be the same instructor on different days if that is genuinely the best fit.
 
 OUTPUT RULES
 Plain text only. No asterisks, no bold, no bullet symbols.
-Give 3 to 5 options, best first.
+Give 3 to 5 options, best first. Only include options where the slot validity calculation confirms they work.
 Each option must follow this exact format — no extra lines, no commentary between options:
 
 OPTION [N]
@@ -506,7 +533,8 @@ OPTION [N]
 Appointment before: [client name, ends HH:MM at suburb] OR [no appointment — travelling from base]
 Appointment after: [client name, starts HH:MM at suburb] OR [no appointment after]
 Travel to client: from [suburb] ~[X] min
-Travel to next: ~[X] min to [next appointment suburb] OR [n/a]`;
+Travel to next: ~[X] min to [next appointment suburb] OR [n/a]
+Gap check: EARLIEST_START [HH:MM] + lesson [X min] + travel out [X min] + buffer = arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
 
     // 6. Call Claude
     const aiResponse = await fetch("https://api.anthropic.com/v1/messages", {
@@ -518,16 +546,25 @@ Travel to next: ~[X] min to [next appointment suburb] OR [n/a]`;
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 1500,
+        max_tokens: 8000,
+        thinking: { type: "enabled", budget_tokens: 6000 },
         system: systemPrompt,
         messages: [{
           role: "user",
-          content: `Find the best ${booking.duration}-min booking options for ${booking.clientName} in ${clientSuburb}. Availability: ${booking.availability}. Modifications: ${booking.modifications || "none"}.`
+          content: `Find the best ${booking.duration}-min booking options for ${booking.clientName} in ${clientSuburb}. Availability: ${booking.availability}. Modifications: ${booking.modifications || "none"}.\n\nFor every candidate slot, work through the SLOT VALIDITY formula step by step before accepting or rejecting it. Only output options that pass the check.`
         }]
       })
     });
 
     const data = await aiResponse.json();
+
+    // Extended thinking returns mixed content blocks (thinking + text).
+    // Strip thinking blocks before sending to the frontend — the client
+    // only needs the final text output.
+    if (data.content && Array.isArray(data.content)) {
+      data.content = data.content.filter(block => block.type !== "thinking");
+    }
+
     res.json(data);
 
   } catch (error) {
