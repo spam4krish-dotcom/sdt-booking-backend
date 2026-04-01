@@ -482,8 +482,20 @@ function filterAIOptions(text, lessonMinutes) {
     }
   }
 
+  // Deduplicate: remove options whose instructor+timeslot line is identical
+  const seen = new Set();
+  const deduped = passing.filter(block => {
+    const key = (block.match(/^OPTION \d+\n(.+)/m) || ["", block])[1].trim();
+    if (seen.has(key)) {
+      console.log(`Filtered duplicate option: ${key}`);
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+
   // Re-number options 1..N
-  const renumbered = passing.map((b, i) =>
+  const renumbered = deduped.map((b, i) =>
     b.replace(/^OPTION \d+/, `OPTION ${i + 1}`)
   );
 
@@ -605,10 +617,17 @@ RULES
      BUFFER      = 10 minutes (mandatory padding on each travel leg for parking/delays)
 
    Calculations:
-     EARLIEST_START = PREV_END + TRAVEL_IN + BUFFER
-     EARLIEST_START must then be rounded UP to the next quarter-hour (:00, :15, :30, or :45).
-     Examples: 1:25pm → 1:30pm, 2:50pm → 3:00pm, 10:08am → 10:15am, 9:00am → 9:00am (already on quarter).
-     LESSON_END     = rounded EARLIEST_START + LESSON
+     EARLIEST_START = PREV_END + TRAVEL_IN + BUFFER, rounded UP to the next quarter-hour.
+     Examples: 1:25pm → 1:30pm, 2:50pm → 3:00pm, 10:08am → 10:15am.
+
+     LATEST_START   = NEXT_START - TRAVEL_OUT - BUFFER - LESSON, rounded DOWN to the nearest quarter-hour.
+     Example: next appt 10:30am, travel out 25min, buffer 10min, lesson 60min → 10:30 - 25 - 10 - 60 = 8:55am → round down → 8:45am.
+
+     PREFERRED_START = LATEST_START (start as late as possible — minimises instructor dead time).
+     If there is no next appointment, PREFERRED_START = EARLIEST_START.
+     PREFERRED_START must be >= EARLIEST_START. If LATEST_START < EARLIEST_START, the slot is IMPOSSIBLE.
+
+     LESSON_END     = PREFERRED_START + LESSON
      ARRIVE_NEXT    = LESSON_END + TRAVEL_OUT + BUFFER
 
    Validity check:
