@@ -183,7 +183,7 @@ const clientSuburbCache = {};
 
 async function getNookalClientSuburb(rawSummary) {
   // Strip Nookal display prefixes ($ ★ ☆ emoji) from the client name
-  const name = rawSummary.replace(/^[\$\★\☆\u{1F300}-\u{1FFFF}\s]+/u, "").trim();
+  const name = rawSummary.replace(/^[$★☆\s]+/, "").trim();
   if (!name || name.length < 3) return null;
 
   if (clientSuburbCache[name] !== undefined) return clientSuburbCache[name];
