@@ -367,6 +367,70 @@ async function getDriveTime(origin, destination) {
   }
 }
 
+// ─── INTER-APPOINTMENT TRAVEL LOOKUP ─────────────────────────────────────────
+// Extract a clean suburb/location string from an appointment so we can look up
+// Google Maps drive times for every location that appears in instructors' diaries.
+function getApptSuburb(appt) {
+  if (appt.lessonLocation) {
+    // Strip qualifier like "(from Nookal)" or "(client home)" from the end
+    return appt.lessonLocation.replace(/\s*\([^)]*\)\s*$/, "").trim();
+  }
+  if (appt.location) {
+    // ICS location can be "123 Smith St, Brunswick VIC 3000" or just "Brunswick"
+    // Try to extract a known Melbourne suburb from the field
+    const parts = appt.location.split(",").map(s => s.replace(/\s*VIC\s*\d*/i, "").trim());
+    for (const p of parts.reverse()) { // suburb is usually near the end
+      if (p && MELBOURNE_SUBURBS.has(p)) return p;
+    }
+    // Fall back to the whole field trimmed (may be a street address; Maps can handle it)
+    return appt.location.split(",")[0].trim() || null;
+  }
+  return extractNoteSuburb(appt.notes);
+}
+
+// Build a Google Maps travel-time table for all unique appointment locations →
+// client suburb (and vice versa). Called once per /analyse request.
+// Results are returned as a formatted string ready to drop into the AI prompt.
+const travelTableCache = {};
+
+async function buildInterApptTravelTable(diaries, clientSuburb) {
+  // Collect unique locations across all instructors
+  const locationSet = new Set();
+  for (const diary of diaries) {
+    for (const appt of diary.appointments) {
+      const loc = getApptSuburb(appt);
+      if (loc && loc.length > 2) locationSet.add(loc);
+    }
+  }
+
+  // Remove the client suburb itself (trivially 0 min)
+  locationSet.delete(clientSuburb);
+
+  const locations = [...locationSet];
+  if (locations.length === 0) return "";
+
+  // Fetch both directions in parallel, with a simple in-request cache
+  const results = await Promise.all(
+    locations.map(async (loc) => {
+      const cacheKey = `${loc}|${clientSuburb}`;
+      if (!travelTableCache[cacheKey]) {
+        travelTableCache[cacheKey] = await getDriveTime(loc, clientSuburb);
+      }
+      const travel = travelTableCache[cacheKey];
+      return { loc, duration: travel ? travel.duration : null };
+    })
+  );
+
+  // Format as a lookup table for the AI
+  const rows = results
+    .filter(r => r.duration)
+    .sort((a, b) => a.loc.localeCompare(b.loc))
+    .map(r => `  ${r.loc} → ${clientSuburb}: ${r.duration}`);
+
+  if (rows.length === 0) return "";
+  return `APPOINTMENT LOCATION → CLIENT TRAVEL TIMES (Google Maps):\n${rows.join("\n")}\nUse these exact figures for TRAVEL_IN. For TRAVEL_OUT (client → next appointment), reverse the direction — driving times are similar both ways for Melbourne suburbs.`;
+}
+
 // ─── HARD FILTER HELPERS ──────────────────────────────────────────────────────
 function modRequested(text, ...terms) {
   const upper = text.toUpperCase();
@@ -424,10 +488,13 @@ function parseTimeToMinutes(str) {
 }
 
 function filterAIOptions(text, lessonMinutes) {
-  // Split text on OPTION N boundaries, keeping any preamble
-  const parts = text.split(/(?=\nOPTION \d)/);
-  const preamble = parts[0].replace(/\nOPTION \d[\s\S]*/, "").trim();
-  const optionBlocks = text.match(/OPTION \d[\s\S]*?(?=\nOPTION \d|$)/g) || [];
+  // Preamble = everything before the first "OPTION N" line.
+  // Using parts[0] with the old split was wrong: when the AI starts directly
+  // with "OPTION 1" (no preceding newline) the entire first block ended up in
+  // preamble and bypassed all filtering.
+  const firstOptionPos = text.search(/^OPTION \d/m);
+  const preamble = firstOptionPos > 0 ? text.slice(0, firstOptionPos).trim() : "";
+  const optionBlocks = text.match(/^OPTION \d[\s\S]*?(?=\nOPTION \d|$)/gm) || [];
 
   const passing = [];
   for (const block of optionBlocks) {
@@ -471,6 +538,21 @@ function filterAIOptions(text, lessonMinutes) {
         const afterStart = parseTimeToMinutes(afterMatch[1]);
         if (lessonEnd !== null && afterStart !== null && afterStart < lessonEnd) {
           reject = true; reason = `appointment after (${afterMatch[1]}) is before lesson end (${lessonMatch[2]})`;
+        }
+      }
+    }
+
+    // 5. Lesson must start AFTER the previous appointment ends
+    //    (catches cases where the AI starts the lesson at the exact moment
+    //     the previous client ends, before any travel time has elapsed)
+    if (!reject) {
+      const lessonMatch = block.match(/,\s*(\d+:\d+[ap]m) to/i);
+      const prevMatch   = block.match(/appointment before:.*ends (\d+:\d+[ap]m)/i);
+      if (lessonMatch && prevMatch) {
+        const prevEnd    = parseTimeToMinutes(prevMatch[1]);
+        const lessonStart = parseTimeToMinutes(lessonMatch[1]);
+        if (prevEnd !== null && lessonStart !== null && lessonStart <= prevEnd) {
+          reject = true; reason = `lesson starts at ${lessonMatch[1]} but prev appt ends at ${prevMatch[1]}`;
         }
       }
     }
@@ -565,6 +647,9 @@ app.post("/analyse", async (req, res) => {
       .map(t => `${t.name}: ${t.fromBase ? t.fromBase.duration + " / " + t.fromBase.distance : "unknown"} from base to ${clientSuburb}`)
       .join("\n");
 
+    // Build inter-appointment travel table (all diary locations → client suburb)
+    const interApptTravelTable = await buildInterApptTravelTable(diaries, clientSuburb);
+
     // 4. Format diary as readable text (not raw JSON) so AI can reason about busy/free times
     const diaryText = diaries.map(formatDiaryForAI).join("\n");
 
@@ -593,6 +678,7 @@ Instructor preference: ${booking.instructorPreference || "None"}
 TRAVEL TIMES (instructor home base → client suburb, from Google Maps)
 ${travelSummary}
 
+${interApptTravelTable ? interApptTravelTable + "\n" : ""}
 INSTRUCTOR SCHEDULES — NEXT 30 DAYS
 Every instructor listed has already been confirmed capable of the required modifications.
 [BUSY] lines are confirmed appointments. Any time NOT marked [BUSY] is potentially free.
@@ -638,9 +724,11 @@ RULES
      If there is no previous appointment, PREV_END = start of day (earliest 8:00am); TRAVEL_IN comes from instructor home base.
 
 5. TRAVEL TIMES:
-   a. Use the Google Maps figures provided above for instructor base → client suburb.
-   b. For travel between two mid-day appointments in different suburbs, use your knowledge of Melbourne geography. Be conservative — add 5 min to any estimate you are uncertain about.
-   c. Travel IN (to client) always comes FROM wherever the instructor's previous appointment is located, not from their home base (unless it is the first appointment of the day).
+   a. For instructor base → client suburb: use the Google Maps figures in "TRAVEL TIMES" above.
+   b. For any appointment location → client suburb (TRAVEL_IN): use the "APPOINTMENT LOCATION → CLIENT TRAVEL TIMES" table above. These are real Google Maps figures — do NOT substitute your own estimate if the location appears in the table.
+   c. If a location is not in the table, use your Melbourne geography knowledge and be conservative (add at least 10 min to any estimate you are uncertain about).
+   d. TRAVEL_OUT (client suburb → next appointment location) is approximately the same as TRAVEL_IN for that suburb — use the same table value in reverse.
+   e. Travel IN always comes FROM the previous appointment's location, not from home base (unless it is the first appointment of the day).
 
 6. LOCATION PRIORITY for each existing appointment (use the first available field):
    a. "LESSON LOCATION:" — confirmed pickup/meeting point. Always use this if present.
