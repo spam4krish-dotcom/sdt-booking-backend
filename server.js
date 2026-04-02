@@ -15,7 +15,7 @@ const INSTRUCTORS = [
   {
     name: "Christian",
     gender: "Male",
-    mods: ["LFA", "Spinner", "Hand Controls", "Satellite", "Indicator Extension", "Extension Pedals"],
+    mods: ["LFA", "Standard Spinner", "Electronic Spinner", "E-Radial", "Tri Pin", "Hand Controls", "Satellite", "Easy Drive", "Indicator Extension", "Extension Pedals"],
     base: "Montmorency",
     notes: "Covers all areas by arrangement. Full modifications vehicle.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fnXpnN%2FtMeidfD9E6WmLBWPsPF881mF4%2FDKjqX6mENEnlggTWF2jMn8Em8aKgSGXA%3D%3D"
@@ -23,7 +23,7 @@ const INSTRUCTORS = [
   {
     name: "Gabriel",
     gender: "Male",
-    mods: ["LFA", "Spinner", "Hand Controls", "Satellite", "Indicator Extension"],
+    mods: ["LFA", "Standard Spinner", "Electronic Spinner", "E-Radial", "Tri Pin", "Hand Controls", "Satellite", "Indicator Extension"],
     base: "Croydon North",
     notes: "Prefers East Melbourne but flexible. Does NOT start before 10:00am. ON HOLIDAY 25 Apr 2026 to 30 Apr 2026 — do NOT book on these dates.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2a52GEgwyPVJ%2B0I6mOab2rD4%2Bmqr7EYvQGR9ykfeKAj%2F"
@@ -31,7 +31,7 @@ const INSTRUCTORS = [
   {
     name: "Greg",
     gender: "Male",
-    mods: ["LFA", "Spinner", "Indicator Extension"],
+    mods: ["LFA", "Standard Spinner", "Electronic Spinner", "Hand Controls", "Indicator Extension"],
     base: "Kilsyth",
     notes: "Extended East and South-East coverage. Does NOT work on Thursdays or Fridays.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fgA7lzqZCrNH6P0mJPZWpJqu4G4d87qHmXHYUUq3ZhplneSIXp12lfHZzfvGyQdDw%3D%3D"
@@ -39,7 +39,7 @@ const INSTRUCTORS = [
   {
     name: "Jason",
     gender: "Male",
-    mods: ["LFA", "Spinner"],
+    mods: ["LFA", "Standard Spinner", "Electronic Spinner"],
     base: "Wandin North",
     notes: "East and South-East up to Bayside wedge only.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Sks8REnxfIzFLWWhJgXRykKsTkQKIlND6Q3P8UWc8WWFJCS5Y5gIU0xiqPfnSz%2FkQ%3D%3D"
@@ -47,7 +47,7 @@ const INSTRUCTORS = [
   {
     name: "Marc",
     gender: "Male",
-    mods: ["LFA", "Spinner", "Indicator Extension", "Extension Pedals"],
+    mods: ["LFA", "Standard Spinner", "Electronic Spinner", "Indicator Extension", "Extension Pedals"],
     base: "Werribee",
     notes: "West Melbourne specialist. On Tuesdays and Thursdays must be back in Werribee by 3:30pm (school pick-up) — lesson must finish with enough travel time to reach Werribee by 3:30pm.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2ecoRZN2xzdtmsUYY9vDrAuMuEJAzQSivaNXrwqSOqrMT982Jq4gficfE9XDNSVl0A%3D%3D"
@@ -63,9 +63,9 @@ const INSTRUCTORS = [
   {
     name: "Yves",
     gender: "Male",
-    mods: ["LFA", "Spinner", "Indicator Extension"],
+    mods: ["LFA", "Standard Spinner", "Electronic Spinner", "Indicator Extension"],
     base: "Rye",
-    notes: "Mornington Peninsula specialist.",
+    notes: "Mornington Peninsula and Frankston area specialist. For clients outside this area (more than ~40 min from Rye), only suggest by arrangement — append '(by arrangement — confirm with Yves first)' after his option line.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaJ6xepUO6AS0mQIBuSqW%2BOWjh2dEdLM2ryJYQBbgLemmcR6jFHgrJeGdQCO3yfSW7dInaTI63gFq7aNCi2ArGCg%3D%3D"
   }
 ];
@@ -446,20 +446,34 @@ function modRequested(text, ...terms) {
 function filterInstructors(booking) {
   const mods = booking.modifications || "";
 
-  const needsLFA         = modRequested(mods, "LFA", "LEFT FOOT");
-  const needsHandCtrls   = modRequested(mods, "HAND CONTROL");
-  const needsSatellite   = modRequested(mods, "SATELLITE");
-  const needsSpinner     = modRequested(mods, "SPINNER", "STEERING AID", "SPINNER KNOB");
-  const needsExtPedals   = modRequested(mods, "EXTENSION PEDAL", "EXT PEDAL", "PEDAL EXTENSION");
-  const needsIndicator   = modRequested(mods, "INDICATOR");
+  const needsLFA               = modRequested(mods, "LFA", "LEFT FOOT");
+  const needsHandCtrls         = modRequested(mods, "HAND CONTROL");
+  const needsSatellite         = modRequested(mods, "SATELLITE");
+  const needsExtPedals         = modRequested(mods, "EXTENSION PEDAL", "EXT PEDAL", "PEDAL EXTENSION");
+  const needsIndicator         = modRequested(mods, "INDICATOR");
+  const needsEasyDrive         = modRequested(mods, "EASY DRIVE", "EASYDRIVE");
+  const needsERadial           = modRequested(mods, "E-RADIAL", "E RADIAL", "ERADIAL");
+  const needsTriPin            = modRequested(mods, "TRI PIN", "TRI-PIN", "TRIPIN");
+  // "Electronic spinner" / keypad / lollipop / euro grip — all require Electronic Spinner mod
+  const needsElecSpinner       = modRequested(mods, "ELECTRONIC SPINNER", "ELECTRONIC SPIN",
+                                               "KEYPAD SPINNER", "KEYPAD", "LOLLIPOP", "EURO GRIP",
+                                               "E-SPINNER");
+  // Plain "spinner" with no electronic qualifier — any spinner type qualifies
+  const needsAnySpinner        = modRequested(mods, "SPINNER", "STEERING AID", "SPINNER KNOB");
 
   let qualified = INSTRUCTORS.filter(ins => {
-    if (needsLFA       && !ins.mods.includes("LFA"))               return false;
-    if (needsHandCtrls && !ins.mods.includes("Hand Controls"))     return false;
-    if (needsSatellite && !ins.mods.includes("Satellite"))         return false;
-    if (needsSpinner   && !ins.mods.includes("Spinner"))           return false;
-    if (needsExtPedals && !ins.mods.includes("Extension Pedals"))  return false;
-    if (needsIndicator && !ins.mods.includes("Indicator Extension")) return false;
+    if (needsLFA         && !ins.mods.includes("LFA"))               return false;
+    if (needsHandCtrls   && !ins.mods.includes("Hand Controls"))     return false;
+    if (needsSatellite   && !ins.mods.includes("Satellite"))         return false;
+    if (needsExtPedals   && !ins.mods.includes("Extension Pedals"))  return false;
+    if (needsIndicator   && !ins.mods.includes("Indicator Extension")) return false;
+    if (needsEasyDrive   && !ins.mods.includes("Easy Drive"))        return false;
+    if (needsERadial     && !ins.mods.includes("E-Radial"))          return false;
+    if (needsTriPin      && !ins.mods.includes("Tri Pin"))           return false;
+    if (needsElecSpinner && !ins.mods.includes("Electronic Spinner")) return false;
+    // Plain spinner request (no electronic qualifier): needs at least one spinner type
+    if (needsAnySpinner && !needsElecSpinner &&
+        !ins.mods.includes("Standard Spinner") && !ins.mods.includes("Electronic Spinner")) return false;
     return true;
   });
 
@@ -861,6 +875,9 @@ RULES
    e. Marc (Tue & Thu only): must finish his last lesson and travel back to Werribee by 3:30pm.
       Calculate: lesson end + drive time from lesson suburb to Werribee + 10 min buffer ≤ 3:30pm.
       If this constraint is not satisfied, the slot is impossible for Marc on that day.
+   f. Yves: serves Mornington Peninsula and Frankston area. If the client suburb is more than
+      ~40 min from Rye, Yves is only an option by arrangement — append the text
+      "(by arrangement — confirm with Yves first)" on the same line as his name and time.
 
 4. SLOT VALIDITY — run this exact calculation for EVERY candidate slot. Reject it if the numbers do not work out.
 
