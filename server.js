@@ -854,21 +854,24 @@ Travel to client: from [suburb] ~[X] min
 Travel to next: ~[X] min to [next appointment suburb] OR [n/a]
 Gap check: arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
 
-    // 6. Call Claude
+    // 6. Call Claude with extended thinking so it can reason carefully through
+    //    every instructor's diary before committing to output.
     const aiResponse = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "x-api-key": process.env.ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
+        "anthropic-beta": "interleaved-thinking-2025-05-14",
         "content-type": "application/json"
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 3000,
+        max_tokens: 16000,
+        thinking: { type: "enabled", budget_tokens: 10000 },
         system: systemPrompt,
         messages: [{
           role: "user",
-          content: `Find the best ${booking.duration}-min booking options for ${booking.clientName} in ${clientSuburb}. Availability: ${booking.availability}. Modifications: ${booking.modifications || "none"}. Check every candidate slot against the SLOT VALIDITY formula before including it. Only output passing options in the required format.`
+          content: `Find the best ${booking.duration}-min booking options for ${booking.clientName} in ${clientSuburb}. Availability: ${booking.availability}. Modifications: ${booking.modifications || "none"}. Work through every qualified instructor one by one. For each, find the gap(s) in their diary where the SLOT VALIDITY formula passes. Only output the final passing options in the required format — no working, no rejected candidates.`
         }]
       })
     });
@@ -881,13 +884,20 @@ Gap check: arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
 
     const data = await aiResponse.json();
 
+    // Strip thinking blocks — user only sees the final text output.
+    // Find the text block (may be preceded by one or more thinking blocks).
+    if (data?.content) {
+      data.content = data.content.filter(b => b.type !== "thinking");
+    }
+
     // ── Server-side sanity filter ──────────────────────────────────────────
     // The AI sometimes produces options that fail their own gap check, have
     // the wrong adjacent appointments, or breach the 6pm finish rule.
     // Parse each option and remove any that are provably wrong.
-    const rawText = data?.content?.[0]?.text || "";
+    const rawText = data?.content?.find(b => b.type === "text")?.text || "";
     const filteredText = filterAIOptions(rawText, parseInt(booking.duration) || 60, diaries);
-    if (data?.content?.[0]) data.content[0].text = filteredText;
+    const textBlock = data?.content?.find(b => b.type === "text");
+    if (textBlock) textBlock.text = filteredText;
 
     res.json(data);
 
