@@ -25,7 +25,7 @@ const INSTRUCTORS = [
     gender: "Male",
     mods: ["LFA", "Spinner", "Hand Controls", "Satellite", "Indicator Extension"],
     base: "Croydon North",
-    notes: "Prefers East Melbourne but flexible. ON HOLIDAY 25 Apr 2026 to 30 Apr 2026 — do NOT book on these dates.",
+    notes: "Prefers East Melbourne but flexible. Does NOT start before 10:00am. ON HOLIDAY 25 Apr 2026 to 30 Apr 2026 — do NOT book on these dates.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2a52GEgwyPVJ%2B0I6mOab2rD4%2Bmqr7EYvQGR9ykfeKAj%2F"
   },
   {
@@ -33,7 +33,7 @@ const INSTRUCTORS = [
     gender: "Male",
     mods: ["LFA", "Spinner", "Indicator Extension"],
     base: "Kilsyth",
-    notes: "Extended East and South-East coverage.",
+    notes: "Extended East and South-East coverage. Does NOT work on Thursdays or Fridays.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fgA7lzqZCrNH6P0mJPZWpJqu4G4d87qHmXHYUUq3ZhplneSIXp12lfHZzfvGyQdDw%3D%3D"
   },
   {
@@ -49,7 +49,7 @@ const INSTRUCTORS = [
     gender: "Male",
     mods: ["LFA", "Spinner", "Indicator Extension", "Extension Pedals"],
     base: "Werribee",
-    notes: "West Melbourne specialist.",
+    notes: "West Melbourne specialist. On Tuesdays and Thursdays must be back in Werribee by 3:30pm (school pick-up) — lesson must finish with enough travel time to reach Werribee by 3:30pm.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2ecoRZN2xzdtmsUYY9vDrAuMuEJAzQSivaNXrwqSOqrMT982Jq4gficfE9XDNSVl0A%3D%3D"
   },
   {
@@ -57,7 +57,7 @@ const INSTRUCTORS = [
     gender: "Female",
     mods: [],
     base: "Wandin North",
-    notes: "STANDARD LESSONS ONLY. Cannot perform any vehicle modifications whatsoever. Area: Wandin to Ringwood radius, plus Warragul.",
+    notes: "STANDARD LESSONS ONLY. Cannot perform any vehicle modifications whatsoever. Area: Wandin to Ringwood radius, plus Warragul. Does NOT work on Fridays.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Qm9F8eQzb%2B6bu2IC%2FLaNBOOWmK9yskJZYl8guOGtP67bXXfuA0nBVLMaaPL2rsqew%3D%3D"
   },
   {
@@ -550,6 +550,37 @@ function filterAIOptions(text, lessonMinutes, diaries) {
       }
     }
 
+    // 3c. Instructor-specific day/time constraints
+    if (!reject) {
+      const hdr = block.match(/^OPTION \d+\n(\w+) — (\w+)\s+\d+/im);
+      if (hdr) {
+        const instr = hdr[1].toLowerCase();
+        const day   = hdr[2].toLowerCase();
+        const timeLine = block.match(/,\s*(\d+:\d+[ap]m) to (\d+:\d+[ap]m)/i);
+        const startMins = timeLine ? parseTimeToMinutes(timeLine[1]) : null;
+        const endMins   = timeLine ? parseTimeToMinutes(timeLine[2]) : null;
+
+        // Gabriel: no start before 10:00am
+        if (instr === "gabriel" && startMins !== null && startMins < 10 * 60) {
+          reject = true; reason = `Gabriel doesn't start before 10am (${timeLine[1]})`;
+        }
+        // Greg: no Thursdays or Fridays
+        if (!reject && instr === "greg" && (day === "thursday" || day === "friday")) {
+          reject = true; reason = `Greg doesn't work on ${hdr[2]}`;
+        }
+        // Sherri: no Fridays
+        if (!reject && instr === "sherri" && day === "friday") {
+          reject = true; reason = "Sherri doesn't work on Fridays";
+        }
+        // Marc Tue/Thu: lesson end + 30 min (minimum Werribee travel) must be ≤ 3:30pm
+        if (!reject && instr === "marc" && (day === "tuesday" || day === "thursday")) {
+          if (endMins !== null && endMins + 30 > 15 * 60 + 30) {
+            reject = true; reason = `Marc can't make Werribee 3:30pm pick-up — lesson ends ${timeLine[2]}`;
+          }
+        }
+      }
+    }
+
     // 4. "Appointment after" must start AFTER the lesson ends
     if (!reject) {
       const lessonMatch = block.match(/,\s*(\d+:\d+[ap]m) to (\d+:\d+[ap]m)/i);
@@ -637,6 +668,40 @@ function filterAIOptions(text, lessonMinutes, diaries) {
             if (noApptBefore && apptE <= lessonS) {
               reject = true;
               reason = `AI claimed no prior appointment but diary shows ${appt.summary} ending at ${appt.endTime}`;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // 8. AI cited an "appointment after" but the diary has an earlier appointment
+    //    that starts between lesson end and the cited one — AI skipped over it.
+    //    (e.g. Gabriel Thu 2 Apr: lesson ends 9:30am, AI cited Uthayakumari at 1:30pm
+    //     but John Mitford at 11:00am was in between and should have been "after".)
+    if (!reject && diaries) {
+      const afterMatch  = block.match(/appointment after:.*starts (\d+:\d+[ap]m)/i);
+      const headerMatch = block.match(/^OPTION \d+\n(\w+) — [^\d]*(\d+)\s+(\w+)/im);
+      const timeMatch   = block.match(/,\s*(\d+:\d+[ap]m) to (\d+:\d+[ap]m)/i);
+      if (afterMatch && headerMatch && timeMatch) {
+        const instrName     = headerMatch[1].toLowerCase();
+        const optDay        = parseInt(headerMatch[2]);
+        const optMonthStr   = headerMatch[3].toLowerCase().substring(0, 3);
+        const lessonE       = parseTimeToMinutes(timeMatch[2]);
+        const citedAfterS   = parseTimeToMinutes(afterMatch[1]);
+        const diary = diaries.find(d => d.name.toLowerCase() === instrName);
+        if (diary && lessonE !== null && citedAfterS !== null) {
+          for (const appt of diary.appointments) {
+            const apptDm = appt.date.toLowerCase().match(/(\d+)\s+(\w{3})/);
+            if (!apptDm) continue;
+            if (parseInt(apptDm[1]) !== optDay) continue;
+            if (apptDm[2].substring(0, 3) !== optMonthStr) continue;
+            const apptS = parseTimeToMinutes(appt.startTime);
+            if (apptS === null) continue;
+            // An appointment starts after lesson end but before the one the AI cited
+            if (apptS > lessonE && apptS < citedAfterS) {
+              reject = true;
+              reason = `AI skipped ${appt.summary} (starts ${appt.startTime}) — should be "appointment after", not ${afterMatch[1]}`;
               break;
             }
           }
@@ -739,8 +804,6 @@ app.post("/analyse", async (req, res) => {
 
     // 4. Format diary as readable text (not raw JSON) so AI can reason about busy/free times
     const diaryText = diaries.map(formatDiaryForAI).join("\n");
-    console.log("=== DIARY TEXT SENT TO AI ===\n" + diaryText);
-    console.log("=== TRAVEL TABLE SENT TO AI ===\n" + (interApptTravelTable || "(empty)"));
 
     // 5. Prompt
     const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training in Melbourne, Australia.
@@ -777,7 +840,14 @@ ${diaryText}
 RULES
 1. Only suggest instructors shown above.
 2. Sherri has no vehicle modifications — she only appears here if the client needs no modifications.
-3. Gabriel is on holiday 25–30 Apr 2026. Do not suggest him on those dates.
+3. INSTRUCTOR AVAILABILITY CONSTRAINTS — treat these as absolute:
+   a. Gabriel: never suggest a start time before 10:00am.
+   b. Gabriel: on holiday 25–30 Apr 2026 — do not suggest him on those dates.
+   c. Greg: does not work on Thursdays or Fridays — never suggest Greg on those days.
+   d. Sherri: does not work on Fridays — never suggest Sherri on Fridays.
+   e. Marc (Tue & Thu only): must finish his last lesson and travel back to Werribee by 3:30pm.
+      Calculate: lesson end + drive time from lesson suburb to Werribee + 10 min buffer ≤ 3:30pm.
+      If this constraint is not satisfied, the slot is impossible for Marc on that day.
 
 4. SLOT VALIDITY — run this exact calculation for EVERY candidate slot. Reject it if the numbers do not work out.
 
@@ -866,8 +936,8 @@ Gap check: arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 16000,
-        thinking: { type: "enabled", budget_tokens: 10000 },
+        max_tokens: 12000,
+        thinking: { type: "enabled", budget_tokens: 6000 },
         system: systemPrompt,
         messages: [{
           role: "user",
