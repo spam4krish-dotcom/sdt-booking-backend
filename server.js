@@ -539,6 +539,17 @@ function filterAIOptions(text, lessonMinutes, diaries) {
       }
     }
 
+    // 3b. Lesson must not start before 8:30am
+    if (!reject) {
+      const timeLine = block.match(/,\s*(\d+:\d+[ap]m) to/i);
+      if (timeLine) {
+        const startMins = parseTimeToMinutes(timeLine[1]);
+        if (startMins !== null && startMins < 8 * 60 + 30) {
+          reject = true; reason = `lesson starts before 8:30am (${timeLine[1]})`;
+        }
+      }
+    }
+
     // 4. "Appointment after" must start AFTER the lesson ends
     if (!reject) {
       const lessonMatch = block.match(/,\s*(\d+:\d+[ap]m) to (\d+:\d+[ap]m)/i);
@@ -787,9 +798,10 @@ RULES
      LATEST_START   = NEXT_START - TRAVEL_OUT - BUFFER - LESSON, rounded DOWN to the nearest quarter-hour.
      Example: next appt 10:30am, travel out 25min, buffer 10min, lesson 60min → 10:30 - 25 - 10 - 60 = 8:55am → round down → 8:45am.
 
-     PREFERRED_START = LATEST_START (start as late as possible — minimises instructor dead time).
-     If there is no next appointment, PREFERRED_START = EARLIEST_START.
+     PREFERRED_START = LATEST_START. Always. Start as late as possible to minimise dead time.
+     Exception: if there is no next appointment, PREFERRED_START = EARLIEST_START.
      PREFERRED_START must be >= EARLIEST_START. If LATEST_START < EARLIEST_START, the slot is IMPOSSIBLE.
+     PREFERRED_START must also be >= 8:30am (minimum working start — see Rule 10 below).
 
      LESSON_END     = PREFERRED_START + LESSON
      ARRIVE_NEXT    = LESSON_END + TRAVEL_OUT + BUFFER
@@ -799,7 +811,7 @@ RULES
      If ARRIVE_NEXT > NEXT_START, the slot is IMPOSSIBLE — do not output it under any circumstances.
      A slot that fails the gap check must NEVER appear in your response, even if you label it NOT OK.
      The only options you output are ones where ARRIVE_NEXT <= NEXT_START (or there is no next appointment).
-     If there is no previous appointment, PREV_END = start of day (earliest 8:00am); TRAVEL_IN comes from instructor home base.
+     If there is no previous appointment, PREV_END = 8:30am (earliest working start); TRAVEL_IN comes from instructor home base.
 
 5. TRAVEL TIMES:
    a. For instructor base → client suburb: use the Google Maps figures in "TRAVEL TIMES" above.
@@ -815,8 +827,12 @@ RULES
 
 7. Map the client's availability (e.g. "Mon AM") to real upcoming calendar dates from today's date.
 8. Never suggest a time that overlaps with a [BUSY] block.
-9. Try to spread recommendations across different instructors. Do not default to the same instructor for all options — check every qualified instructor's schedule before deciding.
+9. INSTRUCTOR DIVERSITY — mandatory:
+   a. Work through EVERY qualified instructor listed above, one by one, before deciding on options.
+   b. Your 3–5 options MUST include at least 3 different instructors unless fewer than 3 are qualified.
+   c. Once you have 2 options from the same instructor, move on and find slots for others.
 10. No lesson may finish after 6:00pm. The lesson end time must be 6:00pm or earlier.
+    No lesson may START before 8:30am. Never output a start time earlier than 8:30am.
 11. ADJACENT APPOINTMENT SELECTION — this is critical:
     "Appointment before" = the last [BUSY] block that ENDS before the lesson start time.
     "Appointment after"  = the first [BUSY] block that STARTS after the lesson END time.
@@ -827,7 +843,7 @@ RULES
 OUTPUT RULES
 Do all slot validity and date-verification checks silently — never print rejected candidates, never show your working.
 Plain text only. No asterisks, no bold, no bullet symbols.
-Give 3 to 5 valid options, best first. Aim for at least 2 different instructors across the options.
+Give 3 to 5 valid options, best first. You MUST include at least 3 different instructors across the options (see Rule 9).
 Each option must follow this exact format with no extra lines or commentary between options:
 
 OPTION [N]
@@ -838,21 +854,24 @@ Travel to client: from [suburb] ~[X] min
 Travel to next: ~[X] min to [next appointment suburb] OR [n/a]
 Gap check: arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
 
-    // 6. Call Claude
+    // 6. Call Claude with extended thinking so it can reason carefully through
+    //    every instructor's diary before committing to output.
     const aiResponse = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "x-api-key": process.env.ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
+        "anthropic-beta": "interleaved-thinking-2025-05-14",
         "content-type": "application/json"
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 3000,
+        max_tokens: 16000,
+        thinking: { type: "enabled", budget_tokens: 10000 },
         system: systemPrompt,
         messages: [{
           role: "user",
-          content: `Find the best ${booking.duration}-min booking options for ${booking.clientName} in ${clientSuburb}. Availability: ${booking.availability}. Modifications: ${booking.modifications || "none"}. Check every candidate slot against the SLOT VALIDITY formula before including it. Only output passing options in the required format.`
+          content: `Find the best ${booking.duration}-min booking options for ${booking.clientName} in ${clientSuburb}. Availability: ${booking.availability}. Modifications: ${booking.modifications || "none"}. Work through every qualified instructor one by one. For each, find the gap(s) in their diary where the SLOT VALIDITY formula passes. Only output the final passing options in the required format — no working, no rejected candidates.`
         }]
       })
     });
@@ -865,13 +884,20 @@ Gap check: arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
 
     const data = await aiResponse.json();
 
+    // Strip thinking blocks — user only sees the final text output.
+    // Find the text block (may be preceded by one or more thinking blocks).
+    if (data?.content) {
+      data.content = data.content.filter(b => b.type !== "thinking");
+    }
+
     // ── Server-side sanity filter ──────────────────────────────────────────
     // The AI sometimes produces options that fail their own gap check, have
     // the wrong adjacent appointments, or breach the 6pm finish rule.
     // Parse each option and remove any that are provably wrong.
-    const rawText = data?.content?.[0]?.text || "";
+    const rawText = data?.content?.find(b => b.type === "text")?.text || "";
     const filteredText = filterAIOptions(rawText, parseInt(booking.duration) || 60, diaries);
-    if (data?.content?.[0]) data.content[0].text = filteredText;
+    const textBlock = data?.content?.find(b => b.type === "text");
+    if (textBlock) textBlock.text = filteredText;
 
     res.json(data);
 
