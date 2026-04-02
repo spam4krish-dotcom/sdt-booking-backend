@@ -644,6 +644,40 @@ function filterAIOptions(text, lessonMinutes, diaries) {
       }
     }
 
+    // 8. AI cited an "appointment after" but the diary has an earlier appointment
+    //    that starts between lesson end and the cited one — AI skipped over it.
+    //    (e.g. Gabriel Thu 2 Apr: lesson ends 9:30am, AI cited Uthayakumari at 1:30pm
+    //     but John Mitford at 11:00am was in between and should have been "after".)
+    if (!reject && diaries) {
+      const afterMatch  = block.match(/appointment after:.*starts (\d+:\d+[ap]m)/i);
+      const headerMatch = block.match(/^OPTION \d+\n(\w+) — [^\d]*(\d+)\s+(\w+)/im);
+      const timeMatch   = block.match(/,\s*(\d+:\d+[ap]m) to (\d+:\d+[ap]m)/i);
+      if (afterMatch && headerMatch && timeMatch) {
+        const instrName     = headerMatch[1].toLowerCase();
+        const optDay        = parseInt(headerMatch[2]);
+        const optMonthStr   = headerMatch[3].toLowerCase().substring(0, 3);
+        const lessonE       = parseTimeToMinutes(timeMatch[2]);
+        const citedAfterS   = parseTimeToMinutes(afterMatch[1]);
+        const diary = diaries.find(d => d.name.toLowerCase() === instrName);
+        if (diary && lessonE !== null && citedAfterS !== null) {
+          for (const appt of diary.appointments) {
+            const apptDm = appt.date.toLowerCase().match(/(\d+)\s+(\w{3})/);
+            if (!apptDm) continue;
+            if (parseInt(apptDm[1]) !== optDay) continue;
+            if (apptDm[2].substring(0, 3) !== optMonthStr) continue;
+            const apptS = parseTimeToMinutes(appt.startTime);
+            if (apptS === null) continue;
+            // An appointment starts after lesson end but before the one the AI cited
+            if (apptS > lessonE && apptS < citedAfterS) {
+              reject = true;
+              reason = `AI skipped ${appt.summary} (starts ${appt.startTime}) — should be "appointment after", not ${afterMatch[1]}`;
+              break;
+            }
+          }
+        }
+      }
+    }
+
     if (reject) {
       console.log(`Filtered AI option: ${reason} — ${block.split("\n")[0]}`);
     } else {
@@ -739,8 +773,6 @@ app.post("/analyse", async (req, res) => {
 
     // 4. Format diary as readable text (not raw JSON) so AI can reason about busy/free times
     const diaryText = diaries.map(formatDiaryForAI).join("\n");
-    console.log("=== DIARY TEXT SENT TO AI ===\n" + diaryText);
-    console.log("=== TRAVEL TABLE SENT TO AI ===\n" + (interApptTravelTable || "(empty)"));
 
     // 5. Prompt
     const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training in Melbourne, Australia.
@@ -866,8 +898,8 @@ Gap check: arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 16000,
-        thinking: { type: "enabled", budget_tokens: 10000 },
+        max_tokens: 12000,
+        thinking: { type: "enabled", budget_tokens: 6000 },
         system: systemPrompt,
         messages: [{
           role: "user",
