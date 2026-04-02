@@ -522,8 +522,21 @@ function filterAIOptions(text, lessonMinutes, diaries) {
       if (gc) {
         const arrives = parseTimeToMinutes(gc[1]);
         const nextAppt = parseTimeToMinutes(gc[2]);
-        if (arrives !== null && nextAppt !== null && arrives > nextAppt) {
-          reject = true; reason = `arrives ${gc[1]} > next appt ${gc[2]}`;
+        if (arrives !== null && nextAppt !== null) {
+          // 2a. Can't arrive after the next appointment
+          if (arrives > nextAppt) {
+            reject = true; reason = `arrives ${gc[1]} > next appt ${gc[2]}`;
+          }
+          // 2b. PREFERRED_START = LATEST_START enforcement.
+          // If the instructor arrives more than 30 min before the next appointment,
+          // the lesson was scheduled too early — LATEST_START was not used.
+          // Quarter-hour rounding creates at most ~15 min early arrival, so 30 min
+          // is a safe threshold. This catches e.g. 8:30am starts when the only
+          // following appointment is at 3:30pm.
+          if (!reject && nextAppt - arrives > 30) {
+            reject = true;
+            reason = `arrives ${gc[1]} but next appt not until ${gc[2]} — start too early, LATEST_START not used`;
+          }
         }
       }
     }
