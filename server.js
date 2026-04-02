@@ -146,7 +146,7 @@ TRAVEL TIMES: ${travelInfo}`;
         "content-type": "application/json"
       },
       body: JSON.stringify({
-        model: "claude-3-5-sonnet-20240620", // Ensure this matches your API tier
+        model: "claude-sonnet-4-20250514", // Ensure this matches your API tier
         max_tokens: 1000,
         system: systemPrompt,
         messages: [{ role: "user", content: userMessage }]
