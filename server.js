@@ -928,9 +928,10 @@ RULES
 7. Map the client's availability (e.g. "Mon AM") to real upcoming calendar dates from today's date.
 8. Never suggest a time that overlaps with a [BUSY] block.
 9. INSTRUCTOR DIVERSITY — mandatory:
-   a. Work through EVERY qualified instructor listed above, one by one, before deciding on options.
-   b. Your 3–5 options MUST include at least 3 different instructors unless fewer than 3 are qualified.
-   c. Once you have 2 options from the same instructor, move on and find slots for others.
+   a. For each qualified instructor, find their EARLIEST valid slot first — scan from today forward, week by week, and stop at the first gap that passes the SLOT VALIDITY formula.
+   b. Once you have the earliest slot for each instructor, rank all candidates by date (soonest first) and pick the best 3–5.
+   c. You MUST include at least 3 different instructors across the options unless fewer than 3 are qualified.
+   d. Once you have 2 options from the same instructor, move on to find slots for others.
 10. No lesson may finish after 6:00pm. The lesson end time must be 6:00pm or earlier.
     No lesson may START before 8:30am. Never output a start time earlier than 8:30am.
 11. ADJACENT APPOINTMENT SELECTION — this is critical:
@@ -943,7 +944,7 @@ RULES
 OUTPUT RULES
 Do all slot validity and date-verification checks silently — never print rejected candidates, never show your working.
 Plain text only. No asterisks, no bold, no bullet symbols.
-Give 3 to 5 valid options, best first. You MUST include at least 3 different instructors across the options (see Rule 9).
+Give 3 to 5 valid options sorted by date, EARLIEST first. You MUST include at least 3 different instructors across the options (see Rule 9).
 Each option must follow this exact format with no extra lines or commentary between options:
 
 OPTION [N]
@@ -966,12 +967,12 @@ Gap check: arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 12000,
-        thinking: { type: "enabled", budget_tokens: 6000 },
+        max_tokens: 14000,
+        thinking: { type: "enabled", budget_tokens: 8000 },
         system: systemPrompt,
         messages: [{
           role: "user",
-          content: `Find the best ${booking.duration}-min booking options for ${booking.clientName} in ${clientSuburb}. Availability: ${booking.availability}. Modifications: ${booking.modifications || "none"}. Work through every qualified instructor one by one. For each, find the gap(s) in their diary where the SLOT VALIDITY formula passes. Only output the final passing options in the required format — no working, no rejected candidates.`
+          content: `Find the best ${booking.duration}-min booking options for ${booking.clientName} in ${clientSuburb}. Availability: ${booking.availability}. Modifications: ${booking.modifications || "none"}. For each qualified instructor, find their EARLIEST valid slot first, then rank all results by date soonest-first. Output the 3–5 earliest options across at least 3 different instructors. Required format only — no working, no rejected candidates.`
         }]
       })
     });
