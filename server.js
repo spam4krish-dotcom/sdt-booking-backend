@@ -964,7 +964,7 @@ Gap check: arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
         "content-type": "application/json"
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6",
+        model: "claude-3-5-sonnet-20241022",
         max_tokens: 4000,
         system: systemPrompt,
         messages: [{
@@ -977,7 +977,7 @@ Gap check: arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
     if (!aiResponse.ok) {
       const errText = await aiResponse.text();
       console.error(`Anthropic API error ${aiResponse.status}: ${errText}`);
-      return res.status(502).json({ error: `AI service error: ${aiResponse.status}` });
+      return res.status(502).json({ error: `AI service error: ${aiResponse.status}`, detail: errText });
     }
 
     const data = await aiResponse.json();
