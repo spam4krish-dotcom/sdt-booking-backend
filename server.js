@@ -962,11 +962,10 @@ Gap check: arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
       headers: {
         "x-api-key": process.env.ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
-        "anthropic-beta": "interleaved-thinking-2025-05-14",
         "content-type": "application/json"
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
+        model: "claude-sonnet-4-5",
         max_tokens: 14000,
         thinking: { type: "enabled", budget_tokens: 8000 },
         system: systemPrompt,
