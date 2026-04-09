@@ -102,15 +102,11 @@ async function fetchInstructorCalendar(instructor) {
         notes: (event.description || "").replace(/\n/g, " ").trim()
       });
     }
-    // Reduced logging to avoid Railway rate limits
     return appts.sort((a, b) => new Date(a.startISO) - new Date(b.startISO));
   } catch (err) {
     return [];
   }
 }
-
-// (The rest of your Nookal and Suburb detection logic remains unchanged)
-// ...
 
 app.post("/analyse", async (req, res) => {
   try {
@@ -122,19 +118,25 @@ app.post("/analyse", async (req, res) => {
       appointments: await fetchInstructorCalendar(i)
     })));
 
-    // Your Travel Table calculation
-    const travelInfo = ""; // Placeholder for your buildInterApptTravelTable call
+    // Your Travel Table calculation placeholder
+    const travelInfo = ""; 
 
     const systemPrompt = `You are the SDT Booking Assistant. 
-STRICT SPEED RULES: Find 3 valid options and STOP. Do not analyze the whole month.
-LOGIC: Exclude Sherri if mods are needed. 
+STRICT RULES: 
+1. AVAILABILITY MATCHING: You MUST ONLY suggest times that match the client's requested availability. If they ask for a specific day or time (e.g. "Mon AM"), you must absolutely exclude all other days and times.
+2. TRAVEL TIME: You must factor in travel time. Allow at least 30 to 45 minutes between appointments in different suburbs. Do not schedule back-to-back appointments without a travel buffer unless the locations are identical.
+3. MODS: Exclude Sherri immediately if mods are needed.
+4. SPEED: Find 3 valid options and STOP. Do not analyze the whole month.
 FORMAT: No bolding. Plain text only.
 Date Context: Today is ${new Date().toLocaleDateString("en-AU", melbOptions)}.`;
 
+    // ADDED BACK the crucial variables that were missing (Availability & Duration)
     const userMessage = `
 CLIENT: ${booking.clientName}
 SUBURB: ${booking.suburb}
 MODS: ${booking.modifications}
+AVAILABILITY: ${booking.availability || "Any"}
+DURATION: ${booking.duration || "60 mins"}
 DIARIES: ${JSON.stringify(diaries)}
 TRAVEL TIMES: ${travelInfo}`;
 
@@ -146,8 +148,8 @@ TRAVEL TIMES: ${travelInfo}`;
         "content-type": "application/json"
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6", // Ensure this matches your API tier
-        max_tokens: 1000,
+        model: "claude-sonnet-4-6", // Kept exact model from your file
+        max_tokens: 2500, // INCREASED to stop cut-offs
         system: systemPrompt,
         messages: [{ role: "user", content: userMessage }]
       })
