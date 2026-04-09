@@ -122,15 +122,22 @@ app.post("/analyse", async (req, res) => {
     const travelInfo = ""; 
 
     const systemPrompt = `You are the SDT Booking Assistant. 
+Date Context: Today is ${new Date().toLocaleDateString("en-AU", melbOptions)}.
+
 STRICT RULES: 
-1. AVAILABILITY MATCHING: You MUST ONLY suggest times that match the client's requested availability. If they ask for a specific day or time (e.g. "Mon AM"), you must absolutely exclude all other days and times.
+1. AVAILABILITY MATCHING: You MUST ONLY suggest times that match the client's requested availability. If they ask for "Mon AM", exclude all other days/times.
 2. TRAVEL TIME: You must factor in travel time. Allow at least 30 to 45 minutes between appointments in different suburbs. Do not schedule back-to-back appointments without a travel buffer unless the locations are identical.
 3. MODS: Exclude Sherri immediately if mods are needed.
-4. SPEED: Find 3 valid options and STOP. Do not analyze the whole month.
-FORMAT: No bolding. Plain text only.
-Date Context: Today is ${new Date().toLocaleDateString("en-AU", melbOptions)}.`;
+4. OUTPUT FORMAT: DO NOT output your step-by-step diary scanning. Do your reasoning silently. You must ONLY output a brief introductory sentence followed directly by the 3 options in this exact format:
 
-    // ADDED BACK the crucial variables that were missing (Availability & Duration)
+Option 1
+Instructor: [Name]
+Date: [Date]
+Time: [Time]
+Transit Logic: [Briefly explain the gap and travel time]
+
+Option 2... (and so on)`;
+
     const userMessage = `
 CLIENT: ${booking.clientName}
 SUBURB: ${booking.suburb}
@@ -148,8 +155,8 @@ TRAVEL TIMES: ${travelInfo}`;
         "content-type": "application/json"
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6", // Kept exact model from your file
-        max_tokens: 2500, // INCREASED to stop cut-offs
+        model: "claude-sonnet-4-6",
+        max_tokens: 4096, // Maximum output to prevent any chance of truncation
         system: systemPrompt,
         messages: [{ role: "user", content: userMessage }]
       })
