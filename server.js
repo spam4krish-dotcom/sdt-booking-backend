@@ -955,8 +955,7 @@ Travel to client: from [suburb] ~[X] min
 Travel to next: ~[X] min to [next appointment suburb] OR [n/a]
 Gap check: arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
 
-    // 6. Call Claude with extended thinking so it can reason carefully through
-    //    every instructor's diary before committing to output.
+    // 6. Call Claude
     const aiResponse = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -965,9 +964,8 @@ Gap check: arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
         "content-type": "application/json"
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-5",
-        max_tokens: 14000,
-        thinking: { type: "enabled", budget_tokens: 8000 },
+        model: "claude-sonnet-4-6",
+        max_tokens: 4000,
         system: systemPrompt,
         messages: [{
           role: "user",
@@ -984,19 +982,10 @@ Gap check: arrives next at [HH:MM] vs next appt [HH:MM] — OK`;
 
     const data = await aiResponse.json();
 
-    // Strip thinking blocks — user only sees the final text output.
-    // Find the text block (may be preceded by one or more thinking blocks).
-    if (data?.content) {
-      data.content = data.content.filter(b => b.type !== "thinking");
-    }
-
     // ── Server-side sanity filter ──────────────────────────────────────────
-    // The AI sometimes produces options that fail their own gap check, have
-    // the wrong adjacent appointments, or breach the 6pm finish rule.
-    // Parse each option and remove any that are provably wrong.
-    const rawText = data?.content?.find(b => b.type === "text")?.text || "";
+    const rawText = data?.content?.[0]?.text || "";
     const filteredText = filterAIOptions(rawText, parseInt(booking.duration) || 60, diaries);
-    const textBlock = data?.content?.find(b => b.type === "text");
+    const textBlock = data?.content?.[0];
     if (textBlock) textBlock.text = filteredText;
 
     res.json(data);
