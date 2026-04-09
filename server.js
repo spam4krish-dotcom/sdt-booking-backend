@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const ical = require("node-ical");
+const axios = require("axios");
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -8,173 +9,135 @@ const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
+const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+const melbOptions = { timeZone: 'Australia/Melbourne', hour12: true };
+
 // ─── INSTRUCTOR DATABASE ─────────────────────────────────────────────────────
 const INSTRUCTORS = [
   {
     name: "Christian",
-    gender: "Male",
     mods: ["LFA", "Spinner", "Hand Controls", "Satellite", "Indicator Extension", "Extension Pedals"],
-    base: "Montmorency",
-    notes: "Covers all areas by arrangement. Full modifications vehicle.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fnXpnN%2FtMeidfD9E6WmLBWPsPF881mF4%2FDKjqX6mENEnlggTWF2jMn8Em8aKgSGXA%3D%3D"
   },
   {
     name: "Gabriel",
-    gender: "Male",
     mods: ["LFA", "Spinner", "Hand Controls", "Satellite", "Indicator Extension"],
-    base: "Croydon North",
-    notes: "Prefers East Melbourne but flexible. ON HOLIDAY 25 Apr 2026 to 30 Apr 2026 — do NOT book on these dates.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2a52GEgwyPVJ%2B0I6mOab2rD4%2Bmqr7EYvQGR9ykfeKAj%2F"
   },
   {
     name: "Greg",
-    gender: "Male",
     mods: ["LFA", "Spinner", "Indicator Extension"],
-    base: "Kilsyth",
-    notes: "Extended East and South-East coverage.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fgA7lzqZCrNH6P0mJPZWpJqu4G4d87qHmXHYUUq3ZhplneSIXp12lfHZzfvGyQdDw%3D%3D"
   },
   {
     name: "Jason",
-    gender: "Male",
     mods: ["LFA", "Spinner"],
-    base: "Wandin North",
-    notes: "East and South-East up to Bayside wedge only.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Sks8REnxfIzFLWWhJgXRykKsTkQKIlND6Q3P8UWc8WWFJCS5Y5gIU0xiqPfnSz%2FkQ%3D%3D"
   },
   {
     name: "Marc",
-    gender: "Male",
     mods: ["LFA", "Spinner", "Indicator Extension", "Extension Pedals"],
-    base: "Werribee",
-    notes: "West Melbourne specialist.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2ecoRZN2xzdtmsUYY9vDrAuMuEJAzQSivaNXrwqSOqrMT982Jq4gficfE9XDNSVl0A%3D%3D"
   },
   {
     name: "Sherri",
-    gender: "Female",
-    mods: [],
-    base: "Wandin North",
-    notes: "STANDARD LESSONS ONLY. Cannot perform any vehicle modifications whatsoever.",
+    mods: [], // Standard lessons only
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Qm9F8eQzb%2B6bu2IC%2FLaNBOOWmK9yskJZYl8guOGtP67bXXfuA0nBVLMaaPL2rsqew%3D%3D"
   },
   {
     name: "Yves",
-    gender: "Male",
     mods: ["LFA", "Spinner", "Indicator Extension"],
-    base: "Rye",
-    notes: "Mornington Peninsula specialist.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaJ6xepUO6AS0mQIBuSqW%2BOWjh2dEdLM2ryJYQBbgLemmcR6jFHgrJeGdQCO3yfSW7dInaTI63gFq7aNCi2ArGCg%3D%3D"
   }
 ];
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
-
-// Robust Melbourne Date Formatter
-const melbOptions = { timeZone: 'Australia/Melbourne', hour12: true };
-
-async function fetchInstructorCalendar(instructor) {
+// ─── TRAVEL TIME HELPER ──────────────────────────────────────────────────────
+async function getTravelTime(origin, destination) {
+  if (!origin || !destination || origin.toLowerCase() === destination.toLowerCase()) return 5;
   try {
-    const rawData = await Promise.race([
-      ical.async.fromURL(instructor.icsUrl),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("ICS timeout")), 12000))
-    ]);
-
-    const now = new Date();
-    const future = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-    const appts = [];
-
-    for (const key in rawData) {
-      const event = rawData[key];
-      if (event.type !== "VEVENT") continue;
-
-      const start = new Date(event.start);
-      const end = new Date(event.end);
-      if (isNaN(start.getTime()) || start < now || start > future) continue;
-
-      appts.push({
-        startISO: start.toISOString(),
-        date: start.toLocaleDateString("en-AU", { ...melbOptions, weekday: "short", day: "numeric", month: "short" }),
-        startTime: start.toLocaleTimeString("en-AU", { ...melbOptions, hour: "2-digit", minute: "2-digit" }),
-        endTime: end.toLocaleTimeString("en-AU", { ...melbOptions, hour: "2-digit", minute: "2-digit" }),
-        summary: event.summary || "Appointment",
-        location: event.location || "",
-        notes: (event.description || "").replace(/\n/g, " ").trim()
-      });
+    const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${encodeURIComponent(origin + ", VIC")}&destinations=${encodeURIComponent(destination + ", VIC")}&mode=driving&departure_time=now&key=${GOOGLE_MAPS_API_KEY}`;
+    const res = await axios.get(url);
+    if (res.data.rows[0].elements[0].status === "OK") {
+      const durationSeconds = res.data.rows[0].elements[0].duration.value;
+      return Math.ceil(durationSeconds / 60);
     }
-    return appts.sort((a, b) => new Date(a.startISO) - new Date(b.startISO));
+    return 60; // Fallback
   } catch (err) {
-    return [];
+    console.error("Maps Error:", err.message);
+    return 60;
   }
 }
 
+// ─── ANALYSIS ENDPOINT ───────────────────────────────────────────────────────
 app.post("/analyse", async (req, res) => {
   try {
     const booking = req.body;
-    const diaries = await Promise.all(INSTRUCTORS.map(async i => ({
-      name: i.name,
-      base: i.base,
-      mods: i.mods,
-      appointments: await fetchInstructorCalendar(i)
-    })));
+    const clientSuburb = booking.suburb;
 
-    // Your Travel Table calculation placeholder
-    const travelInfo = ""; 
+    // 1. Fetch Diaries
+    const diaries = await Promise.all(INSTRUCTORS.map(async inst => {
+      try {
+        const rawData = await ical.async.fromURL(inst.icsUrl);
+        const appts = Object.values(rawData)
+          .filter(e => e.type === "VEVENT")
+          .map(e => ({
+            start: e.start,
+            end: e.end,
+            location: e.location || "Unknown",
+            summary: e.summary
+          }));
+        return { name: inst.name, mods: inst.mods, appts };
+      } catch (e) { return { name: inst.name, mods: inst.mods, appts: [] }; }
+    }));
+
+    // 2. Map Unique Suburbs for Travel Calculation
+    const uniqueSuburbs = [...new Set(diaries.flatMap(d => d.appts.map(a => a.location)))];
+    const travelMatrix = {};
+    for (const s of uniqueSuburbs) {
+      if (s !== "Unknown") {
+        travelMatrix[s] = await getTravelTime(s, clientSuburb);
+      }
+    }
 
     const systemPrompt = `You are the SDT Booking Assistant. 
 Date Context: Today is ${new Date().toLocaleDateString("en-AU", melbOptions)}.
 
-STRICT RULES: 
-1. AVAILABILITY MATCHING: You MUST ONLY suggest times that match the client's requested availability. If they ask for "Mon AM", exclude all other days/times.
-2. TRAVEL TIME: You must factor in travel time. Allow at least 30 to 45 minutes between appointments in different suburbs. Do not schedule back-to-back appointments without a travel buffer unless the locations are identical.
-3. MODS: Exclude Sherri immediately if mods are needed.
-4. OUTPUT FORMAT: DO NOT output your step-by-step diary scanning. Do your reasoning silently. You must ONLY output a brief introductory sentence followed directly by the 3 options in this exact format:
+STRICT LOGIC:
+1. THE 5-MINUTE RULE: You MUST add a 5-minute prep buffer to every travel time.
+   Formula: [Appt End Time] + [Travel Time from Matrix] + [5 Mins] = Earliest Start.
+2. NO GUESSING: Use the TRAVEL_MINUTES matrix provided. If a suburb isn't listed, assume 60 mins.
+3. MODS: Exclude Sherri if client needs modifications.
+4. GABRIEL: On holiday 25 Apr - 30 Apr.
+5. NO CHAT: Do not explain your thinking. Only output the final 3 options.
 
-Option 1
-Instructor: [Name]
-Date: [Date]
-Time: [Time]
-Transit Logic: [Briefly explain the gap and travel time]
-
-Option 2... (and so on)`;
+TRAVEL_MINUTES (Drive time to/from ${clientSuburb}):
+${JSON.stringify(travelMatrix, null, 2)}`;
 
     const userMessage = `
-CLIENT: ${booking.clientName}
-SUBURB: ${booking.suburb}
+CLIENT: ${booking.clientName} in ${clientSuburb}
+AVAILABILITY: ${booking.availability}
 MODS: ${booking.modifications}
-AVAILABILITY: ${booking.availability || "Any"}
-DURATION: ${booking.duration || "60 mins"}
-DIARIES: ${JSON.stringify(diaries)}
-TRAVEL TIMES: ${travelInfo}`;
+DIARIES: ${JSON.stringify(diaries)}`;
 
-    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
+    const aiRes = await axios.post("https://api.anthropic.com/v1/messages", {
+      model: "claude-3-5-sonnet-20240620",
+      max_tokens: 2000,
+      system: systemPrompt,
+      messages: [{ role: "user", content: userMessage }]
+    }, {
+      headers: { 
+        "x-api-key": process.env.ANTHROPIC_API_KEY, 
         "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 4096, // Maximum output to prevent any chance of truncation
-        system: systemPrompt,
-        messages: [{ role: "user", content: userMessage }]
-      })
+        "content-type": "application/json" 
+      }
     });
 
-    const data = await aiRes.json();
-    
-    // Safety check for empty content
-    if (data.error) {
-        throw new Error(`Anthropic API Error: ${data.error.message}`);
-    }
-
-    res.json(data);
+    res.json(aiRes.data);
 
   } catch (err) {
-    console.error("ANALYSIS ERROR:", err.message);
+    console.error("Server Error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(PORT, () => console.log(`SDT Backend Active on Port ${PORT}`));
+app.listen(PORT, () => console.log(`SDT Smart Backend on ${PORT}`));
