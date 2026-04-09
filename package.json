@@ -1,7 +1,7 @@
 {
   "name": "sdt-booking-backend",
   "version": "1.0.0",
-  "description": "SDT Booking Assistant backend with Google Maps Integration",
+  "description": "SDT Booking Assistant backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
