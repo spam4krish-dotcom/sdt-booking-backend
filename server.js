@@ -41,7 +41,7 @@ const INSTRUCTORS = [
   },
   {
     name: "Sherri",
-    mods: [], // Standard lessons only
+    mods: [],
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Qm9F8eQzb%2B6bu2IC%2FLaNBOOWmK9yskJZYl8guOGtP67bXXfuA0nBVLMaaPL2rsqew%3D%3D"
   },
   {
@@ -53,22 +53,25 @@ const INSTRUCTORS = [
 
 // ─── TRAVEL TIME HELPER ──────────────────────────────────────────────────────
 async function getTravelTime(origin, destination) {
-  if (!origin || !destination || origin.toLowerCase() === destination.toLowerCase()) return 5;
+  if (!origin || !destination || origin.toLowerCase() === destination.toLowerCase() || origin === "Unknown") return 10;
   try {
-    const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${encodeURIComponent(origin + ", VIC")}&destinations=${encodeURIComponent(destination + ", VIC")}&mode=driving&departure_time=now&key=${GOOGLE_MAPS_API_KEY}`;
+    const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${encodeURIComponent(origin + ", VIC")}&destinations=${encodeURIComponent(destination + ", VIC")}&mode=driving&key=${GOOGLE_MAPS_API_KEY}`;
     const res = await axios.get(url);
     if (res.data.rows[0].elements[0].status === "OK") {
       const durationSeconds = res.data.rows[0].elements[0].duration.value;
       return Math.ceil(durationSeconds / 60);
     }
-    return 60; // Fallback
+    return 60; // Safe default for traffic
   } catch (err) {
-    console.error("Maps Error:", err.message);
-    return 60;
+    return 60; 
   }
 }
 
-// ─── ANALYSIS ENDPOINT ───────────────────────────────────────────────────────
+// ─── ROUTES ──────────────────────────────────────────────────────────────────
+
+// Diagnostic route
+app.get("/health", (req, res) => res.send("SDT Smart Backend is Live and Running!"));
+
 app.post("/analyse", async (req, res) => {
   try {
     const booking = req.body;
@@ -83,32 +86,30 @@ app.post("/analyse", async (req, res) => {
           .map(e => ({
             start: e.start,
             end: e.end,
-            location: e.location || "Unknown",
+            location: (e.location || "Unknown").split(',')[0].trim(), // Get just the suburb
             summary: e.summary
           }));
         return { name: inst.name, mods: inst.mods, appts };
       } catch (e) { return { name: inst.name, mods: inst.mods, appts: [] }; }
     }));
 
-    // 2. Map Unique Suburbs for Travel Calculation
+    // 2. Build Travel Matrix
     const uniqueSuburbs = [...new Set(diaries.flatMap(d => d.appts.map(a => a.location)))];
     const travelMatrix = {};
     for (const s of uniqueSuburbs) {
-      if (s !== "Unknown") {
-        travelMatrix[s] = await getTravelTime(s, clientSuburb);
-      }
+      travelMatrix[s] = await getTravelTime(s, clientSuburb);
     }
 
     const systemPrompt = `You are the SDT Booking Assistant. 
 Date Context: Today is ${new Date().toLocaleDateString("en-AU", melbOptions)}.
 
 STRICT LOGIC:
-1. THE 5-MINUTE RULE: You MUST add a 5-minute prep buffer to every travel time.
-   Formula: [Appt End Time] + [Travel Time from Matrix] + [5 Mins] = Earliest Start.
-2. NO GUESSING: Use the TRAVEL_MINUTES matrix provided. If a suburb isn't listed, assume 60 mins.
-3. MODS: Exclude Sherri if client needs modifications.
-4. GABRIEL: On holiday 25 Apr - 30 Apr.
-5. NO CHAT: Do not explain your thinking. Only output the final 3 options.
+1. THE 5-MINUTE RULE: You MUST add a 5-minute prep buffer to every drive.
+   Calculation: [Appt End Time] + [Travel Time from Matrix] + [5 Mins] = Earliest Start.
+2. TRAFFIC FACTS: Use the TRAVEL_MINUTES matrix. If a suburb isn't listed, assume 60 mins.
+3. MODS: If client needs modifications, Sherri is strictly excluded.
+4. GABRIEL: On holiday 25 Apr - 30 Apr 2026.
+5. NO CHAT: Only output the final 3 formatted options. Do not show reasoning.
 
 TRAVEL_MINUTES (Drive time to/from ${clientSuburb}):
 ${JSON.stringify(travelMatrix, null, 2)}`;
@@ -116,12 +117,12 @@ ${JSON.stringify(travelMatrix, null, 2)}`;
     const userMessage = `
 CLIENT: ${booking.clientName} in ${clientSuburb}
 AVAILABILITY: ${booking.availability}
-MODS: ${booking.modifications}
+MODS: ${booking.modifications || "None"}
 DIARIES: ${JSON.stringify(diaries)}`;
 
     const aiRes = await axios.post("https://api.anthropic.com/v1/messages", {
       model: "claude-3-5-sonnet-20240620",
-      max_tokens: 2000,
+      max_tokens: 1500,
       system: systemPrompt,
       messages: [{ role: "user", content: userMessage }]
     }, {
@@ -135,9 +136,9 @@ DIARIES: ${JSON.stringify(diaries)}`;
     res.json(aiRes.data);
 
   } catch (err) {
-    console.error("Server Error:", err.message);
+    console.error("ANALYSIS ERROR:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(PORT, () => console.log(`SDT Smart Backend on ${PORT}`));
+app.listen(PORT, () => console.log(`SDT Smart Backend active on ${PORT}`));
