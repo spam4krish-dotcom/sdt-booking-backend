@@ -99,19 +99,25 @@ function isBlockOutEvent(e) {
   const blockWords = [
     "holiday", "day off", "no lesson", "leave", "bali", "travel",
     "unavailable", "time held", "private stuff", "car service",
-    "non-sdt", "late start after hols", "early finish", "confirmed",
+    "non-sdt", "late start after hols", "early finish",
     "no sdt", "not working", "away", "sick", "personal",
-    "school pickup", "pickup", "school run", "pick up",
-    "family", "appointment", "dentist", "doctor", "medical",
-    "lunch", "break", "not available", "do not book", "dnb"
+    "school pickup", "school run", "pick up",
+    "dentist", "doctor", "medical",
+    "not available", "do not book", "dnb", "mowing man",
+    "fasting", "blood test", "ultrasound"
   ];
   if (blockWords.some(w => summary.includes(w))) return true;
 
+  // All-day event type (date-only, no time component)
+  if (e.datetype === "date") return true;
+
+  // Only block on duration if it's genuinely all-day (8+ hours)
+  // 5h was too aggressive and was eating legitimate lesson sequences
   const start = new Date(e.start);
   const end = new Date(e.end);
   const durationHours = (end - start) / (1000 * 60 * 60);
-  if (durationHours >= 5) return true;
-  if (e.datetype === "date") return true;
+  if (durationHours >= 8) return true;
+
   return false;
 }
 
@@ -381,7 +387,8 @@ app.post("/analyse", async (req, res) => {
           }
         }
 
-        debugLog.push(`${inst.name}: ${Object.keys(appointments).length} days with appts, ${blockedDates.size} blocked dates`);
+        const apptDates = Object.keys(appointments).sort();
+        debugLog.push(`${inst.name}: ${apptDates.length} days with appts (${apptDates.slice(0,8).join(', ')}${apptDates.length > 8 ? '...' : ''}), ${blockedDates.size} blocked (${[...blockedDates].sort().slice(0,5).join(', ')})`);
         return { inst, blockedDates, appointments };
       } catch (e) {
         debugLog.push(`${inst.name}: FAILED - ${e.message}`);
@@ -414,9 +421,15 @@ app.post("/analyse", async (req, res) => {
           continue;
         }
 
-        // Check if this day matches client preference (if any)
-        const preferredPeriods = availPref[dayName]; // e.g. ["AM"] or ["PM"] or undefined
+        // Check if this day matches client preference
+        const preferredPeriods = availPref[dayName];
         const dayIsPreferred = prefDays.length === 0 || preferredPeriods !== undefined;
+
+        // HARD SKIP non-preferred days — only suggest them if zero preferred slots exist across 6 weeks
+        if (!dayIsPreferred) {
+          d.setDate(d.getDate() + 1);
+          continue;
+        }
 
         const dayAppts = appointments[dateStr] || [];
 
@@ -475,39 +488,39 @@ app.post("/analyse", async (req, res) => {
     }
 
     // ── 6. Score and rank slots ──
-    // Scoring: preferred day > geographic proximity > fewer travel minutes > earlier in the 6-week window
     function scoreSlot(slot) {
       let score = 0;
-      if (slot.isPreferred) score += 1000;
-      // Geographic: lower travel = better
-      score -= slot.travelIn * 2;
-      // Earlier in the window = slightly better
+      // Lower travel = better (primary geographic signal)
+      score -= slot.travelIn * 3;
+      // Earlier in the 6-week window = slightly better
       score -= (new Date(slot.date) - new Date()) / (1000 * 60 * 60 * 24);
+      // Reward slots where instructor is already nearby (prev location close to client)
+      if (slot.travelIn <= 15) score += 50;
       return score;
     }
 
     validSlots.sort((a, b) => scoreSlot(b) - scoreSlot(a));
 
-    // Pick top 10 diverse slots (spread across instructors and weeks) to send to Claude
+    // Pick top 10 diverse slots: enforce different instructors and spread across weeks
+    // All slots here are already preferred-day only (non-preferred were hard-skipped above)
     const selectedSlots = [];
-    const usedWeeks = new Set();
-    const usedInstructors = new Set();
+    const usedInstructorWeeks = new Set(); // key: instructor+week — max 1 slot per instructor per week
 
-    // First pass: preferred days, diverse instructors and weeks
     for (const slot of validSlots) {
       if (selectedSlots.length >= 10) break;
-      if (!slot.isPreferred) continue;
-      const week = slot.date.substring(0, 7); // YYYY-MM as rough week proxy
+      const weekKey = slot.instructor + "|" + slot.date.substring(0, 8); // YYYY-MM-D (Mon of week approx)
+      // Allow same instructor in different weeks, but not same instructor same week
+      if (usedInstructorWeeks.has(weekKey)) continue;
       selectedSlots.push(slot);
-      usedWeeks.add(week);
-      usedInstructors.add(slot.instructor);
+      usedInstructorWeeks.add(weekKey);
     }
 
-    // Second pass: fill up with non-preferred if needed
-    for (const slot of validSlots) {
-      if (selectedSlots.length >= 10) break;
-      if (slot.isPreferred) continue;
-      selectedSlots.push(slot);
+    // Fallback: if we somehow have fewer than 3, relax the instructor-week constraint
+    if (selectedSlots.length < 3) {
+      for (const slot of validSlots) {
+        if (selectedSlots.length >= 6) break;
+        if (!selectedSlots.includes(slot)) selectedSlots.push(slot);
+      }
     }
 
     debugLog.push(`Sending ${selectedSlots.length} slots to Claude for ranking`);
