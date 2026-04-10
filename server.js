@@ -228,12 +228,15 @@ YOUR JOB: Find the 3 best available time slots for this client across the next 6
 ABSOLUTE RULES - these cannot be broken:
 1. NEVER book an instructor on a BLOCKED DATE. If a date appears in their blocked dates list, they are completely unavailable that entire day.
 2. NEVER double-book. If a time slot shows as BOOKED, the instructor is not available at that time.
-3. After a BOOKED slot, the instructor cannot start the next lesson until: end time + travel mins to client + 5 min buffer.
-4. MODS: Only recommend instructors who have the required mods. Sherri has NO mods.
-5. GABRIEL: Additional holiday block 25 Apr - 30 Apr 2026.
-6. Look across ALL 6 weeks - spread options across different weeks where possible.
-7. If an instructor has NO appointments on a day (and it is NOT blocked), they are available from 08:00.
-8. HOLD entries still count as BOOKED - do not book over them.
+3. HOLD entries count as BOOKED - never book over a HOLD.
+4. After a BOOKED slot, the instructor cannot start the next lesson until: end time + travel mins to client + 5 min buffer.
+5. MODS: Only recommend instructors who have the required mods. Sherri has NO mods.
+6. GABRIEL: Additional holiday block 25 Apr - 30 Apr 2026. Gabriel does not start before 09:30.
+7. WEEKENDS: Do not suggest Saturday or Sunday slots.
+8. WORKING HOURS: No lessons before 08:00 or after 17:30.
+9. Look across ALL 6 weeks - spread options across different weeks where possible.
+10. If an instructor has NO appointments on a day (and it is NOT blocked), they are available from 08:00.
+11. GEOGRAPHIC PREFERENCE: Prefer instructors who are already working near the client suburb that day.
 
 OUTPUT: Provide exactly 3 options ranked best to worst. Format each as:
 Option [N]: [Instructor]
