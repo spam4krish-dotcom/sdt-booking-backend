@@ -59,13 +59,33 @@ function toMelbTime(date) {
   });
 }
 
-function isBlockOut(summary) {
-  if (!summary) return false;
-  const s = summary.toLowerCase();
-  return s.includes("holiday") || s.includes("day off") || s.includes("no lesson") ||
-    s.includes("leave") || s.includes("bali") || s.includes("travel") ||
-    s.includes("unavailable") || s.includes("time held") || s.includes("private stuff") ||
-    s.includes("car service") || s.includes("non-sdt");
+function toMelbHour(date) {
+  return new Date(date).getHours();
+}
+
+// Detect if an event should block the whole day
+function isBlockOutEvent(e) {
+  const summary = (e.summary || "").toLowerCase();
+  
+  // Keyword based blocks
+  const blockWords = [
+    "holiday", "day off", "no lesson", "leave", "bali", "travel", 
+    "unavailable", "time held", "private stuff", "car service", 
+    "non-sdt", "late start after hols", "early finish", "confirmed",
+    "no sdt", "not working", "away", "sick", "personal"
+  ];
+  if (blockWords.some(w => summary.includes(w))) return true;
+
+  // Duration based - if event spans more than 5 hours treat as block
+  const start = new Date(e.start);
+  const end = new Date(e.end);
+  const durationHours = (end - start) / (1000 * 60 * 60);
+  if (durationHours >= 5) return true;
+
+  // All-day event type
+  if (e.datetype === "date") return true;
+
+  return false;
 }
 
 async function getTravelTime(origin, destination) {
@@ -94,11 +114,11 @@ app.post("/analyse", async (req, res) => {
     const booking = req.body;
     const clientSuburb = booking.suburb;
 
-    if (!clientSuburb) return res.status(400).json({ error: "Missing suburb in form data" });
+    if (!clientSuburb) return res.status(400).json({ error: "Missing suburb" });
     if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: "Missing ANTHROPIC_API_KEY" });
     if (!GOOGLE_MAPS_API_KEY) return res.status(500).json({ error: "Missing GOOGLE_MAPS_API_KEY" });
 
-    // 1. Fetch and parse all diaries
+    // 1. Fetch diaries
     debugLog.push("Fetching diaries...");
     const now = new Date();
     const sixWeeksOut = new Date(now.getTime() + 42 * 24 * 60 * 60 * 1000);
@@ -113,23 +133,24 @@ app.post("/analyse", async (req, res) => {
           if (e.type !== "VEVENT") return;
           const start = new Date(e.start);
           const end = new Date(e.end);
-          if (start > sixWeeksOut) return;
-          if (end < now) return;
+          if (end < now || start > sixWeeksOut) return;
 
           const dateStr = toMelbDate(start);
-          const summary = e.summary || "";
 
-          // All-day block or holiday keyword = block entire day
-          if (isBlockOut(summary)) {
-            blockedDates.add(dateStr);
+          if (isBlockOutEvent(e)) {
+            // Block all days this event spans
+            const d = new Date(start);
+            while (d <= end) {
+              blockedDates.add(toMelbDate(d));
+              d.setDate(d.getDate() + 1);
+            }
             return;
           }
 
-          // Check if it's a genuine timed appointment
           const startTime = toMelbTime(start);
           const endTime = toMelbTime(end);
 
-          // Skip if it looks like an all-day event with no real time
+          // Skip midnight-to-midnight events
           if (startTime === "00:00" && endTime === "00:00") {
             blockedDates.add(dateStr);
             return;
@@ -138,15 +159,15 @@ app.post("/analyse", async (req, res) => {
           const location = (e.location || "Unknown").split(",")[0].trim();
           appointments.push({
             date: dateStr,
-            startTime: startTime,
-            endTime: endTime,
-            location: location,
-            summary: summary,
-            isHold: summary.toUpperCase().includes("HOLD")
+            startTime,
+            endTime,
+            location,
+            summary: e.summary || "",
+            isHold: (e.summary || "").toUpperCase().includes("HOLD")
           });
         });
 
-        debugLog.push(`${inst.name}: ${appointments.length} appts, ${blockedDates.size} blocked days`);
+        debugLog.push(`${inst.name}: ${appointments.length} appts, blocked: ${[...blockedDates].slice(0,5).join(", ")}`);
         return { name: inst.name, base: inst.base, mods: inst.mods, blockedDates: [...blockedDates], appointments };
       } catch (e) {
         debugLog.push(`${inst.name}: FAILED - ${e.message}`);
@@ -154,10 +175,9 @@ app.post("/analyse", async (req, res) => {
       }
     }));
 
-    // 2. Get travel times from client suburb to all appointment locations + instructor bases
+    // 2. Travel times
     debugLog.push("Getting travel times...");
-    const allLocations = new Set();
-    INSTRUCTORS.forEach(i => allLocations.add(i.base));
+    const allLocations = new Set(INSTRUCTORS.map(i => i.base));
     diaries.forEach(d => d.appointments.forEach(a => {
       if (a.location && a.location !== "Unknown") allLocations.add(a.location);
     }));
@@ -166,25 +186,17 @@ app.post("/analyse", async (req, res) => {
     for (const loc of allLocations) {
       travelTimes[loc] = await getTravelTime(loc, clientSuburb);
     }
-    debugLog.push(`Travel times calculated for ${Object.keys(travelTimes).length} locations`);
 
-    // 3. Build a clear structured diary summary for Claude
-    const today = toMelbDate(now);
+    // 3. Build diary summary
     let diarySummary = "";
     diaries.forEach(d => {
-      diarySummary += `\n=== ${d.name} (base: ${d.base}, drive to client: ${travelTimes[d.base] || 45} mins) ===\n`;
-      diarySummary += `Mods: ${d.mods.length > 0 ? d.mods.join(", ") : "NONE - standard vehicle only"}\n`;
-
-      if (d.error) {
-        diarySummary += `ERROR loading diary: ${d.error}\n`;
-        return;
-      }
-
+      diarySummary += `\n=== ${d.name} (base: ${d.base}, drive from base to ${clientSuburb}: ${travelTimes[d.base] || 45} mins) ===\n`;
+      diarySummary += `Mods available: ${d.mods.length > 0 ? d.mods.join(", ") : "NONE"}\n`;
+      if (d.error) { diarySummary += `ERROR loading diary\n`; return; }
       if (d.blockedDates.length > 0) {
-        diarySummary += `FULLY BLOCKED DATES (do not book): ${d.blockedDates.join(", ")}\n`;
+        diarySummary += `BLOCKED DATES (unavailable all day): ${d.blockedDates.sort().join(", ")}\n`;
       }
 
-      // Group appointments by date
       const byDate = {};
       d.appointments.forEach(a => {
         if (!byDate[a.date]) byDate[a.date] = [];
@@ -193,55 +205,53 @@ app.post("/analyse", async (req, res) => {
 
       const sortedDates = Object.keys(byDate).sort();
       if (sortedDates.length === 0) {
-        diarySummary += `No appointments found in next 6 weeks\n`;
+        diarySummary += `No appointments in diary for next 6 weeks\n`;
       } else {
         sortedDates.forEach(date => {
           const dayAppts = byDate[date].sort((a, b) => a.startTime.localeCompare(b.startTime));
           diarySummary += `${date}:\n`;
           dayAppts.forEach(a => {
             const travelFromHere = travelTimes[a.location] || 45;
-            const earliestNext = `earliest next slot after this: ${a.endTime} + ${travelFromHere}min travel + 5min buffer`;
-            diarySummary += `  ${a.startTime}-${a.endTime} | ${a.location} | ${a.summary}${a.isHold ? " [HOLD]" : ""} | (${earliestNext})\n`;
+            const bufferMins = travelFromHere + 5;
+            diarySummary += `  BOOKED ${a.startTime}-${a.endTime} at ${a.location}${a.isHold ? " [HOLD]" : ""} — next slot earliest: ${a.endTime} + ${bufferMins}min (${travelFromHere}min travel + 5min buffer)\n`;
           });
         });
       }
     });
 
-    // 4. Call Claude with structured data
+    const today = toMelbDate(now);
     const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training in Melbourne.
 Today is ${today}.
 
-YOUR JOB: Find the 3 best available slots for this client across the next 6 weeks. Look across ALL upcoming weeks, not just the nearest date.
+YOUR JOB: Find the 3 best available time slots for this client across the next 6 weeks.
 
-CRITICAL RULES:
-1. MODS: If client needs modifications, only recommend instructors who have those mods. Sherri has NO mods.
-2. BLOCKED DATES: Never book an instructor on a blocked date. These are holidays, days off, car service days etc.
-3. EXISTING APPOINTMENTS: Never double-book. If an instructor has an appointment at 9:30am, they are NOT available at 9:30am.
-4. SLOT CALCULATION: After an appointment ends, add travel time to client suburb + 5 min buffer before they can start the next lesson.
-   Formula: [Last appt end time] + [travel mins from that location to client] + 5 mins = earliest available start
-5. EMPTY DAYS: If an instructor has no appointments on a day (and it is not blocked), they are available from 8:00am.
-6. GEOGRAPHIC ROUTING: Prefer slots where the new booking fits naturally into the instructor's day without long dead runs.
-7. LOOK AHEAD: Provide options spread across different weeks where possible - do not just suggest one date.
-8. GABRIEL: On holiday 25 Apr - 30 Apr 2026.
+ABSOLUTE RULES - these cannot be broken:
+1. NEVER book an instructor on a BLOCKED DATE. If a date appears in their blocked dates list, they are completely unavailable that entire day.
+2. NEVER double-book. If a time slot shows as BOOKED, the instructor is not available at that time.
+3. After a BOOKED slot, the instructor cannot start the next lesson until: end time + travel mins to client + 5 min buffer.
+4. MODS: Only recommend instructors who have the required mods. Sherri has NO mods.
+5. GABRIEL: Additional holiday block 25 Apr - 30 Apr 2026.
+6. Look across ALL 6 weeks - spread options across different weeks where possible.
+7. If an instructor has NO appointments on a day (and it is NOT blocked), they are available from 08:00.
+8. HOLD entries still count as BOOKED - do not book over them.
 
-OUTPUT FORMAT - provide exactly 3 options, ranked best to worst:
-Option [N]: [Instructor name]
-Date: [DD/MM/YYYY - Day name]
-Time: [HH:MM AM/PM]
-Why: [One sentence explaining why this slot works - reference actual diary entries and travel times]
-Travel to client: [X mins from their last location or base]`;
+OUTPUT: Provide exactly 3 options ranked best to worst. Format each as:
+Option [N]: [Instructor]
+Date: [DD/MM/YYYY - Day]
+Time: [HH:MM]
+Why: [Specific reason referencing actual diary data and travel time]`;
 
     const userMessage = `CLIENT: ${booking.clientName}
 SUBURB: ${clientSuburb}
-AVAILABILITY PREFERENCE: ${booking.availability}
+PREFERRED AVAILABILITY: ${booking.availability}
 DURATION: ${booking.duration || "60 mins"}
 MODIFICATIONS NEEDED: ${booking.modifications || "None"}
 FUNDING: ${booking.funding || "Not specified"}
 
-INSTRUCTOR DIARIES AND TRAVEL TIMES:
+DIARY DATA (next 6 weeks):
 ${diarySummary}`;
 
-    debugLog.push("Calling Anthropic API...");
+    debugLog.push("Calling Claude...");
     const aiRes = await axios.post("https://api.anthropic.com/v1/messages", {
       model: "claude-sonnet-4-20250514",
       max_tokens: 1500,
@@ -260,15 +270,9 @@ ${diarySummary}`;
 
   } catch (err) {
     console.error("ERROR:", err.message);
-    let errorDetail = err.message;
-    if (err.response) {
-      errorDetail = `HTTP ${err.response.status} from ${err.config?.url}: ${JSON.stringify(err.response.data).substring(0, 300)}`;
-    }
-    res.status(500).json({
-      error: "Analysis failed: " + err.message,
-      errorDetail: errorDetail,
-      debugLog: debugLog
-    });
+    let detail = err.message;
+    if (err.response) detail = `HTTP ${err.response.status}: ${JSON.stringify(err.response.data).substring(0, 300)}`;
+    res.status(500).json({ error: err.message, detail, debugLog });
   }
 });
 
