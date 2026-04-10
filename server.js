@@ -10,57 +10,78 @@ app.use(cors());
 app.use(express.json());
 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
-const melbOptions = { timeZone: 'Australia/Melbourne', hour12: true };
 
 const INSTRUCTORS = [
   {
-    name: "Christian",
+    name: "Christian", base: "Montmorency",
     mods: ["LFA", "Spinner", "Hand Controls", "Satellite", "Indicator Extension", "Extension Pedals"],
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fnXpnN%2FtMeidfD9E6WmLBWPsPF881mF4%2FDKjqX6mENEnlggTWF2jMn8Em8aKgSGXA%3D%3D"
   },
   {
-    name: "Gabriel",
+    name: "Gabriel", base: "Croydon North",
     mods: ["LFA", "Spinner", "Hand Controls", "Satellite", "Indicator Extension"],
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2a52GEgwyPVJ%2B0I6mOab2rD4%2Bmqr7EYvQGR9ykfeKAj%2F"
   },
   {
-    name: "Greg",
+    name: "Greg", base: "Kilsyth",
     mods: ["LFA", "Spinner", "Indicator Extension"],
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fgA7lzqZCrNH6P0mJPZWpJqu4G4d87qHmXHYUUq3ZhplneSIXp12lfHZzfvGyQdDw%3D%3D"
   },
   {
-    name: "Jason",
+    name: "Jason", base: "Wandin North",
     mods: ["LFA", "Spinner"],
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Sks8REnxfIzFLWWhJgXRykKsTkQKIlND6Q3P8UWc8WWFJCS5Y5gIU0xiqPfnSz%2FkQ%3D%3D"
   },
   {
-    name: "Marc",
+    name: "Marc", base: "Werribee",
     mods: ["LFA", "Spinner", "Indicator Extension", "Extension Pedals"],
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2ecoRZN2xzdtmsUYY9vDrAuMuEJAzQSivaNXrwqSOqrMT982Jq4gficfE9XDNSVl0A%3D%3D"
   },
   {
-    name: "Sherri",
+    name: "Sherri", base: "Wandin North",
     mods: [],
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Qm9F8eQzb%2B6bu2IC%2FLaNBOOWmK9yskJZYl8guOGtP67bXXfuA0nBVLMaaPL2rsqew%3D%3D"
   },
   {
-    name: "Yves",
+    name: "Yves", base: "Rye",
     mods: ["LFA", "Spinner", "Indicator Extension"],
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaJ6xepUO6AS0mQIBuSqW%2BOWjh2dEdLM2ryJYQBbgLemmcR6jFHgrJeGdQCO3yfSW7dInaTI63gFq7aNCi2ArGCg%3D%3D"
   }
 ];
 
+function toMelbDate(date) {
+  return new Date(date).toLocaleDateString("en-CA", { timeZone: "Australia/Melbourne" });
+}
+
+function toMelbTime(date) {
+  return new Date(date).toLocaleTimeString("en-AU", {
+    timeZone: "Australia/Melbourne", hour: "2-digit", minute: "2-digit", hour12: false
+  });
+}
+
+function isBlockOut(summary) {
+  if (!summary) return false;
+  const s = summary.toLowerCase();
+  return s.includes("holiday") || s.includes("day off") || s.includes("no lesson") ||
+    s.includes("leave") || s.includes("bali") || s.includes("travel") ||
+    s.includes("unavailable") || s.includes("time held") || s.includes("private stuff") ||
+    s.includes("car service") || s.includes("non-sdt");
+}
+
 async function getTravelTime(origin, destination) {
-  if (!origin || !destination || origin.toLowerCase() === destination.toLowerCase() || origin === "Unknown") return 10;
+  if (!origin || !destination || origin === "Unknown" ||
+    origin.toLowerCase() === destination.toLowerCase()) return 10;
   try {
-    const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${encodeURIComponent(origin + ", VIC")}&destinations=${encodeURIComponent(destination + ", VIC")}&mode=driving&key=${GOOGLE_MAPS_API_KEY}`;
+    const url = `https://maps.googleapis.com/maps/api/distancematrix/json` +
+      `?origins=${encodeURIComponent(origin + ", VIC, Australia")}` +
+      `&destinations=${encodeURIComponent(destination + ", VIC, Australia")}` +
+      `&mode=driving&key=${GOOGLE_MAPS_API_KEY}`;
     const res = await axios.get(url);
-    if (res.data.rows[0].elements[0].status === "OK") {
-      return Math.ceil(res.data.rows[0].elements[0].duration.value / 60);
-    }
-    return 60;
-  } catch (err) {
-    return 60;
+    const el = res.data.rows[0].elements[0];
+    if (el.status === "OK") return Math.ceil(el.duration.value / 60);
+    return 45;
+  } catch (e) {
+    return 45;
   }
 }
 
@@ -69,85 +90,158 @@ app.get("/health", (req, res) => res.json({ status: "ok", message: "SDT Smart Ba
 
 app.post("/analyse", async (req, res) => {
   const debugLog = [];
-
   try {
     const booking = req.body;
     const clientSuburb = booking.suburb;
 
-    if (!clientSuburb) {
-      return res.status(400).json({ 
-        error: "Missing suburb in booking data",
-        debug: "The form did not send a suburb value to the server" 
-      });
-    }
+    if (!clientSuburb) return res.status(400).json({ error: "Missing suburb in form data" });
+    if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: "Missing ANTHROPIC_API_KEY" });
+    if (!GOOGLE_MAPS_API_KEY) return res.status(500).json({ error: "Missing GOOGLE_MAPS_API_KEY" });
 
-    if (!process.env.ANTHROPIC_API_KEY) {
-      return res.status(500).json({ 
-        error: "Server configuration error",
-        debug: "ANTHROPIC_API_KEY is not set in Railway environment variables" 
-      });
-    }
+    // 1. Fetch and parse all diaries
+    debugLog.push("Fetching diaries...");
+    const now = new Date();
+    const sixWeeksOut = new Date(now.getTime() + 42 * 24 * 60 * 60 * 1000);
 
-    if (!GOOGLE_MAPS_API_KEY) {
-      return res.status(500).json({ 
-        error: "Server configuration error",
-        debug: "GOOGLE_MAPS_API_KEY is not set in Railway environment variables" 
-      });
-    }
-
-    // 1. Fetch Diaries
-    debugLog.push("Fetching iCal diaries...");
     const diaries = await Promise.all(INSTRUCTORS.map(async inst => {
       try {
         const rawData = await ical.async.fromURL(inst.icsUrl);
-        const appts = Object.values(rawData)
-          .filter(e => e.type === "VEVENT")
-          .map(e => ({
-            start: e.start,
-            end: e.end,
-            location: (e.location || "Unknown").split(',')[0].trim(),
-            summary: e.summary
-          }));
-        debugLog.push(`${inst.name}: ${appts.length} appointments fetched`);
-        return { name: inst.name, mods: inst.mods, appts };
+        const blockedDates = new Set();
+        const appointments = [];
+
+        Object.values(rawData).forEach(e => {
+          if (e.type !== "VEVENT") return;
+          const start = new Date(e.start);
+          const end = new Date(e.end);
+          if (start > sixWeeksOut) return;
+          if (end < now) return;
+
+          const dateStr = toMelbDate(start);
+          const summary = e.summary || "";
+
+          // All-day block or holiday keyword = block entire day
+          if (isBlockOut(summary)) {
+            blockedDates.add(dateStr);
+            return;
+          }
+
+          // Check if it's a genuine timed appointment
+          const startTime = toMelbTime(start);
+          const endTime = toMelbTime(end);
+
+          // Skip if it looks like an all-day event with no real time
+          if (startTime === "00:00" && endTime === "00:00") {
+            blockedDates.add(dateStr);
+            return;
+          }
+
+          const location = (e.location || "Unknown").split(",")[0].trim();
+          appointments.push({
+            date: dateStr,
+            startTime: startTime,
+            endTime: endTime,
+            location: location,
+            summary: summary,
+            isHold: summary.toUpperCase().includes("HOLD")
+          });
+        });
+
+        debugLog.push(`${inst.name}: ${appointments.length} appts, ${blockedDates.size} blocked days`);
+        return { name: inst.name, base: inst.base, mods: inst.mods, blockedDates: [...blockedDates], appointments };
       } catch (e) {
-        debugLog.push(`${inst.name}: iCal fetch FAILED - ${e.message}`);
-        return { name: inst.name, mods: inst.mods, appts: [], error: e.message };
+        debugLog.push(`${inst.name}: FAILED - ${e.message}`);
+        return { name: inst.name, base: inst.base, mods: inst.mods, blockedDates: [], appointments: [], error: e.message };
       }
     }));
 
-    // 2. Build Travel Matrix
-    debugLog.push("Building travel matrix...");
-    const uniqueSuburbs = [...new Set(diaries.flatMap(d => d.appts.map(a => a.location)).filter(s => s && s !== "Unknown"))];
-    debugLog.push(`Unique suburbs to calculate: ${uniqueSuburbs.length}`);
+    // 2. Get travel times from client suburb to all appointment locations + instructor bases
+    debugLog.push("Getting travel times...");
+    const allLocations = new Set();
+    INSTRUCTORS.forEach(i => allLocations.add(i.base));
+    diaries.forEach(d => d.appointments.forEach(a => {
+      if (a.location && a.location !== "Unknown") allLocations.add(a.location);
+    }));
 
-    const travelMatrix = {};
-    for (const s of uniqueSuburbs) {
-      travelMatrix[s] = await getTravelTime(s, clientSuburb);
+    const travelTimes = {};
+    for (const loc of allLocations) {
+      travelTimes[loc] = await getTravelTime(loc, clientSuburb);
     }
-    debugLog.push("Travel matrix built successfully");
+    debugLog.push(`Travel times calculated for ${Object.keys(travelTimes).length} locations`);
 
-    const systemPrompt = `You are the SDT Booking Assistant.
-Date Context: Today is ${new Date().toLocaleDateString("en-AU", melbOptions)}.
+    // 3. Build a clear structured diary summary for Claude
+    const today = toMelbDate(now);
+    let diarySummary = "";
+    diaries.forEach(d => {
+      diarySummary += `\n=== ${d.name} (base: ${d.base}, drive to client: ${travelTimes[d.base] || 45} mins) ===\n`;
+      diarySummary += `Mods: ${d.mods.length > 0 ? d.mods.join(", ") : "NONE - standard vehicle only"}\n`;
 
-STRICT LOGIC:
-1. THE 5-MINUTE RULE: Add a 5-minute prep buffer to every drive.
-   Calculation: [Appt End Time] + [Travel Time from Matrix] + [5 Mins] = Earliest Start.
-2. TRAFFIC FACTS: Use the TRAVEL_MINUTES matrix. If a suburb is not listed, assume 60 mins.
-3. MODS: If client needs modifications, Sherri is strictly excluded.
-4. GABRIEL: On holiday 25 Apr - 30 Apr 2026.
-5. NO CHAT: Only output the final 3 formatted options. Do not show reasoning.
+      if (d.error) {
+        diarySummary += `ERROR loading diary: ${d.error}\n`;
+        return;
+      }
 
-TRAVEL_MINUTES (Drive time to/from ${clientSuburb}):
-${JSON.stringify(travelMatrix, null, 2)}`;
+      if (d.blockedDates.length > 0) {
+        diarySummary += `FULLY BLOCKED DATES (do not book): ${d.blockedDates.join(", ")}\n`;
+      }
 
-    const userMessage = `CLIENT: ${booking.clientName} in ${clientSuburb}
-AVAILABILITY: ${booking.availability}
-MODS: ${booking.modifications || "None"}
-DIARIES: ${JSON.stringify(diaries)}`;
+      // Group appointments by date
+      const byDate = {};
+      d.appointments.forEach(a => {
+        if (!byDate[a.date]) byDate[a.date] = [];
+        byDate[a.date].push(a);
+      });
+
+      const sortedDates = Object.keys(byDate).sort();
+      if (sortedDates.length === 0) {
+        diarySummary += `No appointments found in next 6 weeks\n`;
+      } else {
+        sortedDates.forEach(date => {
+          const dayAppts = byDate[date].sort((a, b) => a.startTime.localeCompare(b.startTime));
+          diarySummary += `${date}:\n`;
+          dayAppts.forEach(a => {
+            const travelFromHere = travelTimes[a.location] || 45;
+            const earliestNext = `earliest next slot after this: ${a.endTime} + ${travelFromHere}min travel + 5min buffer`;
+            diarySummary += `  ${a.startTime}-${a.endTime} | ${a.location} | ${a.summary}${a.isHold ? " [HOLD]" : ""} | (${earliestNext})\n`;
+          });
+        });
+      }
+    });
+
+    // 4. Call Claude with structured data
+    const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training in Melbourne.
+Today is ${today}.
+
+YOUR JOB: Find the 3 best available slots for this client across the next 6 weeks. Look across ALL upcoming weeks, not just the nearest date.
+
+CRITICAL RULES:
+1. MODS: If client needs modifications, only recommend instructors who have those mods. Sherri has NO mods.
+2. BLOCKED DATES: Never book an instructor on a blocked date. These are holidays, days off, car service days etc.
+3. EXISTING APPOINTMENTS: Never double-book. If an instructor has an appointment at 9:30am, they are NOT available at 9:30am.
+4. SLOT CALCULATION: After an appointment ends, add travel time to client suburb + 5 min buffer before they can start the next lesson.
+   Formula: [Last appt end time] + [travel mins from that location to client] + 5 mins = earliest available start
+5. EMPTY DAYS: If an instructor has no appointments on a day (and it is not blocked), they are available from 8:00am.
+6. GEOGRAPHIC ROUTING: Prefer slots where the new booking fits naturally into the instructor's day without long dead runs.
+7. LOOK AHEAD: Provide options spread across different weeks where possible - do not just suggest one date.
+8. GABRIEL: On holiday 25 Apr - 30 Apr 2026.
+
+OUTPUT FORMAT - provide exactly 3 options, ranked best to worst:
+Option [N]: [Instructor name]
+Date: [DD/MM/YYYY - Day name]
+Time: [HH:MM AM/PM]
+Why: [One sentence explaining why this slot works - reference actual diary entries and travel times]
+Travel to client: [X mins from their last location or base]`;
+
+    const userMessage = `CLIENT: ${booking.clientName}
+SUBURB: ${clientSuburb}
+AVAILABILITY PREFERENCE: ${booking.availability}
+DURATION: ${booking.duration || "60 mins"}
+MODIFICATIONS NEEDED: ${booking.modifications || "None"}
+FUNDING: ${booking.funding || "Not specified"}
+
+INSTRUCTOR DIARIES AND TRAVEL TIMES:
+${diarySummary}`;
 
     debugLog.push("Calling Anthropic API...");
-
     const aiRes = await axios.post("https://api.anthropic.com/v1/messages", {
       model: "claude-sonnet-4-20250514",
       max_tokens: 1500,
@@ -161,38 +255,19 @@ DIARIES: ${JSON.stringify(diaries)}`;
       }
     });
 
-    debugLog.push("Anthropic API call successful");
-
-    res.json({
-      ...aiRes.data,
-      _debug: debugLog
-    });
+    debugLog.push("Success");
+    res.json({ ...aiRes.data, _debug: debugLog });
 
   } catch (err) {
-    console.error("ANALYSIS ERROR:", err.message);
-
-    // Detailed error response
+    console.error("ERROR:", err.message);
     let errorDetail = err.message;
-    let errorSource = "Unknown";
-
     if (err.response) {
-      // Axios HTTP error
-      errorSource = "HTTP request to " + (err.config?.url || "unknown URL");
-      errorDetail = `Status ${err.response.status}: ${JSON.stringify(err.response.data).substring(0, 300)}`;
-    } else if (err.code === "ENOTFOUND") {
-      errorSource = "DNS / Network";
-      errorDetail = "Could not reach " + err.hostname + " - check network or URL";
-    } else if (err.code === "ECONNREFUSED") {
-      errorSource = "Connection refused";
-      errorDetail = "Server refused connection at " + err.address;
+      errorDetail = `HTTP ${err.response.status} from ${err.config?.url}: ${JSON.stringify(err.response.data).substring(0, 300)}`;
     }
-
     res.status(500).json({
       error: "Analysis failed: " + err.message,
-      errorSource: errorSource,
       errorDetail: errorDetail,
-      debugLog: debugLog,
-      hint: "Check debugLog to see how far the process got before failing"
+      debugLog: debugLog
     });
   }
 });
