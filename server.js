@@ -75,6 +75,11 @@ function minsToTime(m) {
   return `${String(h).padStart(2, "0")}:${String(mins).padStart(2, "0")}`;
 }
 
+// Round UP to next 15-minute increment
+function snapTo15(timeMins) {
+  return Math.ceil(timeMins / 15) * 15;
+}
+
 // Get day-of-week name from date string YYYY-MM-DD
 function getDayName(dateStr) {
   const d = new Date(dateStr + "T12:00:00+10:00");
@@ -217,27 +222,69 @@ async function computeDayWindows(dayAppts, clientSuburb, durationMins, instructo
 
 // ─── Availability Parser ──────────────────────────────────────────────────────
 
+// Time block definitions — maps label to [startMins, endMins]
+const TIME_BLOCKS = {
+  "early-morning": [timeToMins("08:00"), timeToMins("10:00")],
+  "mid-morning":   [timeToMins("10:00"), timeToMins("12:00")],
+  "afternoon":     [timeToMins("12:00"), timeToMins("14:00")],
+  "late-afternoon":[timeToMins("14:00"), timeToMins("17:30")],
+  "all-day":       [timeToMins("08:00"), timeToMins("17:30")],
+  // Legacy AM/PM support
+  "AM":            [timeToMins("08:00"), timeToMins("12:00")],
+  "PM":            [timeToMins("12:00"), timeToMins("17:30")],
+};
+
 function parseAvailability(availStr) {
-  // e.g. "Mon AM, Tue PM, Wed AM" → { Mon: ["AM"], Tue: ["PM"], Wed: ["AM"] }
+  // New format: "Tue:mid-morning, Thu:late-afternoon, Thu:all-day"
+  // Legacy format: "Mon AM, Tue PM"
+  // Returns: { Tue: ["mid-morning"], Thu: ["late-afternoon", "all-day"] }
   const result = {};
   if (!availStr || availStr === "No specific availability selected") return result;
   const parts = availStr.split(",").map(s => s.trim());
   parts.forEach(p => {
-    const [day, period] = p.split(" ");
-    if (!result[day]) result[day] = [];
-    if (period) result[day].push(period);
+    // New format with colon
+    if (p.includes(":")) {
+      const [day, block] = p.split(":").map(s => s.trim());
+      if (!result[day]) result[day] = [];
+      if (block) result[day].push(block);
+    } else {
+      // Legacy space-separated
+      const [day, period] = p.split(" ");
+      if (!result[day]) result[day] = [];
+      if (period) result[day].push(period);
+    }
   });
   return result;
 }
 
-function windowMatchesAvailability(window, period) {
-  // AM: lesson should start before 12:00 and ideally finish by 13:00
-  // PM: lesson should start at or after 12:00
-  if (!period) return true;
-  const startMins = timeToMins(window.earliestStart);
-  if (period === "AM") return startMins < timeToMins("12:00");
-  if (period === "PM") return startMins >= timeToMins("12:00") || timeToMins(window.latestStart) >= timeToMins("12:00");
-  return true;
+function windowMatchesAvailability(window, block) {
+  if (!block) return true;
+  const blockRange = TIME_BLOCKS[block];
+  if (!blockRange) return true;
+  const [blockStart, blockEnd] = blockRange;
+  const winEarliest = timeToMins(window.earliestStart);
+  const winLatest = timeToMins(window.latestStart);
+  // Window overlaps with block range
+  return winEarliest < blockEnd && winLatest >= blockStart;
+}
+
+// Given a window and a time block, find the best suggested start within that block
+function bestStartInBlock(window, block, durationMins) {
+  const winEarliest = timeToMins(window.earliestStart);
+  const winLatest = timeToMins(window.latestStart);
+  const blockRange = TIME_BLOCKS[block] || [winEarliest, winLatest];
+  const [blockStart, blockEnd] = blockRange;
+
+  // Clamp to both window and block
+  const clampedEarliest = Math.max(winEarliest, blockStart);
+  const clampedLatest = Math.min(winLatest, blockEnd - durationMins);
+
+  if (clampedEarliest > clampedLatest) return null;
+
+  // Snap up to nearest 15 mins
+  const snapped = snapTo15(clampedEarliest);
+  if (snapped > clampedLatest) return null;
+  return minsToTime(snapped);
 }
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
@@ -383,17 +430,11 @@ app.post("/analyse", async (req, res) => {
         );
 
         for (const window of windows) {
-          // Check if window matches preferred AM/PM
           const periods = preferredPeriods || [null];
           for (const period of periods) {
             if (windowMatchesAvailability(window, period)) {
-              // Pick the best start time: earliest if AM, or 12:00+ if PM
-              let suggestedStart = window.earliestStart;
-              if (period === "PM" && timeToMins(suggestedStart) < timeToMins("12:00")) {
-                suggestedStart = "12:00";
-                // Ensure it's still within window
-                if (timeToMins(suggestedStart) > timeToMins(window.latestStart)) continue;
-              }
+              const suggestedStart = bestStartInBlock(window, period, durationMins);
+              if (!suggestedStart) continue;
 
               validSlots.push({
                 instructor: inst.name,
@@ -410,11 +451,12 @@ app.post("/analyse", async (req, res) => {
                 nextLocation: window.nextLocation,
                 isPreferred: dayIsPreferred,
                 period: period || "ANY",
+                slotNotes: booking.availabilityNotes?.[`${dayName}:${period}`] || "",
                 appointmentsBefore: dayAppts.filter(a => timeToMins(a.endTime) <= timeToMins(suggestedStart)).length,
                 appointmentsAfter: dayAppts.filter(a => timeToMins(a.startTime) >= timeToMins(suggestedStart) + durationMins).length,
                 totalApptsThatDay: dayAppts.length
               });
-              break; // only add one entry per window per day
+              break;
             }
           }
         }
@@ -474,10 +516,11 @@ app.post("/analyse", async (req, res) => {
     const slotDescriptions = selectedSlots.map((s, i) => {
       const apptsBefore = s.appointmentsBefore > 0 ? `${s.appointmentsBefore} appt(s) before` : "first lesson of day";
       const apptsAfter = s.appointmentsAfter > 0 ? `${s.appointmentsAfter} appt(s) after` : "last lesson of day";
+      const notesLine = s.slotNotes ? `\n  Client note for this slot: "${s.slotNotes}"` : "";
       return `Slot ${i + 1}: ${s.instructor} — ${formatDate(s.date)} (${s.dayName}) at ${s.suggestedStart}
   Window: ${s.windowEarliest}–${s.windowLatest} | Travel to client: ${s.travelIn} min from ${s.prevLocation} | Travel to next: ${s.travelOut > 0 ? s.travelOut + " min to " + s.nextLocation : "n/a (last lesson)"}
   Day context: ${apptsBefore}, ${apptsAfter} (${s.totalApptsThatDay} total bookings that day)
-  Preferred slot: ${s.isPreferred ? "YES (" + s.period + ")" : "NO"}`;
+  Preferred slot: ${s.isPreferred ? "YES (" + s.period + ")" : "NO"}${notesLine}`;
     }).join("\n\n");
 
     const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training in Melbourne.
