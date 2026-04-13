@@ -111,10 +111,16 @@ function isBlockOutEvent(e) {
   // All-day event type (date-only, no time component)
   if (e.datetype === "date") return true;
 
-  // Only block on duration if it's genuinely all-day (8+ hours)
-  // 5h was too aggressive and was eating legitimate lesson sequences
   const start = new Date(e.start);
   const end = new Date(e.end);
+
+  // Catch midnight-to-midnight all-day events (some ICS feeds encode all-day this way)
+  const melbTZ = { timeZone: "Australia/Melbourne", hour: "2-digit", minute: "2-digit", hour12: false };
+  const startHHMM = start.toLocaleTimeString("en-AU", melbTZ);
+  const endHHMM = end.toLocaleTimeString("en-AU", melbTZ);
+  if (startHHMM === "00:00" && endHHMM === "00:00") return true;
+
+  // Only block on duration if genuinely all-day (8+ hours)
   const durationHours = (end - start) / (1000 * 60 * 60);
   if (durationHours >= 8) return true;
 
@@ -166,8 +172,12 @@ async function computeDayWindows(dayAppts, clientSuburb, durationMins, instructo
   const LESSON_END_CAP = timeToMins("18:00");
   const BUFFER = 5;
 
-  // Sort appointments by start time
-  const sorted = [...dayAppts].sort((a, b) => timeToMins(a.startTime) - timeToMins(b.startTime));
+  // Filter out any midnight-to-midnight events that slipped through block detection
+  // and sort by start time
+  const sorted = [...dayAppts]
+    .filter(a => !(a.startTime === "00:00" && a.endTime === "00:00"))
+    .filter(a => timeToMins(a.endTime) > timeToMins(a.startTime)) // skip zero-duration events
+    .sort((a, b) => timeToMins(a.startTime) - timeToMins(b.startTime));
 
   // Build list of "fence posts": { time (end of prev / start of day), location }
   // We check gaps: [fencePost[i].time, sorted[i].startTime]
@@ -297,6 +307,57 @@ function bestStartInBlock(window, block, durationMins) {
 
 app.get("/", (req, res) => res.json({ status: "ok", message: "SDT Smart Backend is Live" }));
 app.get("/health", (req, res) => res.json({ status: "ok", message: "SDT Smart Backend is Live and Running!" }));
+
+
+app.get("/debug-diary", async (req, res) => {
+  const now = new Date();
+  const endDate = new Date(now.getTime() + 42 * 24 * 60 * 60 * 1000);
+  const results = {};
+
+  await Promise.all(INSTRUCTORS.map(async inst => {
+    try {
+      const rawData = await ical.async.fromURL(inst.icsUrl);
+      const blockedDates = new Set();
+      const appointments = {};
+      const rawEvents = [];
+
+      Object.values(rawData).forEach(e => {
+        if (e.type !== "VEVENT") return;
+        const start = new Date(e.start);
+        const end = new Date(e.end);
+        if (end < now || start > endDate) return;
+        const dateStr = toMelbDateStr(start);
+        const startTime = toMelbTimeStr(start);
+        const endTime = toMelbTimeStr(end);
+        const dur = (end - start) / (1000 * 60 * 60);
+        const blocked = isBlockOutEvent(e);
+        rawEvents.push({ dateStr, startTime, endTime, dur: dur.toFixed(1), summary: e.summary, datetype: e.datetype, blocked });
+        if (blocked) {
+          const d = new Date(start);
+          while (toMelbDateStr(d) <= toMelbDateStr(end)) { blockedDates.add(toMelbDateStr(d)); d.setDate(d.getDate()+1); }
+        } else {
+          if (!(startTime === "00:00" && endTime === "00:00")) {
+            if (!appointments[dateStr]) appointments[dateStr] = [];
+            appointments[dateStr].push({ startTime, endTime, location: (e.location||inst.base).split(",")[0].trim() });
+          }
+        }
+      });
+
+      results[inst.name] = {
+        base: inst.base,
+        mods: inst.mods,
+        blockedDates: [...blockedDates].sort(),
+        appointmentDays: Object.fromEntries(Object.entries(appointments).sort()),
+        rawEventCount: rawEvents.length,
+        rawEvents: rawEvents.sort((a,b) => a.dateStr.localeCompare(b.dateStr))
+      };
+    } catch(e) {
+      results[inst.name] = { error: e.message };
+    }
+  }));
+
+  res.json(results);
+});
 
 app.post("/analyse", async (req, res) => {
   const debugLog = [];
