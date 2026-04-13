@@ -643,42 +643,66 @@ app.post("/analyse", async (req, res) => {
       let score = 0;
       const baseTravel = baseTravelTimes[slot.instructor] || slot.travelIn;
       
-      // Primary: travel from previous location (actual travel on the day)
-      score -= slot.travelIn * 4;
+      // PRIMARY: actual travel on the day (from previous appointment or base)
+      // This is the real cost — how far does the instructor physically travel
+      score -= slot.travelIn * 5;
       
-      // Secondary: base travel as a geographic suitability signal
-      // Heavily penalise if base is far away (instructor is geographically wrong for this client)
-      if (baseTravel > 60) score -= 200;
-      else if (baseTravel > 45) score -= 100;
-      else if (baseTravel > 30) score -= 40;
-      else if (baseTravel <= 15) score += 60; // bonus for nearby base
+      // STRONG bonus if instructor is already working near client that day
+      if (slot.travelIn <= 10) score += 150;
+      else if (slot.travelIn <= 20) score += 80;
+      else if (slot.travelIn <= 30) score += 30;
       
-      // Earlier in the 6-week window = slightly better
-      score -= (new Date(slot.date) - new Date()) / (1000 * 60 * 60 * 24);
+      // GEOGRAPHIC FIT: base travel reflects how "natural" this area is for the instructor
+      // This prevents sending someone whose entire day is in the opposite direction
+      if (baseTravel <= 15) score += 100;      // home turf
+      else if (baseTravel <= 30) score += 50;  // comfortable range
+      else if (baseTravel <= 45) score += 0;   // neutral
+      else if (baseTravel <= 60) score -= 80;  // stretch
+      else score -= 200;                        // unlikely — needs admin check
       
-      // Bonus if already working near client that day
-      if (slot.travelIn <= 15) score += 80;
+      // Earlier in the 6-week window = slightly better (urgency)
+      score -= (new Date(slot.date) - new Date()) / (1000 * 60 * 60 * 24) * 0.5;
       
       return score;
     }
 
     validSlots.sort((a, b) => scoreSlot(b) - scoreSlot(a));
 
-    // Pick top 10 diverse slots: enforce different instructors and spread across weeks
-    // All slots here are already preferred-day only (non-preferred were hard-skipped above)
+    // Pick top 10 diverse slots: spread across instructors AND weeks where possible
     const selectedSlots = [];
-    const usedInstructorWeeks = new Set(); // key: instructor+week — max 1 slot per instructor per week
+    const usedDates = new Set();
+    const usedInstructorWeeks = new Set();
+    const instructorCounts = {};
 
+    // First pass: prefer diversity — different instructors, different weeks
     for (const slot of validSlots) {
       if (selectedSlots.length >= 10) break;
-      const weekKey = slot.instructor + "|" + slot.date.substring(0, 8); // YYYY-MM-D (Mon of week approx)
-      // Allow same instructor in different weeks, but not same instructor same week
-      if (usedInstructorWeeks.has(weekKey)) continue;
+      if (usedDates.has(slot.date)) continue; // no two slots on same date
+      const weekKey = slot.date.substring(0, 8);
+      const instWeekKey = slot.instructor + "|" + weekKey;
+      // Allow max 2 slots per instructor total across all weeks in the selection
+      const instCount = instructorCounts[slot.instructor] || 0;
+      if (instCount >= 2) continue;
+      if (usedInstructorWeeks.has(instWeekKey)) continue;
       selectedSlots.push(slot);
-      usedInstructorWeeks.add(weekKey);
+      usedDates.add(slot.date);
+      usedInstructorWeeks.add(instWeekKey);
+      instructorCounts[slot.instructor] = instCount + 1;
     }
 
-    // Fallback: if we somehow have fewer than 3, relax the instructor-week constraint
+    // Second pass: if < 3 slots, relax instructor limit but keep date uniqueness
+    if (selectedSlots.length < 3) {
+      for (const slot of validSlots) {
+        if (selectedSlots.length >= 6) break;
+        if (usedDates.has(slot.date)) continue;
+        if (!selectedSlots.includes(slot)) {
+          selectedSlots.push(slot);
+          usedDates.add(slot.date);
+        }
+      }
+    }
+
+    // Final fallback: no constraints at all
     if (selectedSlots.length < 3) {
       for (const slot of validSlots) {
         if (selectedSlots.length >= 6) break;
@@ -723,6 +747,12 @@ The backend has already computed valid, mathematically correct time slots — yo
 DO NOT invent new dates or times. DO NOT question the validity of the slots — they have been pre-verified.
 DO NOT mention slots that aren't in the list.
 
+GEOGRAPHIC CONTEXT RULES:
+- If all 3 options are the same instructor, note this is because they are the only available option with the required mods and availability
+- If an instructor's base is >45 min from client, always include the ⚠️ flag
+- If base travel is >60 min, explicitly state "this is a stretch geographically — admin should confirm this is the best available option before booking"
+- Always mention what the instructor has before and after the slot so admin can judge feasibility
+
 Format each option as:
 Option [N]: [Instructor]
 Date: [DD/MM/YYYY — Day]
@@ -731,9 +761,20 @@ Travel: [X min from previous location / base]
 Why: [2-3 sentences covering: day/time match, where instructor is coming from, what's before and after]
 ⚠️ Flag: [ONLY include this line if base travel exceeds 45 min — write "Needs admin review — [instructor] is based in [base] which is [X] min from [suburb]. Confirm this works before booking.". Omit this line entirely if travel is reasonable.]`;
 
+    // Find geographically ideal instructor(s) for context
+    const eligibleWithTravel = diaries.map(d => ({
+      name: d.inst.name,
+      base: d.inst.base,
+      baseTravel: baseTravelTimes[d.inst.name] || 999
+    })).sort((a, b) => a.baseTravel - b.baseTravel);
+    
+    const geoContext = eligibleWithTravel.map(i => 
+      `${i.name} (base: ${i.base}, ${i.baseTravel} min from ${clientSuburb})`
+    ).join(", ");
+
     const userMessage = `CLIENT: ${booking.clientName}
 SUBURB: ${clientSuburb}
-REQUIRED MODS: ${requiredMods.join(", ") || "None"}
+REQUIRED MODS: ${normalisedMods.join(", ") || "None"}
 PREFERRED AVAILABILITY: ${booking.availability}
 DURATION: ${durationMins} mins
 FUNDING: ${booking.funding || "Not specified"}
@@ -741,10 +782,13 @@ INSTRUCTOR PREFERENCE: ${booking.instructorPreference || "None"}
 GENDER PREFERENCE: ${booking.genderPreference || "No Preference"}
 NOTES: ${booking.schedulingNotes || ""} ${booking.otherNotes || ""}
 
+ELIGIBLE INSTRUCTORS BY DISTANCE FROM CLIENT (closest first):
+${geoContext}
+
 PRE-VERIFIED AVAILABLE SLOTS:
 ${slotDescriptions}
 
-Please pick the best 3 options and explain each clearly.`;
+Please pick the best 3 options and explain each clearly. If the closest instructor(s) don't appear in the slots above, mention that they had no available gaps matching the client's preferences.`;
 
     debugLog.push("Calling Claude...");
     const aiRes = await axios.post("https://api.anthropic.com/v1/messages", {
