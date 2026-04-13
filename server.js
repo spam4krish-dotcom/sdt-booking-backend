@@ -471,13 +471,27 @@ app.post("/analyse", async (req, res) => {
           if (!appointments[dateStr]) appointments[dateStr] = [];
           // Clean location: strip BOM/non-ASCII prefix chars, fall back to base if garbled or person-name
           let rawLoc = (e.location || "").replace(/^[^a-zA-Z0-9]+/, "").split(",")[0].trim();
-          // If location looks like a person name (contains "Driving Matters", instructor name, or no suburb-like content)
-          // or is empty, fall back to instructor base
           const isGarbledLocation = !rawLoc || 
             rawLoc.toLowerCase().includes("driving matters") ||
             rawLoc.toLowerCase() === inst.name.toLowerCase() ||
-            rawLoc.split(" ").every(w => /^[A-Z][a-z]+$/.test(w) && w.length > 2); // all title-case words = likely a name
-          const cleanLoc = isGarbledLocation ? inst.base : rawLoc;
+            rawLoc.split(" ").every(w => /^[A-Z][a-z]+$/.test(w) && w.length > 2);
+          
+          let cleanLoc = inst.base; // default fallback
+          if (!isGarbledLocation) {
+            cleanLoc = rawLoc;
+          } else {
+            // Try to extract suburb from the summary field
+            // Summaries often contain suburb in ALL CAPS or after a dash
+            // e.g. "Gabriel Keymer - LILYDALE to HEALESVILLE" or "Jesse Gattenhof MOOROOLBARK"
+            const summary = e.summary || "";
+            const suburbMatch = summary.match(/[-–]\s*([A-Z][A-Z\s]{2,}?)(?:\s+to\s+|\s*$)/);
+            const capsMatch = summary.match(/([A-Z][A-Z]{3,}(?:\s+[A-Z]{2,})?)/);
+            if (suburbMatch) {
+              cleanLoc = suburbMatch[1].trim().replace(/\s+/g, " ");
+            } else if (capsMatch && !["HOLD", "TEST", "LESSON", "NEW", "INITIAL", "PRE"].includes(capsMatch[1])) {
+              cleanLoc = capsMatch[1].trim();
+            }
+          }
           appointments[dateStr].push({
             startTime,
             endTime,
@@ -636,13 +650,22 @@ app.post("/analyse", async (req, res) => {
 
     // ── 7. Format slots for Claude ──
     const slotDescriptions = selectedSlots.map((s, i) => {
-      const apptsBefore = s.appointmentsBefore > 0 ? `${s.appointmentsBefore} appt(s) before` : "first lesson of day";
-      const apptsAfter = s.appointmentsAfter > 0 ? `${s.appointmentsAfter} appt(s) after` : "last lesson of day";
-      const notesLine = s.slotNotes ? `\n  Client note for this slot: "${s.slotNotes}"` : "";
+      const prevDesc = s.prevLocation === s.base
+        ? `travelling from base (${s.base}, ${s.travelIn} min drive)`
+        : `after lesson ending ${s.windowEarliest.replace(/^(\d+):(\d+)$/, (_, h, m) => {
+            // work back to find the end time of the previous appt
+            return s.windowEarliest;
+          })} at ${s.prevLocation} (${s.travelIn} min drive to client)`;
+      const nextDesc = s.nextLocation
+        ? `next lesson at ${s.nextLocation} (${s.travelOut} min drive from client)`
+        : "last lesson of day — no time pressure";
+      const notesLine = s.slotNotes ? `\n  Client note: "${s.slotNotes}"` : "";
       return `Slot ${i + 1}: ${s.instructor} — ${formatDate(s.date)} (${s.dayName}) at ${s.suggestedStart}
-  Window: ${s.windowEarliest}–${s.windowLatest} | Travel to client: ${s.travelIn} min from ${s.prevLocation} | Travel to next: ${s.travelOut > 0 ? s.travelOut + " min to " + s.nextLocation : "n/a (last lesson)"}
-  Day context: ${apptsBefore}, ${apptsAfter} (${s.totalApptsThatDay} total bookings that day)
-  Preferred slot: ${s.isPreferred ? "YES (" + s.period + ")" : "NO"}${notesLine}`;
+  Valid window: ${s.windowEarliest}–${s.windowLatest}
+  Before: ${prevDesc}
+  After: ${nextDesc}
+  Day total: ${s.totalApptsThatDay} booking(s) that day
+  Preferred: YES (${s.period})${notesLine}`;
     }).join("\n\n");
 
     const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training in Melbourne.
@@ -660,7 +683,7 @@ Format each option as:
 Option [N]: [Instructor]
 Date: [DD/MM/YYYY — Day]
 Time: [HH:MM]
-Why: [Plain English explanation referencing travel time, day preference, geography]`;
+Why: [2-3 sentences. Mention: (1) why the day/time suits the client, (2) where the instructor is coming from and travel time, (3) what's happening before and after — e.g. "Jason finishes in Croydon at 2:30, giving him 25 mins to reach Ringwood before the 3:00 start, and has no lessons after so there's no time pressure."]`;
 
     const userMessage = `CLIENT: ${booking.clientName}
 SUBURB: ${clientSuburb}
