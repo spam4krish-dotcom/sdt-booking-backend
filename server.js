@@ -11,41 +11,57 @@ app.use(express.json());
 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
+// maxTravelMins: hard cap — instructor won't be suggested if base-to-client travel exceeds this
+// preferredZone: description passed to Claude for context
 const INSTRUCTORS = [
   {
     name: "Christian", base: "Montmorency",
     mods: ["LFA", "Spinner", "Electronic Spinner", "Hand Controls", "Satellite", "Extension Pedals"],
+    maxTravelMins: 60,
+    preferredZone: "North/Northeast Melbourne, inner eastern suburbs",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fnXpnN%2FtMeidfD9E6WmLBWPsPF881mF4%2FDKjqX6mENEnlggTWF2jMn8Em8aKgSGXA%3D%3D"
   },
   {
     name: "Gabriel", base: "Croydon North",
     mods: ["LFA", "Spinner", "Electronic Spinner", "Hand Controls", "Satellite", "O-Ring", "Monarchs"],
     earliestStart: "09:30",
+    maxTravelMins: 50,
+    preferredZone: "Eastern suburbs, inner city, southeastern suburbs up to Frankston",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2a52GEgwyPVJ%2B0I6mOab2rD4%2Bmqr7EYvQGR9ykfeKAj%2F"
   },
   {
     name: "Greg", base: "Kilsyth",
     mods: ["LFA", "Spinner", "Electronic Spinner", "Monarchs"],
+    maxTravelMins: 50,
+    preferredZone: "Eastern and outer eastern suburbs",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fgA7lzqZCrNH6P0mJPZWpJqu4G4d87qHmXHYUUq3ZhplneSIXp12lfHZzfvGyQdDw%3D%3D"
   },
   {
     name: "Jason", base: "Wandin North",
     mods: ["LFA", "Spinner"],
+    maxTravelMins: 55,
+    preferredZone: "Eastern and outer eastern suburbs, Yarra Valley",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Sks8REnxfIzFLWWhJgXRykKsTkQKIlND6Q3P8UWc8WWFJCS5Y5gIU0xiqPfnSz%2FkQ%3D%3D"
   },
   {
     name: "Marc", base: "Werribee",
     mods: ["LFA", "Spinner", "Electronic Spinner", "Extension Pedals"],
+    maxTravelMins: 55,
+    preferredZone: "Western suburbs, southwestern suburbs",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2ecoRZN2xzdtmsUYY9vDrAuMuEJAzQSivaNXrwqSOqrMT982Jq4gficfE9XDNSVl0A%3D%3D"
   },
   {
     name: "Sherri", base: "Wandin North",
     mods: [],
+    maxTravelMins: 45,
+    preferredZone: "Eastern suburbs",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Qm9F8eQzb%2B6bu2IC%2FLaNBOOWmK9yskJZYl8guOGtP67bXXfuA0nBVLMaaPL2rsqew%3D%3D"
   },
   {
     name: "Yves", base: "Rye",
     mods: ["LFA", "Spinner"],
+    maxTravelMins: 30,
+    preferredZone: "Mornington Peninsula only",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fgA7lzqZCrNH6P0mJPZWpJqu4G4d87qHmXHYUUq3ZhplneSIXp12lfHZzfvGyQdDw%3D%3D"
   }
 ];
@@ -519,6 +535,15 @@ app.post("/analyse", async (req, res) => {
       }
     }));
 
+    // ── 4b. Pre-check base travel time for each instructor ──
+    debugLog.push("Checking base travel times...");
+    const baseTravelTimes = {};
+    for (const diary of diaries) {
+      const travelFromBase = await getTravelTime(diary.inst.base, clientSuburb);
+      baseTravelTimes[diary.inst.name] = travelFromBase;
+      debugLog.push(`${diary.inst.name} base→${clientSuburb}: ${travelFromBase} min (max: ${diary.inst.maxTravelMins || 60})`);
+    }
+
     // ── 5. For each eligible instructor, find valid slots ──
     debugLog.push("Computing valid slots...");
     const validSlots = [];
@@ -553,6 +578,9 @@ app.post("/analyse", async (req, res) => {
           d.setDate(d.getDate() + 1);
           continue;
         }
+
+        // Note base travel for scoring - no hard cap, but used in scoring and flagging
+        const baseTravel = baseTravelTimes[inst.name] || 0;
 
         const dayAppts = appointments[dateStr] || [];
 
@@ -613,12 +641,24 @@ app.post("/analyse", async (req, res) => {
     // ── 6. Score and rank slots ──
     function scoreSlot(slot) {
       let score = 0;
-      // Lower travel = better (primary geographic signal)
-      score -= slot.travelIn * 3;
+      const baseTravel = baseTravelTimes[slot.instructor] || slot.travelIn;
+      
+      // Primary: travel from previous location (actual travel on the day)
+      score -= slot.travelIn * 4;
+      
+      // Secondary: base travel as a geographic suitability signal
+      // Heavily penalise if base is far away (instructor is geographically wrong for this client)
+      if (baseTravel > 60) score -= 200;
+      else if (baseTravel > 45) score -= 100;
+      else if (baseTravel > 30) score -= 40;
+      else if (baseTravel <= 15) score += 60; // bonus for nearby base
+      
       // Earlier in the 6-week window = slightly better
       score -= (new Date(slot.date) - new Date()) / (1000 * 60 * 60 * 24);
-      // Reward slots where instructor is already nearby (prev location close to client)
-      if (slot.travelIn <= 15) score += 50;
+      
+      // Bonus if already working near client that day
+      if (slot.travelIn <= 15) score += 80;
+      
       return score;
     }
 
@@ -660,12 +700,16 @@ app.post("/analyse", async (req, res) => {
         ? `next lesson at ${s.nextLocation} (${s.travelOut} min drive from client)`
         : "last lesson of day — no time pressure";
       const notesLine = s.slotNotes ? `\n  Client note: "${s.slotNotes}"` : "";
+      const instData = INSTRUCTORS.find(i => i.name === s.instructor);
+      const baseKm = baseTravelTimes[s.instructor] || "?";
+      const baseNote = `  Base: ${instData ? instData.base : "unknown"} → ${clientSuburb}: ${baseKm} min drive`;
       return `Slot ${i + 1}: ${s.instructor} — ${formatDate(s.date)} (${s.dayName}) at ${s.suggestedStart}
   Valid window: ${s.windowEarliest}–${s.windowLatest}
   Before: ${prevDesc}
   After: ${nextDesc}
   Day total: ${s.totalApptsThatDay} booking(s) that day
-  Preferred: YES (${s.period})${notesLine}`;
+  Preferred: YES (${s.period})
+${baseNote}${notesLine}`;
     }).join("\n\n");
 
     const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training in Melbourne.
@@ -683,7 +727,9 @@ Format each option as:
 Option [N]: [Instructor]
 Date: [DD/MM/YYYY — Day]
 Time: [HH:MM]
-Why: [2-3 sentences. Mention: (1) why the day/time suits the client, (2) where the instructor is coming from and travel time, (3) what's happening before and after — e.g. "Jason finishes in Croydon at 2:30, giving him 25 mins to reach Ringwood before the 3:00 start, and has no lessons after so there's no time pressure."]`;
+Travel: [X min from previous location / base]
+Why: [2-3 sentences covering: day/time match, where instructor is coming from, what's before and after]
+⚠️ Flag: [ONLY include this line if base travel exceeds 45 min — write "Needs admin review — [instructor] is based in [base] which is [X] min from [suburb]. Confirm this works before booking.". Omit this line entirely if travel is reasonable.]`;
 
     const userMessage = `CLIENT: ${booking.clientName}
 SUBURB: ${clientSuburb}
