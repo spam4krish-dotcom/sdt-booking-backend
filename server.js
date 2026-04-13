@@ -338,7 +338,9 @@ app.get("/debug-diary", async (req, res) => {
         } else {
           if (!(startTime === "00:00" && endTime === "00:00")) {
             if (!appointments[dateStr]) appointments[dateStr] = [];
-            appointments[dateStr].push({ startTime, endTime, location: (e.location||inst.base).split(",")[0].trim() });
+            let dRaw = (e.location||"").replace(/^[^a-zA-Z0-9]+/,"").split(",")[0].trim();
+            const dGarbled = !dRaw||dRaw.toLowerCase().includes("driving matters")||dRaw.toLowerCase()===inst.name.toLowerCase()||dRaw.split(" ").every(w=>/^[A-Z][a-z]+$/.test(w)&&w.length>2);
+            appointments[dateStr].push({ startTime, endTime, location: dGarbled ? inst.base : dRaw });
           }
         }
       });
@@ -430,10 +432,19 @@ app.post("/analyse", async (req, res) => {
           }
 
           if (!appointments[dateStr]) appointments[dateStr] = [];
+          // Clean location: strip BOM/non-ASCII prefix chars, fall back to base if garbled or person-name
+          let rawLoc = (e.location || "").replace(/^[^a-zA-Z0-9]+/, "").split(",")[0].trim();
+          // If location looks like a person name (contains "Driving Matters", instructor name, or no suburb-like content)
+          // or is empty, fall back to instructor base
+          const isGarbledLocation = !rawLoc || 
+            rawLoc.toLowerCase().includes("driving matters") ||
+            rawLoc.toLowerCase() === inst.name.toLowerCase() ||
+            rawLoc.split(" ").every(w => /^[A-Z][a-z]+$/.test(w) && w.length > 2); // all title-case words = likely a name
+          const cleanLoc = isGarbledLocation ? inst.base : rawLoc;
           appointments[dateStr].push({
             startTime,
             endTime,
-            location: (e.location || inst.base).split(",")[0].trim(),
+            location: cleanLoc,
             summary: e.summary || "",
             isHold: (e.summary || "").toUpperCase().includes("HOLD")
           });
