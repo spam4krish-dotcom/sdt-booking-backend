@@ -14,18 +14,18 @@ const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 const INSTRUCTORS = [
   {
     name: "Christian", base: "Montmorency",
-    mods: ["LFA", "Spinner", "Hand Controls", "Satellite", "Indicator Extension", "Extension Pedals"],
+    mods: ["LFA", "Spinner", "Electronic Spinner", "Hand Controls", "Satellite", "Extension Pedals"],
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fnXpnN%2FtMeidfD9E6WmLBWPsPF881mF4%2FDKjqX6mENEnlggTWF2jMn8Em8aKgSGXA%3D%3D"
   },
   {
     name: "Gabriel", base: "Croydon North",
-    mods: ["LFA", "Spinner", "Hand Controls", "Satellite", "Indicator Extension"],
+    mods: ["LFA", "Spinner", "Electronic Spinner", "Hand Controls", "Satellite", "O-Ring", "Monarchs"],
     earliestStart: "09:30",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2a52GEgwyPVJ%2B0I6mOab2rD4%2Bmqr7EYvQGR9ykfeKAj%2F"
   },
   {
     name: "Greg", base: "Kilsyth",
-    mods: ["LFA", "Spinner", "Indicator Extension"],
+    mods: ["LFA", "Spinner", "Electronic Spinner", "Monarchs"],
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fgA7lzqZCrNH6P0mJPZWpJqu4G4d87qHmXHYUUq3ZhplneSIXp12lfHZzfvGyQdDw%3D%3D"
   },
   {
@@ -35,7 +35,7 @@ const INSTRUCTORS = [
   },
   {
     name: "Marc", base: "Werribee",
-    mods: ["LFA", "Spinner", "Indicator Extension", "Extension Pedals"],
+    mods: ["LFA", "Spinner", "Electronic Spinner", "Extension Pedals"],
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2ecoRZN2xzdtmsUYY9vDrAuMuEJAzQSivaNXrwqSOqrMT982Jq4gficfE9XDNSVl0A%3D%3D"
   },
   {
@@ -45,7 +45,7 @@ const INSTRUCTORS = [
   },
   {
     name: "Yves", base: "Rye",
-    mods: ["LFA", "Spinner", "Indicator Extension"],
+    mods: ["LFA", "Spinner"],
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fgA7lzqZCrNH6P0mJPZWpJqu4G4d87qHmXHYUUq3ZhplneSIXp12lfHZzfvGyQdDw%3D%3D"
   }
 ];
@@ -375,9 +375,46 @@ app.post("/analyse", async (req, res) => {
     const requiredMods = (booking.modifications || "").split(",").map(s => s.trim()).filter(Boolean);
 
     // ── 1. Filter instructors by mods ──
+    // Fuzzy mod matching — "Standard Spinner", "spinner knob", "RHS spinner" all match "Spinner"
+    const MOD_KEYWORDS = {
+      "lfa": "LFA",
+      "left foot": "LFA",
+      "left foot accelerator": "LFA",
+      "spinner": "Spinner",
+      "spinner knob": "Spinner",
+      "standard spinner": "Spinner",
+      "rhs spinner": "Spinner",
+      "lhs spinner": "Spinner",
+      "electronic spinner": "Electronic Spinner",
+      "e-spinner": "Electronic Spinner",
+      "hand control": "Hand Controls",
+      "hand controls": "Hand Controls",
+      "satellite": "Satellite",
+      "satellite accelerator": "Satellite",
+      "o-ring": "O-Ring",
+      "oval ring": "O-Ring",
+      "o ring": "O-Ring",
+      "monarchs": "Monarchs",
+      "monarch": "Monarchs",
+      "extension pedal": "Extension Pedals",
+      "extension pedals": "Extension Pedals",
+    };
+
+    // Normalise required mods to canonical names
+    const normalisedMods = requiredMods.map(mod => {
+      const lower = mod.toLowerCase().trim();
+      // Direct keyword lookup
+      for (const [kw, canonical] of Object.entries(MOD_KEYWORDS)) {
+        if (lower.includes(kw)) return canonical;
+      }
+      return mod; // keep original if no match
+    });
+
+    debugLog.push(`Normalised mods: ${normalisedMods.join(", ")}`);
+
     let eligibleInstructors = INSTRUCTORS.filter(inst => {
-      if (requiredMods.length === 0) return true;
-      return requiredMods.every(mod =>
+      if (normalisedMods.length === 0) return true;
+      return normalisedMods.every(mod =>
         inst.mods.some(m => m.toLowerCase() === mod.toLowerCase())
       );
     });
