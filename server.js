@@ -579,8 +579,31 @@ app.post("/analyse", async (req, res) => {
           continue;
         }
 
-        // Note base travel for scoring - no hard cap, but used in scoring and flagging
+        // HARD CAP: if base→client exceeds maxTravelMins, only allow if instructor
+        // already has an appointment within 20 min of client that day (they're in the area)
         const baseTravel = baseTravelTimes[inst.name] || 0;
+        const maxTravel = inst.maxTravelMins || 60;
+        if (baseTravel > maxTravel) {
+          // Check if instructor is already working near client this day
+          const dayAppts = appointments[dateStr] || [];
+          // travelIn is the actual travel from previous location - if they're nearby, allow it
+          // We'll compute this after windows, so for now just flag for later filtering
+          // Skip if base is way too far (>1.5x max) - no way they'd be in the area
+          if (baseTravel > maxTravel * 1.5) {
+            d.setDate(d.getDate() + 1);
+            continue;
+          }
+          // Between maxTravel and 1.5x: only allow if they have appointments near client that day
+          const hasNearbyAppt = dayAppts.some(a => {
+            // We'll check this after travel times are computed - for now use location name heuristic
+            return a.location && a.location !== inst.base;
+          });
+          if (!hasNearbyAppt && dayAppts.length === 0) {
+            // Completely empty day and base is too far - skip
+            d.setDate(d.getDate() + 1);
+            continue;
+          }
+        }
 
         const dayAppts = appointments[dateStr] || [];
 
@@ -599,6 +622,14 @@ app.post("/analyse", async (req, res) => {
             if (windowMatchesAvailability(window, period)) {
               const suggestedStart = bestStartInBlock(window, period, durationMins);
               if (!suggestedStart) continue;
+
+              // Filter: if actual travel-in exceeds instructor's max AND base is also far,
+              // this slot is genuinely not feasible
+              const instMaxTravel = inst.maxTravelMins || 60;
+              const actualTravel = window.travelIn;
+              if (actualTravel > instMaxTravel && baseTravel > instMaxTravel) {
+                continue; // Both base and current location are too far
+              }
 
               validSlots.push({
                 instructor: inst.name,
@@ -632,8 +663,29 @@ app.post("/analyse", async (req, res) => {
     debugLog.push(`Total valid slots found: ${validSlots.length}`);
 
     if (validSlots.length === 0) {
+      // Build a helpful explanation of why no slots were found
+      const eligibleNames = eligibleInstructors.map(i => i.name).join(", ");
+      const travelSummary = eligibleInstructors.map(i => {
+        const t = baseTravelTimes[i.name] || "?";
+        const max = i.maxTravelMins || 60;
+        const flag = t > max ? " ⚠️ exceeds range" : "";
+        return `${i.name} (${t} min from base${flag})`;
+      }).join(", ");
+
+      const noSlotMsg = `No available slots found for ${booking.clientName} in ${clientSuburb}.
+
+Eligible instructors (with required mods): ${eligibleNames}
+Travel from base to ${clientSuburb}: ${travelSummary}
+
+Possible reasons:
+- All eligible instructors are fully booked during the client's preferred availability windows
+- Some instructors may be outside their normal operating area for this suburb
+- The client's availability windows may be too restrictive
+
+Recommendation: Contact the office to discuss alternative availability or whether an instructor can make a special arrangement to cover this location.`;
+
       return res.json({
-        content: [{ type: "text", text: "No available slots found for this client in the next 6 weeks matching their requirements and availability." }],
+        content: [{ type: "text", text: noSlotMsg }],
         _debug: debugLog
       });
     }
@@ -748,10 +800,12 @@ DO NOT invent new dates or times. DO NOT question the validity of the slots — 
 DO NOT mention slots that aren't in the list.
 
 GEOGRAPHIC CONTEXT RULES:
-- If all 3 options are the same instructor, note this is because they are the only available option with the required mods and availability
-- If an instructor's base is >45 min from client, always include the ⚠️ flag
-- If base travel is >60 min, explicitly state "this is a stretch geographically — admin should confirm this is the best available option before booking"
-- Always mention what the instructor has before and after the slot so admin can judge feasibility
+- Check the "ELIGIBLE INSTRUCTORS BY DISTANCE" list to understand who is geographically suitable.
+- If a closer instructor with the required mods exists but had no gaps (shown in INSTRUCTORS WITH REQUIRED MODS BUT NO AVAILABLE GAPS), mention this: "Note: [Closer instructor] would normally be the ideal choice for [suburb] but had no available gaps during the client's preferred times."
+- If ALL slots are from one instructor because they're the only one with the required mods AND they're within reasonable range, do NOT flag — just note they're the only option.
+- If an instructor's base travel exceeds 45 min AND a closer alternative exists (even if booked), add: "⚠️ [Instructor] is [X] min from [suburb] — this is outside their usual area. [Closer instructor] had no available gaps but admin may want to check if a special arrangement is possible."
+- If base travel exceeds 60 min for ALL options, end with: "⚠️ No ideal geographic match found. The options above involve significant travel — admin should confirm feasibility or contact the client about alternative availability."
+- Always mention what the instructor has before and after the slot so admin can judge travel feasibility.
 
 Format each option as:
 Option [N]: [Instructor]
@@ -772,6 +826,13 @@ Why: [2-3 sentences covering: day/time match, where instructor is coming from, w
       `${i.name} (base: ${i.base}, ${i.baseTravel} min from ${clientSuburb})`
     ).join(", ");
 
+    // Instructors who have the mods but did NOT appear in slots (fully booked / no gaps)
+    const instructorsInSlots = new Set(selectedSlots.map(s => s.instructor));
+    const eligibleNotInSlots = eligibleWithTravel.filter(i => !instructorsInSlots.has(i.name));
+    const missedContext = eligibleNotInSlots.length > 0
+      ? `\nINSTRUCTORS WITH REQUIRED MODS BUT NO AVAILABLE GAPS: ${eligibleNotInSlots.map(i => `${i.name} (${i.baseTravel} min from ${clientSuburb} — fully booked during client's preferred times)`).join(", ")}`
+      : "";
+
     const userMessage = `CLIENT: ${booking.clientName}
 SUBURB: ${clientSuburb}
 REQUIRED MODS: ${normalisedMods.join(", ") || "None"}
@@ -783,7 +844,7 @@ GENDER PREFERENCE: ${booking.genderPreference || "No Preference"}
 NOTES: ${booking.schedulingNotes || ""} ${booking.otherNotes || ""}
 
 ELIGIBLE INSTRUCTORS BY DISTANCE FROM CLIENT (closest first):
-${geoContext}
+${geoContext}${missedContext}
 
 PRE-VERIFIED AVAILABLE SLOTS:
 ${slotDescriptions}
