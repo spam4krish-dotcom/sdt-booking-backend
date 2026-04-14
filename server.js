@@ -958,79 +958,81 @@ Please pick the best 3 options and explain each clearly. If the closest instruct
 
 // ─── Nookal API Test Endpoint ────────────────────────────────────────────────
 app.get("/test-nookal", async (req, res) => {
-  const NOOKAL_ENDPOINT = "https://auzone1.nookal.com/production/v2/graphql";
-  const clientId = process.env.NOOKAL_CLIENT_ID;
   const apiKey = process.env.NOOKAL_API_KEY;
+  const clientId = process.env.NOOKAL_CLIENT_ID;
 
-  if (!clientId || !apiKey) {
-    return res.json({ error: "Missing NOOKAL_CLIENT_ID or NOOKAL_API_KEY environment variables" });
+  if (!apiKey) {
+    return res.json({ error: "Missing NOOKAL_API_KEY environment variable" });
   }
 
-  // Test 1: appointments for this week
-  const appointmentsQuery = `
-    query {
-      appointments(
-        filters: {
-          startDate: "2026-04-14"
-          endDate: "2026-04-18"
-        }
-      ) {
-        data {
-          id
-          startDatetime
-          endDatetime
-          notes
-          location { name }
-          practitioner { firstName lastName }
-          client { id firstName lastName }
-        }
-      }
+  const results = {};
+
+  // Nookal legacy REST API - try multiple auth header formats and endpoints
+  const BASE = "https://api.nookal.com/production/v2";
+  const AUZONE_BASE = "https://auzone1.nookal.com/production/v2";
+
+  const authVariants = [
+    { name: "api-key header", headers: { "api-key": apiKey, "Content-Type": "application/x-www-form-urlencoded" } },
+    { name: "apiKey header", headers: { "apiKey": apiKey, "Content-Type": "application/x-www-form-urlencoded" } },
+    { name: "Authorization Basic", headers: { "Authorization": `Basic ${apiKey}`, "Content-Type": "application/x-www-form-urlencoded" } },
+    { name: "x-api-key + x-client-id", headers: { "x-api-key": apiKey, "x-client-id": clientId, "Content-Type": "application/json" } },
+  ];
+
+  const endpoints = [
+    { name: "verify (api.nookal.com)", url: `${BASE}/verify` },
+    { name: "verify (auzone1)", url: `${AUZONE_BASE}/verify` },
+    { name: "getLocations (api.nookal.com)", url: `${BASE}/getLocations` },
+    { name: "getLocations (auzone1)", url: `${AUZONE_BASE}/getLocations` },
+  ];
+
+  // Try verify endpoint with each auth variant
+  for (const auth of authVariants) {
+    try {
+      const r = await axios.post(`${BASE}/verify`, "", {
+        headers: auth.headers,
+        timeout: 8000
+      });
+      results[`verify__${auth.name}`] = {
+        status: r.status,
+        data: r.data
+      };
+    } catch (err) {
+      results[`verify__${auth.name}`] = {
+        status: err.response?.status || "network_error",
+        error: err.message,
+        detail: typeof err.response?.data === "string"
+          ? err.response.data.substring(0, 200)
+          : err.response?.data
+      };
     }
-  `;
-
-  // Test 2: locations (to see what location data looks like)
-  const locationsQuery = `
-    query {
-      locations {
-        data {
-          id
-          name
-          address1
-          suburb
-          state
-        }
-      }
-    }
-  `;
-
-  try {
-    const headers = {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "x-client-id": clientId
-    };
-
-    const [apptRes, locRes] = await Promise.all([
-      axios.post(NOOKAL_ENDPOINT, { query: appointmentsQuery }, { headers }),
-      axios.post(NOOKAL_ENDPOINT, { query: locationsQuery }, { headers })
-    ]);
-
-    res.json({
-      credentials_used: {
-        client_id: clientId,
-        api_key_length: apiKey.length
-      },
-      appointments_response: apptRes.data,
-      locations_response: locRes.data
-    });
-
-  } catch (err) {
-    res.json({
-      error: err.message,
-      status: err.response?.status,
-      detail: err.response?.data
-    });
   }
+
+  // Try getLocations with api-key header (most common Nookal format)
+  for (const ep of endpoints) {
+    try {
+      const r = await axios.post(ep.url, "", {
+        headers: { "api-key": apiKey, "Content-Type": "application/x-www-form-urlencoded" },
+        timeout: 8000
+      });
+      results[ep.name] = { status: r.status, data: r.data };
+    } catch (err) {
+      results[ep.name] = {
+        status: err.response?.status || "network_error",
+        error: err.message,
+        detail: typeof err.response?.data === "string"
+          ? err.response.data.substring(0, 200)
+          : err.response?.data
+      };
+    }
+  }
+
+  res.json({
+    credentials: {
+      api_key_length: apiKey?.length,
+      client_id: clientId
+    },
+    results
+  });
 });
 
 app.listen(PORT, () => console.log(`SDT Smart Backend active on ${PORT}`));
