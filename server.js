@@ -958,7 +958,7 @@ Please pick the best 3 options and explain each clearly. If the closest instruct
 
 // ─── Nookal API Test Endpoint ────────────────────────────────────────────────
 app.get("/test-nookal", async (req, res) => {
-  const NOOKAL_ENDPOINT = "https://api.nookal.com/production/v2/graphql";
+  const NOOKAL_ENDPOINT = "https://auzone1.nookal.com/production/v2/graphql";
   const clientId = process.env.NOOKAL_CLIENT_ID;
   const apiKey = process.env.NOOKAL_API_KEY;
 
