@@ -965,72 +965,50 @@ app.get("/test-nookal", async (req, res) => {
     return res.json({ error: "Missing NOOKAL_API_KEY environment variable" });
   }
 
+  const BASE = "https://api.nookal.com/production/v2";
   const results = {};
 
-  // Nookal legacy REST API - try multiple auth header formats and endpoints
-  const BASE = "https://api.nookal.com/production/v2";
-  const AUZONE_BASE = "https://auzone1.nookal.com/production/v2";
+  // Nookal legacy REST sends api_key in the POST BODY as form data
+  const bodyWithKey = `api_key=${encodeURIComponent(apiKey)}`;
+  const headers = { "Content-Type": "application/x-www-form-urlencoded" };
 
-  const authVariants = [
-    { name: "api-key header", headers: { "api-key": apiKey, "Content-Type": "application/x-www-form-urlencoded" } },
-    { name: "apiKey header", headers: { "apiKey": apiKey, "Content-Type": "application/x-www-form-urlencoded" } },
-    { name: "Authorization Basic", headers: { "Authorization": `Basic ${apiKey}`, "Content-Type": "application/x-www-form-urlencoded" } },
-    { name: "x-api-key + x-client-id", headers: { "x-api-key": apiKey, "x-client-id": clientId, "Content-Type": "application/json" } },
-  ];
-
-  const endpoints = [
-    { name: "verify (api.nookal.com)", url: `${BASE}/verify` },
-    { name: "verify (auzone1)", url: `${AUZONE_BASE}/verify` },
-    { name: "getLocations (api.nookal.com)", url: `${BASE}/getLocations` },
-    { name: "getLocations (auzone1)", url: `${AUZONE_BASE}/getLocations` },
-  ];
-
-  // Try verify endpoint with each auth variant
-  for (const auth of authVariants) {
-    try {
-      const r = await axios.post(`${BASE}/verify`, "", {
-        headers: auth.headers,
-        timeout: 8000
-      });
-      results[`verify__${auth.name}`] = {
-        status: r.status,
-        data: r.data
-      };
-    } catch (err) {
-      results[`verify__${auth.name}`] = {
-        status: err.response?.status || "network_error",
-        error: err.message,
-        detail: typeof err.response?.data === "string"
-          ? err.response.data.substring(0, 200)
-          : err.response?.data
-      };
-    }
+  // Test 1: verify
+  try {
+    const r = await axios.post(`${BASE}/verify`, bodyWithKey, { headers, timeout: 8000 });
+    results.verify = { status: r.status, data: r.data };
+  } catch (err) {
+    results.verify = { status: err.response?.status, error: err.message };
   }
 
-  // Try getLocations with api-key header (most common Nookal format)
-  for (const ep of endpoints) {
-    try {
-      const r = await axios.post(ep.url, "", {
-        headers: { "api-key": apiKey, "Content-Type": "application/x-www-form-urlencoded" },
-        timeout: 8000
-      });
-      results[ep.name] = { status: r.status, data: r.data };
-    } catch (err) {
-      results[ep.name] = {
-        status: err.response?.status || "network_error",
-        error: err.message,
-        detail: typeof err.response?.data === "string"
-          ? err.response.data.substring(0, 200)
-          : err.response?.data
-      };
-    }
+  // Test 2: getLocations
+  try {
+    const r = await axios.post(`${BASE}/getLocations`, bodyWithKey, { headers, timeout: 8000 });
+    results.getLocations = { status: r.status, data: r.data };
+  } catch (err) {
+    results.getLocations = { status: err.response?.status, error: err.message };
+  }
+
+  // Test 3: getPractitioners
+  try {
+    const r = await axios.post(`${BASE}/getPractitioners`, bodyWithKey, { headers, timeout: 8000 });
+    results.getPractitioners = { status: r.status, data: r.data };
+  } catch (err) {
+    results.getPractitioners = { status: err.response?.status, error: err.message };
+  }
+
+  // Test 4: getAppointments for this week - needs location_id from above
+  // We'll try with location_id=1 as a guess first
+  try {
+    const body = `api_key=${encodeURIComponent(apiKey)}&location_id=1&date_start=2026-04-14&date_end=2026-04-18`;
+    const r = await axios.post(`${BASE}/getAppointments`, body, { headers, timeout: 8000 });
+    results.getAppointments_loc1 = { status: r.status, data: r.data };
+  } catch (err) {
+    results.getAppointments_loc1 = { status: err.response?.status, error: err.message };
   }
 
   res.json({
-    credentials: {
-      api_key_length: apiKey?.length,
-      client_id: clientId
-    },
+    api_key_length: apiKey?.length,
+    client_id: clientId,
     results
   });
 });
