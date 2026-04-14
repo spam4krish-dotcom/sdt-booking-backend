@@ -958,57 +958,64 @@ Please pick the best 3 options and explain each clearly. If the closest instruct
 
 // ─── Nookal API Test Endpoint ────────────────────────────────────────────────
 app.get("/test-nookal", async (req, res) => {
-  const legacyKey = process.env.NOOKAL_LEGACY_KEY;
-  const graphqlKey = process.env.NOOKAL_API_KEY;
-  const clientId = process.env.NOOKAL_CLIENT_ID;
+  const apiKey = process.env.NOOKAL_API_KEY;
 
-  if (!legacyKey) {
-    return res.json({ error: "Missing NOOKAL_LEGACY_KEY environment variable" });
+  if (!apiKey) {
+    return res.json({ error: "Missing NOOKAL_API_KEY environment variable" });
   }
 
-  const BASE = "https://api.nookal.com/production/v2";
-  const headers = { "Content-Type": "application/x-www-form-urlencoded" };
-  const body = `api_key=${encodeURIComponent(legacyKey)}`;
+  const GRAPHQL_ENDPOINT = "https://api.nookal.com/graphql";
+  const headers = {
+    "Content-Type": "application/json",
+    "api-key": apiKey
+  };
   const results = {};
 
-  // Test 1: verify
+  // Test 1: Get all locations (instructor IDs)
   try {
-    const r = await axios.post(`${BASE}/verify`, body, { headers, timeout: 8000 });
-    results.verify = { status: r.status, data: r.data };
+    const r = await axios.post(GRAPHQL_ENDPOINT, {
+      query: `query { locations { id name } }`
+    }, { headers, timeout: 10000 });
+    results.locations = { status: r.status, data: r.data };
   } catch (err) {
-    results.verify = { status: err.response?.status, error: err.message };
+    results.locations = {
+      status: err.response?.status,
+      error: err.message,
+      detail: typeof err.response?.data === "string"
+        ? err.response.data.substring(0, 300)
+        : err.response?.data
+    };
   }
 
-  // Test 2: getLocations
+  // Test 2: Get appointments for today across all locations
   try {
-    const r = await axios.post(`${BASE}/getLocations`, body, { headers, timeout: 8000 });
-    results.getLocations = { status: r.status, data: r.data };
+    const today = toMelbDateStr(new Date());
+    const r = await axios.post(GRAPHQL_ENDPOINT, {
+      query: `query {
+        appointments(start: "${today}", end: "${today}") {
+          id
+          start
+          end
+          duration
+          locationID
+          staffID
+        }
+      }`
+    }, { headers, timeout: 10000 });
+    results.appointments_today = { status: r.status, data: r.data };
   } catch (err) {
-    results.getLocations = { status: err.response?.status, error: err.message };
-  }
-
-  // Test 3: getPractitioners
-  try {
-    const r = await axios.post(`${BASE}/getPractitioners`, body, { headers, timeout: 8000 });
-    results.getPractitioners = { status: r.status, data: r.data };
-  } catch (err) {
-    results.getPractitioners = { status: err.response?.status, error: err.message };
-  }
-
-  // Test 4: getAppointments - we'll try after we get location IDs from above
-  // For now try page 1 without location filter to see what comes back
-  try {
-    const apptBody = `api_key=${encodeURIComponent(legacyKey)}&date_start=2026-04-14&date_end=2026-04-15&page=1`;
-    const r = await axios.post(`${BASE}/getAppointments`, apptBody, { headers, timeout: 8000 });
-    results.getAppointments = { status: r.status, data: r.data };
-  } catch (err) {
-    results.getAppointments = { status: err.response?.status, error: err.message };
+    results.appointments_today = {
+      status: err.response?.status,
+      error: err.message,
+      detail: typeof err.response?.data === "string"
+        ? err.response.data.substring(0, 300)
+        : err.response?.data
+    };
   }
 
   res.json({
-    legacy_key_length: legacyKey?.length,
-    graphql_key_length: graphqlKey?.length,
-    client_id: clientId,
+    endpoint: GRAPHQL_ENDPOINT,
+    api_key_length: apiKey?.length,
     results
   });
 });
