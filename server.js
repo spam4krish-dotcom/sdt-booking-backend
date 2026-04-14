@@ -956,4 +956,81 @@ Please pick the best 3 options and explain each clearly. If the closest instruct
   }
 });
 
+// ─── Nookal API Test Endpoint ────────────────────────────────────────────────
+app.get("/test-nookal", async (req, res) => {
+  const NOOKAL_ENDPOINT = "https://api.nookal.com/production/v2/graphql";
+  const clientId = process.env.NOOKAL_CLIENT_ID;
+  const apiKey = process.env.NOOKAL_API_KEY;
+
+  if (!clientId || !apiKey) {
+    return res.json({ error: "Missing NOOKAL_CLIENT_ID or NOOKAL_API_KEY environment variables" });
+  }
+
+  // Test 1: appointments for this week
+  const appointmentsQuery = `
+    query {
+      appointments(
+        filters: {
+          startDate: "2026-04-14"
+          endDate: "2026-04-18"
+        }
+      ) {
+        data {
+          id
+          startDatetime
+          endDatetime
+          notes
+          location { name }
+          practitioner { firstName lastName }
+          client { id firstName lastName }
+        }
+      }
+    }
+  `;
+
+  // Test 2: locations (to see what location data looks like)
+  const locationsQuery = `
+    query {
+      locations {
+        data {
+          id
+          name
+          address1
+          suburb
+          state
+        }
+      }
+    }
+  `;
+
+  try {
+    const headers = {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "x-client-id": clientId
+    };
+
+    const [apptRes, locRes] = await Promise.all([
+      axios.post(NOOKAL_ENDPOINT, { query: appointmentsQuery }, { headers }),
+      axios.post(NOOKAL_ENDPOINT, { query: locationsQuery }, { headers })
+    ]);
+
+    res.json({
+      credentials_used: {
+        client_id: clientId,
+        api_key_length: apiKey.length
+      },
+      appointments_response: apptRes.data,
+      locations_response: locRes.data
+    });
+
+  } catch (err) {
+    res.json({
+      error: err.message,
+      status: err.response?.status,
+      detail: err.response?.data
+    });
+  }
+});
+
 app.listen(PORT, () => console.log(`SDT Smart Backend active on ${PORT}`));
