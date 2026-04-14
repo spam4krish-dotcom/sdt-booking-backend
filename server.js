@@ -958,23 +958,22 @@ Please pick the best 3 options and explain each clearly. If the closest instruct
 
 // ─── Nookal API Test Endpoint ────────────────────────────────────────────────
 app.get("/test-nookal", async (req, res) => {
-  const apiKey = process.env.NOOKAL_API_KEY;
+  const legacyKey = process.env.NOOKAL_LEGACY_KEY;
+  const graphqlKey = process.env.NOOKAL_API_KEY;
   const clientId = process.env.NOOKAL_CLIENT_ID;
 
-  if (!apiKey) {
-    return res.json({ error: "Missing NOOKAL_API_KEY environment variable" });
+  if (!legacyKey) {
+    return res.json({ error: "Missing NOOKAL_LEGACY_KEY environment variable" });
   }
 
   const BASE = "https://api.nookal.com/production/v2";
-  const results = {};
-
-  // Nookal legacy REST sends api_key in the POST BODY as form data
-  const bodyWithKey = `api_key=${encodeURIComponent(apiKey)}`;
   const headers = { "Content-Type": "application/x-www-form-urlencoded" };
+  const body = `api_key=${encodeURIComponent(legacyKey)}`;
+  const results = {};
 
   // Test 1: verify
   try {
-    const r = await axios.post(`${BASE}/verify`, bodyWithKey, { headers, timeout: 8000 });
+    const r = await axios.post(`${BASE}/verify`, body, { headers, timeout: 8000 });
     results.verify = { status: r.status, data: r.data };
   } catch (err) {
     results.verify = { status: err.response?.status, error: err.message };
@@ -982,7 +981,7 @@ app.get("/test-nookal", async (req, res) => {
 
   // Test 2: getLocations
   try {
-    const r = await axios.post(`${BASE}/getLocations`, bodyWithKey, { headers, timeout: 8000 });
+    const r = await axios.post(`${BASE}/getLocations`, body, { headers, timeout: 8000 });
     results.getLocations = { status: r.status, data: r.data };
   } catch (err) {
     results.getLocations = { status: err.response?.status, error: err.message };
@@ -990,24 +989,25 @@ app.get("/test-nookal", async (req, res) => {
 
   // Test 3: getPractitioners
   try {
-    const r = await axios.post(`${BASE}/getPractitioners`, bodyWithKey, { headers, timeout: 8000 });
+    const r = await axios.post(`${BASE}/getPractitioners`, body, { headers, timeout: 8000 });
     results.getPractitioners = { status: r.status, data: r.data };
   } catch (err) {
     results.getPractitioners = { status: err.response?.status, error: err.message };
   }
 
-  // Test 4: getAppointments for this week - needs location_id from above
-  // We'll try with location_id=1 as a guess first
+  // Test 4: getAppointments - we'll try after we get location IDs from above
+  // For now try page 1 without location filter to see what comes back
   try {
-    const body = `api_key=${encodeURIComponent(apiKey)}&location_id=1&date_start=2026-04-14&date_end=2026-04-18`;
-    const r = await axios.post(`${BASE}/getAppointments`, body, { headers, timeout: 8000 });
-    results.getAppointments_loc1 = { status: r.status, data: r.data };
+    const apptBody = `api_key=${encodeURIComponent(legacyKey)}&date_start=2026-04-14&date_end=2026-04-15&page=1`;
+    const r = await axios.post(`${BASE}/getAppointments`, apptBody, { headers, timeout: 8000 });
+    results.getAppointments = { status: r.status, data: r.data };
   } catch (err) {
-    results.getAppointments_loc1 = { status: err.response?.status, error: err.message };
+    results.getAppointments = { status: err.response?.status, error: err.message };
   }
 
   res.json({
-    api_key_length: apiKey?.length,
+    legacy_key_length: legacyKey?.length,
+    graphql_key_length: graphqlKey?.length,
     client_id: clientId,
     results
   });
