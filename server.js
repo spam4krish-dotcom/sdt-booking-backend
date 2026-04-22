@@ -432,7 +432,7 @@ function parseAvailability(availString) {
 }
 
 // ─── Core matcher ────────────────────────────────────────────────────────────
-async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, weeksToScan = 6) {
+async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, weeksToScan = 17) {
   const slots = [];
   const now = new Date();
   const startDate = toMelbDateStr(now);
@@ -947,6 +947,7 @@ app.get("/debug-day", async (req, res) => {
     const nextDay = new Date(dateObj.getTime() + 24 * 3600 * 1000);
     const dateTo = toMelbDateStr(nextDay);
 
+    // Test with full field list
     const fullQuery = `
       query {
         appointments(
@@ -967,37 +968,55 @@ app.get("/debug-day", async (req, res) => {
           providerName
           caseID
           caseName
-          isNewClient
-          isNewCase
           apptType
           typeName
           typeID
-          dateAdded
-          cancellationDate
           notes
           locationID
           locationName
-          lastModified
-          emailReminderSent
-          arrived
-          confirmed
-          dna
-          contactID
-          addedBy
-          addedByName
           metadata
           response
           otherNotes
-          lastModifiedBy
-          onlineBooking
         }
       }
     `;
 
-    const d = await nookalQuery(fullQuery);
-    const allAppts = d.appointments || [];
-    // Filter to only the requested date (we queried date+1 to get proper response)
-    const rawAppts = allAppts.filter(a => a.appointmentDate === date);
+    // Also test with minimal fields — if this works but fullQuery doesn't, we know it's a field issue
+    const minimalQuery = `
+      query {
+        appointments(
+          locationIDs: [${inst.locationID}]
+          providerIDs: [${inst.providerID}]
+          dateFrom: "${date}"
+          dateTo: "${dateTo}"
+          pageLength: 100
+        ) {
+          apptID
+          appointmentDate
+          startTime
+          endTime
+          status
+          clientName
+          notes
+          typeName
+        }
+      }
+    `;
+
+    // Try minimal query first
+    let minimalResult, fullResult, minimalError, fullError;
+    try {
+      const dMin = await nookalQuery(minimalQuery);
+      minimalResult = (dMin.appointments || []).filter(a => a.appointmentDate === date);
+    } catch (err) {
+      minimalError = err.message;
+    }
+    try {
+      const dFull = await nookalQuery(fullQuery);
+      fullResult = (dFull.appointments || []).filter(a => a.appointmentDate === date);
+    } catch (err) {
+      fullError = err.message;
+    }
 
     // Also introspect ALL types that could be Event-related
     const schemaQueries = {
@@ -1016,8 +1035,19 @@ app.get("/debug-day", async (req, res) => {
     res.json({
       instructor: inst.name,
       date,
-      totalAppointments: rawAppts.length,
-      rawAppointmentsFullFields: rawAppts,
+      dateRange: `${date} to ${dateTo}`,
+      locationID: inst.locationID,
+      providerID: inst.providerID,
+      minimalQueryResult: {
+        count: minimalResult?.length ?? "error",
+        data: minimalResult,
+        error: minimalError
+      },
+      fullQueryResult: {
+        count: fullResult?.length ?? "error",
+        data: fullResult,
+        error: fullError
+      },
       appointmentSchema: schemas.appointment
     });
   } catch (err) {
