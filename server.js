@@ -319,6 +319,15 @@ function classifyAppointment(a) {
     return { kind: "soft-block", reason: "reserved/hold", label: summary };
   }
 
+  // ─── Anything prefixed with "Event - " is ALWAYS a diary event, never a lesson ───
+  // This is Nookal's convention: client lessons use just the client name ("Aaron Cutajar"),
+  // while all other diary items are prefixed with "Event - ". If we got here and the
+  // summary starts with "Event -", it's a block we didn't match by keyword — default
+  // to hard-block (safer than suggesting a booking over it).
+  if (/^event\s*[-–]/i.test(summary)) {
+    return { kind: "hard-block", reason: "diary event (unmatched keyword)", label: summary };
+  }
+
   // ─── Real client lessons ───
   // In ICS, lessons appear as events named after the client (e.g. "Jeffrey Tran")
   // If we got here and the entry has substantial content, treat as a lesson
