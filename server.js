@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
+const ical = require("node-ical");
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -16,15 +17,19 @@ const NOOKAL_TOKEN_URL = "https://au-apiv3.nookal.com/oauth/token";
 const NOOKAL_GRAPHQL_URL = "https://au-apiv3.nookal.com/graphql";
 
 // ─── Instructor Configuration ────────────────────────────────────────────────
-// locationID + providerID from Nookal
-// Gabriel + Christian share Driving Matters Pty Ltd (locationID 1), filter by providerID
+// HYBRID DATA SOURCES:
+//   - ICS calendar URL: used for diary events (lessons, holds, holidays etc.)
+//     ICS gives us clean titles/categories the API doesn't expose
+//   - locationID + providerID: used for API client address lookups only
+//     Gabriel + Christian share Driving Matters Pty Ltd (locationID 1)
 const INSTRUCTORS = [
   {
     name: "Christian", base: "Montmorency", locationID: 1, providerID: 32,
     mods: ["LFA", "Spinner", "Electronic Spinner", "Hand Controls", "Satellite", "Extension Pedals", "Indicator Extension"],
     allAreas: true,
     maxTravelFromBase: 65,
-    preferredZone: "All Melbourne areas by arrangement"
+    preferredZone: "All Melbourne areas by arrangement",
+    icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fnXpnN%2FtMeidfD9E6WmLBWPsPF881mF4%2FDKjqX6mENEnlggTWF2jMn8Em8aKgSGXA%3D%3D"
   },
   {
     name: "Gabriel", base: "Croydon North", locationID: 1, providerID: 1,
@@ -32,41 +37,47 @@ const INSTRUCTORS = [
     earliestStart: "09:30",
     maxTravelFromBase: 55,
     zoneByArrangement: true,
-    preferredZone: "East Melbourne — Croydon, Ringwood, Box Hill, Frankston corridor. Will go further by arrangement."
+    preferredZone: "East Melbourne — Croydon, Ringwood, Box Hill, Frankston corridor. Will go further by arrangement.",
+    icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2a52GEgwyPVJ%2B0I6mOab2rD4%2Bmqr7EYvQGR9ykfeKAj%2F"
   },
   {
     name: "Greg", base: "Kilsyth", locationID: 41, providerID: 77,
     mods: ["LFA", "Spinner", "Electronic Spinner", "Monarchs", "Indicator Extension"],
     maxTravelFromBase: 55,
     zoneByArrangement: true,
-    preferredZone: "Extended East & South-East Melbourne — Kilsyth, Ringwood, Knox, Dandenong, Frankston, Bayside."
+    preferredZone: "Extended East & South-East Melbourne — Kilsyth, Ringwood, Knox, Dandenong, Frankston, Bayside.",
+    icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fgA7lzqZCrNH6P0mJPZWpJqu4G4d87qHmXHYUUq3ZhplneSIXp12lfHZzfvGyQdDw%3D%3D"
   },
   {
     name: "Jason", base: "Wandin North", locationID: 23, providerID: 59,
     mods: ["LFA", "Spinner"],
     maxTravelFromBase: 55,
     zoneByArrangement: true,
-    preferredZone: "East Melbourne & Yarra Valley — Wandin, Lilydale, Mooroolbark, Ringwood, Knox, SE up to Bayside."
+    preferredZone: "East Melbourne & Yarra Valley — Wandin, Lilydale, Mooroolbark, Ringwood, Knox, SE up to Bayside.",
+    icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Sks8REnxfIzFLWWhJgXRykKsTkQKIlND6Q3P8UWc8WWFJCS5Y5gIU0xiqPfnSz%2FkQ%3D%3D"
   },
   {
     name: "Marc", base: "Werribee", locationID: 51, providerID: 90,
     mods: ["LFA", "Spinner", "Electronic Spinner", "Extension Pedals", "Indicator Extension"],
     maxTravelFromBase: 55,
-    preferredZone: "West Melbourne — Werribee, Hoppers Crossing, Tarneit, Melton, Sunshine, Footscray, Altona, Laverton."
+    preferredZone: "West Melbourne — Werribee, Hoppers Crossing, Tarneit, Melton, Sunshine, Footscray, Altona, Laverton.",
+    icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2ecoRZN2xzdtmsUYY9vDrAuMuEJAzQSivaNXrwqSOqrMT982Jq4gficfE9XDNSVl0A%3D%3D"
   },
   {
     name: "Sherri", base: "Wandin North", locationID: 5, providerID: 38,
     mods: [],
     maxTravelFromBase: 50,
     zoneByArrangement: true,
-    preferredZone: "Wandin to Ringwood radius. Will travel further if lessons are planned. Also covers Warragul area."
+    preferredZone: "Wandin to Ringwood radius. Will travel further if lessons are planned. Also covers Warragul area.",
+    icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Qm9F8eQzb%2B6bu2IC%2FLaNBOOWmK9yskJZYl8guOGtP67bXXfuA0nBVLMaaPL2rsqew%3D%3D"
   },
   {
     name: "Yves", base: "Rye", locationID: 29, providerID: 62,
     mods: ["LFA", "Spinner", "Electronic Spinner", "Indicator Extension"],
     maxTravelFromBase: 35,
     hardZone: true,
-    preferredZone: "Mornington Peninsula only — Rye, Rosebud, Mornington, Mt Eliza, Dromana, Safety Beach, Sorrento."
+    preferredZone: "Mornington Peninsula only — Rye, Rosebud, Mornington, Mt Eliza, Dromana, Safety Beach, Sorrento.",
+    icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fgA7lzqZCrNH6P0mJPZWpJqu4G4d87qHmXHYUUq3ZhplneSIXp12lfHZzfvGyQdDw%3D%3D"
   }
 ];
 
@@ -75,6 +86,8 @@ const clientAddressCache = {};
 let cachedToken = null;
 let cachedTokenExpiry = 0;
 const travelCache = {};
+const icsCache = {}; // { icsUrl: { data, fetchedAt } } — ICS feeds cached 5 min
+const ICS_CACHE_TTL_MS = 5 * 60 * 1000;
 
 // ─── Date/Time Helpers ───────────────────────────────────────────────────────
 function toMelbDateStr(date) {
@@ -137,30 +150,79 @@ async function nookalQuery(query) {
   return r.data.data;
 }
 
+// ─── ICS Diary Fetching ──────────────────────────────────────────────────────
+// Uses Nookal's ICS calendar export URLs. Returns clean event data with real
+// titles (SUMMARY field) that the Nookal GraphQL API doesn't expose.
+async function fetchICSForInstructor(inst) {
+  const now = Date.now();
+  const cached = icsCache[inst.icsUrl];
+  if (cached && now - cached.fetchedAt < ICS_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  try {
+    const data = await ical.async.fromURL(inst.icsUrl);
+    icsCache[inst.icsUrl] = { data, fetchedAt: now };
+    return data;
+  } catch (err) {
+    throw new Error(`Failed to fetch ICS for ${inst.name}: ${err.message}`);
+  }
+}
+
+// Convert ICS data to a unified appointment-like structure so the rest of the
+// code works without changes. Returns entries for the date range specified.
 async function getAppointmentsForInstructor(inst, dateFrom, dateTo) {
-  const q = `
-    query {
-      appointments(
-        locationIDs: [${inst.locationID}]
-        providerIDs: [${inst.providerID}]
-        dateFrom: "${dateFrom}"
-        dateTo: "${dateTo}"
-        pageLength: 500
-      ) {
-        apptID
-        appointmentDate
-        startTime
-        endTime
-        status
-        clientID
-        clientName
-        notes
-        typeName
-      }
-    }
-  `;
-  const d = await nookalQuery(q);
-  return d.appointments || [];
+  const rawData = await fetchICSForInstructor(inst);
+  const startBound = new Date(dateFrom + "T00:00:00+10:00");
+  const endBound = new Date(dateTo + "T23:59:59+10:00");
+
+  const appointments = [];
+  for (const [uid, event] of Object.entries(rawData)) {
+    if (event.type !== "VEVENT") continue;
+    if (!event.start || !event.end) continue;
+
+    const start = new Date(event.start);
+    const end = new Date(event.end);
+    if (end < startBound || start > endBound) continue;
+
+    const summary = (event.summary || "").trim();
+    const description = (event.description || "").trim();
+    const categories = event.categories || [];
+
+    // ICS events from Nookal have rich data in SUMMARY (title) and DESCRIPTION
+    // We shape this to look like what the rest of our code expects, but also
+    // add extra fields from ICS that the API didn't give us
+    appointments.push({
+      uid,
+      appointmentDate: toMelbDateStr(start),
+      startTime: toMelbTimeStrFull(start),
+      endTime: toMelbTimeStrFull(end),
+      rawStart: start,
+      rawEnd: end,
+      // ICS-specific fields — what the API was missing:
+      summary,        // The event title — e.g. "Hold for Zain Karim", "School pick up"
+      description,    // Notes/details — includes suburb and admin notes for lessons
+      categories,     // Can contain ["Time Held"], ["Holidays"] etc.
+      location: event.location || "",
+      // Synthesized fields to match the shape we had from API (so existing logic still works)
+      apptID: uid,
+      status: null,    // will be set by classifyAppointment based on summary content
+      clientID: null,  // ICS doesn't expose clientID directly
+      clientName: null,
+      notes: description,
+      typeName: categories[0] || null
+    });
+  }
+  return appointments;
+}
+
+// Format a Date as HH:MM:SS in Melbourne timezone
+function toMelbTimeStrFull(date) {
+  const t = new Date(date).toLocaleTimeString("en-AU", {
+    timeZone: "Australia/Melbourne", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+  });
+  // en-AU returns "HH:MM:SS" but sometimes "24:00:00" — normalise
+  return t.replace(/^24:/, "00:");
 }
 
 async function getClientAddress(clientID) {
@@ -206,35 +268,65 @@ async function getClientAddress(clientID) {
 }
 
 // ─── Appointment Classification ──────────────────────────────────────────────
-// Returns: "lesson" | "hard-block" | "soft-block" | "skip"
-// Since Nookal API doesn't expose Event titles/categories reliably, we treat
-// ALL Events as blocks based on duration and time-of-day heuristics.
+// Returns: { kind, clientName, displayLabel }
+//   kind: "lesson" | "hard-block" | "soft-block" | "skip"
+//   Uses ICS summary text which has real titles from the diary.
 function classifyAppointment(a) {
-  if (a.status === "StdAppt") return "lesson";
-  if (a.status === "Cancelled") return "skip";
-  if (a.status === "Note") return "skip";
+  const summary = (a.summary || "").trim();
+  const summaryLower = summary.toLowerCase();
+  const description = (a.description || "").trim();
+  const categories = (a.categories || []).map(c => String(c).toLowerCase());
 
-  if (a.status === "Event") {
-    const startM = timeToMins(a.startTime.slice(0, 5));
-    const endM = timeToMins(a.endTime.slice(0, 5));
-    const durationMins = endM - startM;
-
-    // Long Events (>= 4 hours) = definitely a holiday/day-off/all-day block — hard block
-    if (durationMins >= 240) return "hard-block";
-
-    // Very early or very late Events (before 7am or after 6pm) that are short
-    // are often personal things (school pickup, etc) — hard block
-    if (endM <= 420 || startM >= 1080) return "hard-block";
-
-    // Short Events during working hours — could be Time Held, Hold for X, or
-    // a personal item like a medical appointment. We can't distinguish without
-    // the title text, so treat as soft-block (blocks time, flags for admin)
-    if (durationMins > 0) return "soft-block";
-
-    return "skip";
+  // Skip cancelled events — ICS export usually excludes them but guard anyway
+  if (summaryLower.includes("cancelled") || summaryLower.includes("cancellation")) {
+    return { kind: "skip", reason: "cancelled" };
   }
 
-  return "skip";
+  // Empty/blank entries — shouldn't happen but guard
+  if (!summary && !description) {
+    return { kind: "skip", reason: "empty" };
+  }
+
+  // ─── Hard blocks (never suggest during this time) ───
+  const hardBlockSignals = [
+    "day off", "dayoff", "no lessons", "no lesson",
+    "private stuff", "private work", "non-sdt", "non sdt",
+    "school pick up", "school pickup", "school run",
+    "holiday", "holidays", "leave", "bali", "trip",
+    "sick", "medical", "personal",
+    "car service", "unavailable", "away", "off sick",
+    "total ability van", "smartbox", "lagos holiday",
+    "lunch break", "lunch"
+  ];
+  const hardBlockCategories = ["holidays", "non-sdt work", "medical", "prefer not to work", "van booking"];
+  const isHardBySignal = hardBlockSignals.some(sig => summaryLower.includes(sig));
+  const isHardByCategory = categories.some(cat => hardBlockCategories.includes(cat));
+  if (isHardBySignal || isHardByCategory) {
+    return { kind: "hard-block", reason: "unavailable time", label: summary };
+  }
+
+  // ─── Soft blocks (Time Held / holds — admin may override for specific clients) ───
+  const softBlockSignals = [
+    "hold for", "hold ", "time held",
+    "community ot", "commot", "comm ot",
+    "active one", "activeone",
+    "hold ax", "holding spot", "holding time", "holding regular"
+  ];
+  const softBlockCategories = ["time held", "general", "hold time for test", "miscellaneous"];
+  const isSoftBySignal = softBlockSignals.some(sig => summaryLower.includes(sig));
+  const isSoftByCategory = categories.some(cat => softBlockCategories.includes(cat));
+  if (isSoftBySignal || isSoftByCategory) {
+    return { kind: "soft-block", reason: "reserved/hold", label: summary };
+  }
+
+  // ─── Real client lessons ───
+  // In ICS, lessons appear as events named after the client (e.g. "Jeffrey Tran")
+  // If we got here and the entry has substantial content, treat as a lesson
+  return {
+    kind: "lesson",
+    clientName: summary,
+    label: summary
+  };
 }
 
 // ─── Location extraction from notes ──────────────────────────────────────────
@@ -308,10 +400,78 @@ function extractPickupFromSchoolPattern(notes) {
   return null;
 }
 
+// Lookup client by name (since ICS doesn't give us clientID).
+// Caches by name to avoid repeat lookups. Returns null if not found or ambiguous.
+const clientByNameCache = {};
+async function getClientByName(fullName) {
+  if (!fullName || fullName.length < 3) return null;
+  const key = fullName.toLowerCase().trim();
+  if (clientByNameCache[key] !== undefined) return clientByNameCache[key];
+
+  // Parse first + last name from "First Last" or "First Middle Last"
+  const parts = fullName.trim().split(/\s+/);
+  if (parts.length < 2) {
+    clientByNameCache[key] = null;
+    return null;
+  }
+  const firstName = parts[0];
+  const lastName = parts[parts.length - 1];
+
+  const q = `
+    query {
+      clients(firstName: "${firstName.replace(/"/g, '\\"')}", lastName: "${lastName.replace(/"/g, '\\"')}", pageLength: 5) {
+        clientID
+        firstName
+        lastName
+        addresses {
+          addr1 city state postcode isDefault
+        }
+      }
+    }
+  `;
+  try {
+    const d = await nookalQuery(q);
+    const matches = d.clients || [];
+    // Prefer exact match
+    const exact = matches.find(c =>
+      c.firstName?.toLowerCase() === firstName.toLowerCase() &&
+      c.lastName?.toLowerCase() === lastName.toLowerCase()
+    );
+    const best = exact || matches[0];
+    if (!best) {
+      clientByNameCache[key] = null;
+      return null;
+    }
+    const defaultAddr = (best.addresses || []).find(a => a.isDefault === 1 && a.city)
+                     || (best.addresses || []).find(a => a.city);
+    const result = defaultAddr ? {
+      clientID: best.clientID,
+      suburb: defaultAddr.city,
+      state: defaultAddr.state,
+      postcode: defaultAddr.postcode,
+      addr1: defaultAddr.addr1,
+      firstName: best.firstName,
+      lastName: best.lastName
+    } : { clientID: best.clientID };
+    clientByNameCache[key] = result;
+    return result;
+  } catch (err) {
+    console.error(`Client name lookup failed for ${fullName}:`, err.message);
+    clientByNameCache[key] = null;
+    return null;
+  }
+}
+
 // ─── Smart location resolution ───────────────────────────────────────────────
 // Returns full street address when available, suburb as fallback
 async function resolveAppointmentLocation(appt) {
-  const clientAddr = appt.clientID ? await getClientAddress(appt.clientID) : null;
+  // Try by clientID first if available, otherwise by clientName
+  let clientAddr = null;
+  if (appt.clientID) {
+    clientAddr = await getClientAddress(appt.clientID);
+  } else if (appt.clientName) {
+    clientAddr = await getClientByName(appt.clientName);
+  }
   const homeSuburb = clientAddr?.suburb || null;
   const homeFull = clientAddr?.addr1
     ? `${clientAddr.addr1}, ${clientAddr.suburb} ${clientAddr.state || "VIC"} ${clientAddr.postcode || ""}`.trim()
@@ -440,7 +600,7 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
   const byDate = {};
   for (const a of appointments) {
     const cls = classifyAppointment(a);
-    if (cls === "skip") continue;
+    if (cls.kind === "skip") continue;
 
     if (!byDate[a.appointmentDate]) byDate[a.appointmentDate] = [];
 
@@ -451,12 +611,21 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
     let locEnd = inst.base;
     let prevClientName = null;
 
-    if (cls === "lesson") {
-      const loc = await resolveAppointmentLocation(a);
+    if (cls.kind === "lesson") {
+      // Set the summary as clientName so resolveAppointmentLocation can try to
+      // find this client in Nookal (by name) and pull their home address
+      const apptForResolve = {
+        ...a,
+        clientName: cls.clientName || a.summary,
+        notes: a.description || a.notes
+      };
+      const loc = await resolveAppointmentLocation(apptForResolve);
       if (loc) {
         locStart = loc.pickup || inst.base;
         locEnd = loc.dropoff || loc.pickup || inst.base;
-        prevClientName = a.clientName;
+        prevClientName = cls.clientName;
+      } else {
+        prevClientName = cls.clientName;
       }
     }
 
@@ -465,8 +634,9 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
       endMins: endM,
       locationForStart: locStart,
       locationForEnd: locEnd,
-      kind: cls, // "lesson" | "hard-block" | "soft-block"
-      note: a.notes || a.typeName || "",
+      kind: cls.kind, // "lesson" | "hard-block" | "soft-block"
+      label: cls.label || a.summary || "",
+      note: a.description || "",
       clientName: prevClientName,
       startTime: a.startTime.slice(0, 5),
       endTime: a.endTime.slice(0, 5)
@@ -917,190 +1087,8 @@ app.post("/clear-cache", (req, res) => {
   res.json({ cleared: before });
 });
 
-// ─── Classification Test: shows how the system classifies each appointment ──
-// Usage: /test-classify?instructor=Gabriel&date=2026-04-28
-// Shows EVERY field the API returns for each appointment so we can spot phantoms
-app.get("/test-classify", async (req, res) => {
-  try {
-    const instructorName = req.query.instructor;
-    const date = req.query.date;
-    if (!instructorName || !date) {
-      return res.json({ error: "Usage: /test-classify?instructor=Gabriel&date=2026-04-28" });
-    }
-    const inst = INSTRUCTORS.find(i => i.name.toLowerCase() === instructorName.toLowerCase());
-    if (!inst) return res.json({ error: `Instructor '${instructorName}' not found` });
 
-    const dateObj = new Date(date + "T12:00:00+10:00");
-    const nextDay = new Date(dateObj.getTime() + 24 * 3600 * 1000);
-    const dateTo = toMelbDateStr(nextDay);
-
-    // Query with every possible field split across two queries (some combos fail silently)
-    // Query A: core fields we know work
-    const queryA = `
-      query {
-        appointments(
-          locationIDs: [${inst.locationID}]
-          providerIDs: [${inst.providerID}]
-          dateFrom: "${date}"
-          dateTo: "${dateTo}"
-          pageLength: 100
-        ) {
-          apptID
-          appointmentDate
-          startTime
-          endTime
-          status
-          clientID
-          clientName
-          notes
-          typeName
-        }
-      }
-    `;
-
-    // Query B: extended fields — state/cancellation/tracking flags
-    const queryB = `
-      query {
-        appointments(
-          locationIDs: [${inst.locationID}]
-          providerIDs: [${inst.providerID}]
-          dateFrom: "${date}"
-          dateTo: "${dateTo}"
-          pageLength: 100
-        ) {
-          apptID
-          status
-          dateAdded
-          cancellationDate
-          arrived
-          confirmed
-          dna
-          onlineBooking
-          emailReminderSent
-          lastModified
-          lastModifiedBy
-          addedBy
-          addedByName
-          apptType
-          typeID
-        }
-      }
-    `;
-
-    // Query C: caseID fields
-    const queryC = `
-      query {
-        appointments(
-          locationIDs: [${inst.locationID}]
-          providerIDs: [${inst.providerID}]
-          dateFrom: "${date}"
-          dateTo: "${dateTo}"
-          pageLength: 100
-        ) {
-          apptID
-          status
-          caseID
-          caseName
-          isNewClient
-          isNewCase
-          metadata
-          response
-          otherNotes
-          locationID
-          locationName
-          providerID
-          providerName
-        }
-      }
-    `;
-
-    let resultA = null, resultB = null, resultC = null;
-    let errorA = null, errorB = null, errorC = null;
-
-    try {
-      const d = await nookalQuery(queryA);
-      resultA = (d.appointments || []).filter(a => a.appointmentDate === date);
-    } catch (err) { errorA = err.message; }
-
-    try {
-      const d = await nookalQuery(queryB);
-      resultB = d.appointments || [];
-    } catch (err) { errorB = err.message; }
-
-    try {
-      const d = await nookalQuery(queryC);
-      resultC = d.appointments || [];
-    } catch (err) { errorC = err.message; }
-
-    // Merge all results by apptID for easy reading
-    const merged = {};
-    if (resultA) for (const a of resultA) merged[a.apptID] = { ...a };
-    if (resultB) for (const a of resultB) merged[a.apptID] = { ...(merged[a.apptID] || {}), ...a };
-    if (resultC) for (const a of resultC) merged[a.apptID] = { ...(merged[a.apptID] || {}), ...a };
-
-    // Filter merged to only this date
-    const mergedArr = Object.values(merged).filter(a => a.appointmentDate === date);
-
-    // Classify each
-    const classified = mergedArr.map(a => {
-      const cls = classifyAppointment(a);
-      const startM = timeToMins((a.startTime || "00:00").slice(0, 5));
-      const endM = timeToMins((a.endTime || "00:00").slice(0, 5));
-      return {
-        apptID: a.apptID,
-        time: `${(a.startTime||"??").slice(0,5)}-${(a.endTime||"??").slice(0,5)}`,
-        durationMins: endM - startM,
-        status: a.status,
-        client: a.clientName || null,
-        notes: a.notes || null,
-        typeName: a.typeName,
-        apptType: a.apptType,
-        typeID: a.typeID,
-        // State flags — key to spotting phantoms
-        dateAdded: a.dateAdded,
-        cancellationDate: a.cancellationDate,
-        arrived: a.arrived,
-        confirmed: a.confirmed,
-        dna: a.dna,
-        onlineBooking: a.onlineBooking,
-        emailReminderSent: a.emailReminderSent,
-        lastModified: a.lastModified,
-        lastModifiedBy: a.lastModifiedBy,
-        addedBy: a.addedBy,
-        addedByName: a.addedByName,
-        // Case info
-        caseID: a.caseID,
-        caseName: a.caseName,
-        isNewClient: a.isNewClient,
-        isNewCase: a.isNewCase,
-        metadata: a.metadata,
-        response: a.response,
-        otherNotes: a.otherNotes,
-        providerName: a.providerName,
-        locationName: a.locationName,
-        classification: cls
-      };
-    }).sort((x, y) => timeToMins(x.time.slice(0, 5)) - timeToMins(y.time.slice(0, 5)));
-
-    res.json({
-      instructor: inst.name,
-      date,
-      queries: {
-        queryA_rowCount: resultA?.length ?? "error",
-        queryA_error: errorA,
-        queryB_rowCount: resultB?.length ?? "error",
-        queryB_error: errorB,
-        queryC_rowCount: resultC?.length ?? "error",
-        queryC_error: errorC
-      },
-      mergedAppointments: classified
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
-  }
-});
-
-// ─── Diagnostic: show exactly what the system sees for one instructor/day ────
+// ─── Debug: show classification for one instructor/day ──────────────────────
 // Usage: /debug-day?instructor=Gabriel&date=2026-04-28
 app.get("/debug-day", async (req, res) => {
   try {
@@ -1112,145 +1100,108 @@ app.get("/debug-day", async (req, res) => {
     const inst = INSTRUCTORS.find(i => i.name.toLowerCase() === instructorName.toLowerCase());
     if (!inst) return res.json({ error: `Instructor '${instructorName}' not found` });
 
-    // Fetch appointments with EVERY possible field the API exposes
-    // Use date range of the one day + next day so the API returns properly
-    const dateObj = new Date(date + "T12:00:00+10:00");
-    const nextDay = new Date(dateObj.getTime() + 24 * 3600 * 1000);
-    const dateTo = toMelbDateStr(nextDay);
+    // Fetch ICS for just that date
+    const appts = await getAppointmentsForInstructor(inst, date, date);
+    const forThisDay = appts.filter(a => a.appointmentDate === date);
 
-    // Test with full field list
-    const fullQuery = `
-      query {
-        appointments(
-          locationIDs: [${inst.locationID}]
-          providerIDs: [${inst.providerID}]
-          dateFrom: "${date}"
-          dateTo: "${dateTo}"
-          pageLength: 100
-        ) {
-          apptID
-          appointmentDate
-          startTime
-          endTime
-          status
-          clientID
-          clientName
-          providerID
-          providerName
-          caseID
-          caseName
-          apptType
-          typeName
-          typeID
-          notes
-          locationID
-          locationName
-          metadata
-          response
-          otherNotes
-        }
-      }
-    `;
+    const classified = forThisDay.map(a => {
+      const cls = classifyAppointment(a);
+      const startM = timeToMins(a.startTime.slice(0, 5));
+      const endM = timeToMins(a.endTime.slice(0, 5));
+      return {
+        time: `${a.startTime.slice(0,5)}-${a.endTime.slice(0,5)}`,
+        durationMins: endM - startM,
+        summary: a.summary,
+        description: a.description?.slice(0, 120),
+        categories: a.categories,
+        classification: cls.kind,
+        label: cls.label,
+        reason: cls.reason,
+        blocksTime: cls.kind === "lesson" || cls.kind === "hard-block" || cls.kind === "soft-block"
+      };
+    }).sort((x, y) => timeToMins(x.time.slice(0, 5)) - timeToMins(y.time.slice(0, 5)));
 
-    // Also test with minimal fields — if this works but fullQuery doesn't, we know it's a field issue
-    const minimalQuery = `
-      query {
-        appointments(
-          locationIDs: [${inst.locationID}]
-          providerIDs: [${inst.providerID}]
-          dateFrom: "${date}"
-          dateTo: "${dateTo}"
-          pageLength: 100
-        ) {
-          apptID
-          appointmentDate
-          startTime
-          endTime
-          status
-          clientName
-          notes
-          typeName
-        }
-      }
-    `;
-
-    // Try minimal query first
-    let minimalResult, fullResult, minimalError, fullError;
-    try {
-      const dMin = await nookalQuery(minimalQuery);
-      minimalResult = (dMin.appointments || []).filter(a => a.appointmentDate === date);
-    } catch (err) {
-      minimalError = err.message;
+    // Compute gaps
+    const blocks = classified.filter(c => c.blocksTime);
+    const gaps = [];
+    const earliestStart = inst.earliestStart ? timeToMins(inst.earliestStart) : 480;
+    const latestEnd = 1050;
+    const sorted = [...blocks].sort((a, b) => timeToMins(a.time.slice(0, 5)) - timeToMins(b.time.slice(0, 5)));
+    let cursor = earliestStart;
+    for (const b of sorted) {
+      const bStart = timeToMins(b.time.slice(0, 5));
+      const bEnd = timeToMins(b.time.slice(6, 11));
+      if (bStart > cursor) gaps.push({ from: minsToTime(cursor), to: minsToTime(bStart), lengthMins: bStart - cursor });
+      cursor = Math.max(cursor, bEnd);
     }
-    try {
-      const dFull = await nookalQuery(fullQuery);
-      fullResult = (dFull.appointments || []).filter(a => a.appointmentDate === date);
-    } catch (err) {
-      fullError = err.message;
-    }
-
-    // Also introspect ALL types that could be Event-related
-    const schemaQueries = {
-      appointment: `query { __type(name: "appointment") { fields { name type { name kind ofType { name } } } } }`
-    };
-    const schemas = {};
-    for (const [label, q] of Object.entries(schemaQueries)) {
-      try {
-        const r = await nookalQuery(q);
-        schemas[label] = r.__type?.fields;
-      } catch (e) {
-        schemas[label] = { error: e.message };
-      }
-    }
+    if (cursor < latestEnd) gaps.push({ from: minsToTime(cursor), to: minsToTime(latestEnd), lengthMins: latestEnd - cursor });
 
     res.json({
       instructor: inst.name,
       date,
-      dateRange: `${date} to ${dateTo}`,
-      locationID: inst.locationID,
-      providerID: inst.providerID,
-      minimalQueryResult: {
-        count: minimalResult?.length ?? "error",
-        data: minimalResult,
-        error: minimalError
+      source: "ICS diary feed",
+      totalEntries: forThisDay.length,
+      classified,
+      summary: {
+        lessons: classified.filter(c => c.classification === "lesson").length,
+        hardBlocks: classified.filter(c => c.classification === "hard-block").length,
+        softBlocks: classified.filter(c => c.classification === "soft-block").length,
+        skipped: classified.filter(c => c.classification === "skip").length
       },
-      fullQueryResult: {
-        count: fullResult?.length ?? "error",
-        data: fullResult,
-        error: fullError
-      },
-      appointmentSchema: schemas.appointment
+      availableGaps: gaps
     });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ─── Nookal API test endpoint ────────────────────────────────────────────────
+// ─── Test Nookal API health ─────────────────────────────────────────────────
 app.get("/test-nookal", async (req, res) => {
   try {
     await getNookalToken();
     const locations = await nookalQuery(`query { locations { locationID name suburb } }`);
+    res.json({
+      apiTokenWorks: true,
+      locations: locations.locations,
+      cacheStats: {
+        clientAddresses: Object.keys(clientAddressCache).length,
+        clientNames: Object.keys(clientByNameCache).length,
+        travelRoutes: Object.keys(travelCache).length,
+        icsFeeds: Object.keys(icsCache).length
+      },
+      note: "Main diary data now comes from ICS feeds, not API. API is used only for client address lookups."
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, detail: err.response?.data });
+  }
+});
+
+// ─── Test ICS feed fetch ────────────────────────────────────────────────────
+app.get("/test-ics", async (req, res) => {
+  try {
+    const instructorName = req.query.instructor || "Christian";
+    const inst = INSTRUCTORS.find(i => i.name.toLowerCase() === instructorName.toLowerCase());
+    if (!inst) return res.json({ error: `Instructor not found` });
 
     const today = toMelbDateStr(new Date());
     const tomorrow = toMelbDateStr(new Date(Date.now() + 24 * 3600 * 1000));
-    const christian = INSTRUCTORS.find(i => i.name === "Christian");
-    const christianAppts = await getAppointmentsForInstructor(christian, today, tomorrow);
+    const appts = await getAppointmentsForInstructor(inst, today, tomorrow);
+    const forThisDay = appts.filter(a => a.appointmentDate === today || a.appointmentDate === tomorrow);
 
     res.json({
-      tokenObtained: true,
-      locations: locations.locations,
-      christianRealEntries: christianAppts.filter(a => classifyAppointment(a) !== "skip"),
-      cacheStats: {
-        clientAddresses: Object.keys(clientAddressCache).length,
-        travelRoutes: Object.keys(travelCache).length
-      }
+      instructor: inst.name,
+      dateRange: `${today} - ${tomorrow}`,
+      entries: forThisDay.map(a => ({
+        date: a.appointmentDate,
+        time: `${a.startTime.slice(0,5)}-${a.endTime.slice(0,5)}`,
+        summary: a.summary,
+        description: a.description?.slice(0, 100),
+        categories: a.categories,
+        classification: classifyAppointment(a)
+      }))
     });
   } catch (err) {
-    res.status(500).json({
-      error: err.message,
-      detail: err.response?.data
-    });
+    res.status(500).json({ error: err.message });
   }
 });
 
