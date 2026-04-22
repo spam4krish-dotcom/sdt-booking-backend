@@ -959,17 +959,16 @@ Please pick the best 3 options and explain each clearly. If the closest instruct
 // ─── Nookal API Test Endpoint ────────────────────────────────────────────────
 app.get("/test-nookal", async (req, res) => {
   const apiKey = process.env.NOOKAL_API_KEY;
-  const clientId = process.env.NOOKAL_CLIENT_ID;
 
   if (!apiKey) {
-    return res.json({ error: "Missing NOOKAL_API_KEY environment variable" });
+    return res.json({ error: "Missing NOOKAL_API_KEY" });
   }
 
   const TOKEN_ENDPOINT = "https://au-apiv3.nookal.com/oauth/token";
   const GRAPHQL_ENDPOINT = "https://au-apiv3.nookal.com/graphql";
   const results = {};
 
-  // STEP 1: Get OAuth access token
+  // STEP 1: Get OAuth token
   let accessToken = null;
   try {
     const tokenResponse = await axios.post(
@@ -983,14 +982,9 @@ app.get("/test-nookal", async (req, res) => {
         timeout: 10000
       }
     );
-    accessToken = tokenResponse.data.accessToken || tokenResponse.data.access_token;
-    results.token_obtained = !!accessToken;
+    accessToken = tokenResponse.data.accessToken;
   } catch (err) {
-    results.token_request_error = {
-      status: err.response?.status,
-      detail: err.response?.data || err.message
-    };
-    return res.json(results);
+    return res.json({ error: "Failed to get token", detail: err.response?.data || err.message });
   }
 
   const gqlHeaders = {
@@ -998,58 +992,95 @@ app.get("/test-nookal", async (req, res) => {
     "Content-Type": "application/json"
   };
 
-  // STEP 2: Introspect schema — what fields does 'location' type have?
-  try {
-    const introspectQuery = `
-      query {
-        __type(name: "location") {
-          name
-          fields {
-            name
-            type { name kind }
-          }
-        }
-      }
-    `;
-    const r = await axios.post(GRAPHQL_ENDPOINT, { query: introspectQuery }, { headers: gqlHeaders, timeout: 10000 });
-    results.location_schema = r.data;
-  } catch (err) {
-    results.location_schema = { error: err.response?.data || err.message };
+  async function runQuery(label, query, variables = {}) {
+    try {
+      const r = await axios.post(GRAPHQL_ENDPOINT,
+        { query, variables },
+        { headers: gqlHeaders, timeout: 15000 });
+      results[label] = r.data;
+    } catch (err) {
+      results[label] = { error: err.response?.data || err.message };
+    }
   }
 
-  // STEP 3: Introspect top-level query fields — what queries are available?
-  try {
-    const queryListQuery = `
-      query {
-        __schema {
-          queryType {
-            fields {
-              name
-              args { name type { name kind } }
-            }
-          }
-        }
+  // TEST 1: Introspect 'appointment' type — what fields on each appointment?
+  await runQuery("appointment_schema", `
+    query {
+      __type(name: "appointment") {
+        fields { name type { name kind ofType { name kind } } }
       }
-    `;
-    const r = await axios.post(GRAPHQL_ENDPOINT, { query: queryListQuery }, { headers: gqlHeaders, timeout: 10000 });
-    results.available_queries = r.data;
-  } catch (err) {
-    results.available_queries = { error: err.response?.data || err.message };
-  }
+    }
+  `);
 
-  // STEP 4: Try a simple locations query with just 'name'
-  try {
-    const r = await axios.post(GRAPHQL_ENDPOINT, {
-      query: `query { locations { name } }`
-    }, { headers: gqlHeaders, timeout: 10000 });
-    results.locations_simple = r.data;
-  } catch (err) {
-    results.locations_simple = { error: err.response?.data || err.message };
-  }
+  // TEST 2: Introspect 'client' type — for client details lookup
+  await runQuery("client_schema", `
+    query {
+      __type(name: "client") {
+        fields { name type { name kind ofType { name kind } } }
+      }
+    }
+  `);
+
+  // TEST 3: Introspect 'staff' type — for instructor info
+  await runQuery("staff_schema", `
+    query {
+      __type(name: "staff") {
+        fields { name type { name kind ofType { name kind } } }
+      }
+    }
+  `);
+
+  // TEST 4: Introspect 'availability' type — slot data
+  await runQuery("availability_schema", `
+    query {
+      __type(name: "availability") {
+        fields { name type { name kind ofType { name kind } } }
+      }
+    }
+  `);
+
+  // TEST 5: Get full locations with suburb
+  await runQuery("locations_full", `
+    query {
+      locations {
+        locationID name suburb state postcode active
+      }
+    }
+  `);
+
+  // TEST 6: Get staff list with their location IDs
+  await runQuery("staff_list", `
+    query {
+      staff {
+        staffID firstName lastName locationIDs isProvider
+      }
+    }
+  `);
+
+  // TEST 7: Get today's appointments across all locations
+  // Request with minimal fields first so we can see the shape
+  const today = toMelbDateStr(new Date());
+  const tomorrow = toMelbDateStr(new Date(Date.now() + 24 * 3600 * 1000));
+  await runQuery("appointments_today", `
+    query {
+      appointments(dateFrom: "${today}", dateTo: "${tomorrow}") {
+        appointmentID
+        appointmentDate
+        appointmentStartTime
+        appointmentEndTime
+        appointmentLength
+        locationID
+        providerID
+        clientID
+        notes
+      }
+    }
+  `);
 
   res.json({
+    token_obtained: true,
     endpoints: { token: TOKEN_ENDPOINT, graphql: GRAPHQL_ENDPOINT },
-    client_id: clientId,
+    date_range_tested: { today, tomorrow },
     results
   });
 });
