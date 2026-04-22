@@ -919,7 +919,7 @@ app.post("/clear-cache", (req, res) => {
 
 // ─── Classification Test: shows how the system classifies each appointment ──
 // Usage: /test-classify?instructor=Gabriel&date=2026-04-28
-// Shows: raw appointments → classification → which are kept as blocks/lessons
+// Shows EVERY field the API returns for each appointment so we can spot phantoms
 app.get("/test-classify", async (req, res) => {
   try {
     const instructorName = req.query.instructor;
@@ -934,68 +934,169 @@ app.get("/test-classify", async (req, res) => {
     const nextDay = new Date(dateObj.getTime() + 24 * 3600 * 1000);
     const dateTo = toMelbDateStr(nextDay);
 
-    const rawAppts = await getAppointmentsForInstructor(inst, date, dateTo);
-    const forThisDay = rawAppts.filter(a => a.appointmentDate === date);
+    // Query with every possible field split across two queries (some combos fail silently)
+    // Query A: core fields we know work
+    const queryA = `
+      query {
+        appointments(
+          locationIDs: [${inst.locationID}]
+          providerIDs: [${inst.providerID}]
+          dateFrom: "${date}"
+          dateTo: "${dateTo}"
+          pageLength: 100
+        ) {
+          apptID
+          appointmentDate
+          startTime
+          endTime
+          status
+          clientID
+          clientName
+          notes
+          typeName
+        }
+      }
+    `;
 
-    const classified = forThisDay.map(a => {
+    // Query B: extended fields — state/cancellation/tracking flags
+    const queryB = `
+      query {
+        appointments(
+          locationIDs: [${inst.locationID}]
+          providerIDs: [${inst.providerID}]
+          dateFrom: "${date}"
+          dateTo: "${dateTo}"
+          pageLength: 100
+        ) {
+          apptID
+          status
+          dateAdded
+          cancellationDate
+          arrived
+          confirmed
+          dna
+          onlineBooking
+          emailReminderSent
+          lastModified
+          lastModifiedBy
+          addedBy
+          addedByName
+          apptType
+          typeID
+        }
+      }
+    `;
+
+    // Query C: caseID fields
+    const queryC = `
+      query {
+        appointments(
+          locationIDs: [${inst.locationID}]
+          providerIDs: [${inst.providerID}]
+          dateFrom: "${date}"
+          dateTo: "${dateTo}"
+          pageLength: 100
+        ) {
+          apptID
+          status
+          caseID
+          caseName
+          isNewClient
+          isNewCase
+          metadata
+          response
+          otherNotes
+          locationID
+          locationName
+          providerID
+          providerName
+        }
+      }
+    `;
+
+    let resultA = null, resultB = null, resultC = null;
+    let errorA = null, errorB = null, errorC = null;
+
+    try {
+      const d = await nookalQuery(queryA);
+      resultA = (d.appointments || []).filter(a => a.appointmentDate === date);
+    } catch (err) { errorA = err.message; }
+
+    try {
+      const d = await nookalQuery(queryB);
+      resultB = d.appointments || [];
+    } catch (err) { errorB = err.message; }
+
+    try {
+      const d = await nookalQuery(queryC);
+      resultC = d.appointments || [];
+    } catch (err) { errorC = err.message; }
+
+    // Merge all results by apptID for easy reading
+    const merged = {};
+    if (resultA) for (const a of resultA) merged[a.apptID] = { ...a };
+    if (resultB) for (const a of resultB) merged[a.apptID] = { ...(merged[a.apptID] || {}), ...a };
+    if (resultC) for (const a of resultC) merged[a.apptID] = { ...(merged[a.apptID] || {}), ...a };
+
+    // Filter merged to only this date
+    const mergedArr = Object.values(merged).filter(a => a.appointmentDate === date);
+
+    // Classify each
+    const classified = mergedArr.map(a => {
       const cls = classifyAppointment(a);
-      const startM = timeToMins(a.startTime.slice(0, 5));
-      const endM = timeToMins(a.endTime.slice(0, 5));
+      const startM = timeToMins((a.startTime || "00:00").slice(0, 5));
+      const endM = timeToMins((a.endTime || "00:00").slice(0, 5));
       return {
-        time: `${a.startTime.slice(0,5)}-${a.endTime.slice(0,5)}`,
+        apptID: a.apptID,
+        time: `${(a.startTime||"??").slice(0,5)}-${(a.endTime||"??").slice(0,5)}`,
         durationMins: endM - startM,
         status: a.status,
         client: a.clientName || null,
         notes: a.notes || null,
-        classification: cls,
-        blocksTime: cls === "lesson" || cls === "hard-block" || cls === "soft-block",
-        adminReviewFlag: cls === "soft-block"
+        typeName: a.typeName,
+        apptType: a.apptType,
+        typeID: a.typeID,
+        // State flags — key to spotting phantoms
+        dateAdded: a.dateAdded,
+        cancellationDate: a.cancellationDate,
+        arrived: a.arrived,
+        confirmed: a.confirmed,
+        dna: a.dna,
+        onlineBooking: a.onlineBooking,
+        emailReminderSent: a.emailReminderSent,
+        lastModified: a.lastModified,
+        lastModifiedBy: a.lastModifiedBy,
+        addedBy: a.addedBy,
+        addedByName: a.addedByName,
+        // Case info
+        caseID: a.caseID,
+        caseName: a.caseName,
+        isNewClient: a.isNewClient,
+        isNewCase: a.isNewCase,
+        metadata: a.metadata,
+        response: a.response,
+        otherNotes: a.otherNotes,
+        providerName: a.providerName,
+        locationName: a.locationName,
+        classification: cls
       };
     }).sort((x, y) => timeToMins(x.time.slice(0, 5)) - timeToMins(y.time.slice(0, 5)));
-
-    // Also compute resulting gaps so we can see what windows remain
-    const blocks = classified.filter(c => c.blocksTime);
-    const gaps = [];
-    const earliestStart = inst.earliestStart ? timeToMins(inst.earliestStart) : 480;
-    const latestEnd = 1050;
-    const sortedByStart = [...blocks].sort((a, b) => timeToMins(a.time.slice(0, 5)) - timeToMins(b.time.slice(0, 5)));
-
-    let cursor = earliestStart;
-    for (const b of sortedByStart) {
-      const bStart = timeToMins(b.time.slice(0, 5));
-      const bEnd = timeToMins(b.time.slice(6, 11));
-      if (bStart > cursor) {
-        gaps.push({
-          from: minsToTime(cursor),
-          to: minsToTime(bStart),
-          lengthMins: bStart - cursor
-        });
-      }
-      cursor = Math.max(cursor, bEnd);
-    }
-    if (cursor < latestEnd) {
-      gaps.push({
-        from: minsToTime(cursor),
-        to: minsToTime(latestEnd),
-        lengthMins: latestEnd - cursor
-      });
-    }
 
     res.json({
       instructor: inst.name,
       date,
-      totalAppointments: forThisDay.length,
-      classifiedAppointments: classified,
-      summary: {
-        lessons: classified.filter(c => c.classification === "lesson").length,
-        hardBlocks: classified.filter(c => c.classification === "hard-block").length,
-        softBlocks: classified.filter(c => c.classification === "soft-block").length,
-        skipped: classified.filter(c => c.classification === "skip").length
+      queries: {
+        queryA_rowCount: resultA?.length ?? "error",
+        queryA_error: errorA,
+        queryB_rowCount: resultB?.length ?? "error",
+        queryB_error: errorB,
+        queryC_rowCount: resultC?.length ?? "error",
+        queryC_error: errorC
       },
-      availableGapsThisDay: gaps
+      mergedAppointments: classified
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message, stack: err.stack });
   }
 });
 
