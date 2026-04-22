@@ -959,32 +959,21 @@ Please pick the best 3 options and explain each clearly. If the closest instruct
 // ─── Nookal API Test Endpoint ────────────────────────────────────────────────
 app.get("/test-nookal", async (req, res) => {
   const apiKey = process.env.NOOKAL_API_KEY;
-
-  if (!apiKey) {
-    return res.json({ error: "Missing NOOKAL_API_KEY" });
-  }
+  if (!apiKey) return res.json({ error: "Missing NOOKAL_API_KEY" });
 
   const TOKEN_ENDPOINT = "https://au-apiv3.nookal.com/oauth/token";
   const GRAPHQL_ENDPOINT = "https://au-apiv3.nookal.com/graphql";
-  const results = {};
 
-  // STEP 1: Get OAuth token
+  // Get OAuth token
   let accessToken = null;
   try {
-    const tokenResponse = await axios.post(
-      TOKEN_ENDPOINT,
-      "grant_type=client_credentials",
-      {
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/x-www-form-urlencoded"
-        },
-        timeout: 10000
-      }
-    );
-    accessToken = tokenResponse.data.accessToken;
+    const tr = await axios.post(TOKEN_ENDPOINT, "grant_type=client_credentials", {
+      headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: 10000
+    });
+    accessToken = tr.data.accessToken;
   } catch (err) {
-    return res.json({ error: "Failed to get token", detail: err.response?.data || err.message });
+    return res.json({ error: "Token failed", detail: err.response?.data || err.message });
   }
 
   const gqlHeaders = {
@@ -992,99 +981,99 @@ app.get("/test-nookal", async (req, res) => {
     "Content-Type": "application/json"
   };
 
-  async function runQuery(label, query, variables = {}) {
-    try {
-      const r = await axios.post(GRAPHQL_ENDPOINT,
-        { query, variables },
-        { headers: gqlHeaders, timeout: 15000 });
-      results[label] = r.data;
-    } catch (err) {
-      results[label] = { error: err.response?.data || err.message };
-    }
+  async function gql(query) {
+    const r = await axios.post(GRAPHQL_ENDPOINT, { query }, { headers: gqlHeaders, timeout: 15000 });
+    return r.data;
   }
 
-  // TEST 1: Introspect 'appointment' type — what fields on each appointment?
-  await runQuery("appointment_schema", `
+  // 1. Introspect address type to see what fields client addresses have
+  const addressSchemaResp = await gql(`
     query {
-      __type(name: "appointment") {
-        fields { name type { name kind ofType { name kind } } }
+      __type(name: "address") {
+        fields { name type { name kind ofType { name } } }
       }
     }
   `);
 
-  // TEST 2: Introspect 'client' type — for client details lookup
-  await runQuery("client_schema", `
+  // 2. Christian's appointments Thu 23 Apr + Fri 24 Apr
+  // Christian = providerID 32, at locationID 1 (Driving Matters)
+  const apptResp = await gql(`
     query {
-      __type(name: "client") {
-        fields { name type { name kind ofType { name kind } } }
-      }
-    }
-  `);
-
-  // TEST 3: Introspect 'staff' type — for instructor info
-  await runQuery("staff_schema", `
-    query {
-      __type(name: "staff") {
-        fields { name type { name kind ofType { name kind } } }
-      }
-    }
-  `);
-
-  // TEST 4: Introspect 'availability' type — slot data
-  await runQuery("availability_schema", `
-    query {
-      __type(name: "availability") {
-        fields { name type { name kind ofType { name kind } } }
-      }
-    }
-  `);
-
-  // TEST 5: Get full locations with suburb
-  await runQuery("locations_full", `
-    query {
-      locations {
-        locationID name suburb state postcode active
-      }
-    }
-  `);
-
-  // TEST 6: Get staff list with their location IDs
-  await runQuery("staff_list", `
-    query {
-      staff {
-        staffID firstName lastName locations isProvider
-      }
-    }
-  `);
-
-  // TEST 7: Get today's appointments across all locations
-  // Request with minimal fields first so we can see the shape
-  const today = toMelbDateStr(new Date());
-  const tomorrow = toMelbDateStr(new Date(Date.now() + 24 * 3600 * 1000));
-  await runQuery("appointments_today", `
-    query {
-      appointments(dateFrom: "${today}", dateTo: "${tomorrow}") {
+      appointments(
+        dateFrom: "2026-04-23"
+        dateTo: "2026-04-24"
+        locationIDs: [1]
+        providerIDs: [32]
+        pageLength: 50
+      ) {
         apptID
         appointmentDate
         startTime
         endTime
-        locationID
-        locationName
-        providerID
-        providerName
+        status
         clientID
         clientName
         notes
-        status
       }
     }
   `);
 
+  const appointments = apptResp?.data?.appointments || [];
+
+  // 3. For every appointment that has a clientID, look up the client's address
+  const clientIDs = [...new Set(appointments.filter(a => a.clientID).map(a => a.clientID))];
+
+  const clientLookups = {};
+  for (const cid of clientIDs) {
+    try {
+      const c = await gql(`
+        query {
+          client(clientID: ${cid}) {
+            clientID
+            firstName
+            lastName
+            addresses {
+              type
+              addr1
+              addr2
+              addr3
+              city
+              state
+              postcode
+              country
+            }
+          }
+        }
+      `);
+      clientLookups[cid] = c?.data?.client;
+    } catch (err) {
+      clientLookups[cid] = { error: err.response?.data || err.message };
+    }
+  }
+
+  // 4. Build the merged view: each appointment with client's home address where available
+  const merged = appointments.map(a => {
+    const c = a.clientID ? clientLookups[a.clientID] : null;
+    // client.addresses is a list - find home address (or first one)
+    let homeAddr = null;
+    if (c && Array.isArray(c.addresses) && c.addresses.length > 0) {
+      homeAddr = c.addresses.find(ad => ad.type && ad.type.toLowerCase().includes("home")) || c.addresses[0];
+    }
+    return {
+      date: a.appointmentDate,
+      time: `${a.startTime}-${a.endTime}`,
+      status: a.status,
+      clientName: a.clientName,
+      notesFromAppt: a.notes,
+      clientHomeAddress: homeAddr
+    };
+  });
+
   res.json({
-    token_obtained: true,
-    endpoints: { token: TOKEN_ENDPOINT, graphql: GRAPHQL_ENDPOINT },
-    date_range_tested: { today, tomorrow },
-    results
+    address_schema: addressSchemaResp?.data?.__type?.fields,
+    appointments_raw: appointments,
+    client_lookups: clientLookups,
+    merged_view: merged
   });
 });
 
