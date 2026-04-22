@@ -576,7 +576,12 @@ app.post("/analyse", async (req, res) => {
   try {
     const booking = req.body;
     const clientSuburb = booking.clientSuburb || booking.suburb;
-    const requiredMods = booking.modifications || booking.requiredMods || [];
+    // Accept both array and comma-separated string for mods
+    let requiredMods = booking.modifications || booking.requiredMods || [];
+    if (typeof requiredMods === "string") {
+      requiredMods = requiredMods.split(",").map(s => s.trim()).filter(Boolean);
+    }
+    if (!Array.isArray(requiredMods)) requiredMods = [];
     const durationMins = parseInt(booking.lessonDuration || booking.duration || 60);
     const availString = booking.availability || "";
 
