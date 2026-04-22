@@ -207,43 +207,31 @@ async function getClientAddress(clientID) {
 
 // ─── Appointment Classification ──────────────────────────────────────────────
 // Returns: "lesson" | "hard-block" | "soft-block" | "skip"
-// hard-block = day off, holiday, personal, school pickup (never book during)
-// soft-block = Time Held / HOLD for X (blocks time but note for admin review)
+// Since Nookal API doesn't expose Event titles/categories reliably, we treat
+// ALL Events as blocks based on duration and time-of-day heuristics.
 function classifyAppointment(a) {
   if (a.status === "StdAppt") return "lesson";
   if (a.status === "Cancelled") return "skip";
   if (a.status === "Note") return "skip";
 
   if (a.status === "Event") {
-    const summary = (a.notes || "") + " " + (a.typeName || "");
-    const lower = summary.toLowerCase();
+    const startM = timeToMins(a.startTime.slice(0, 5));
+    const endM = timeToMins(a.endTime.slice(0, 5));
+    const durationMins = endM - startM;
 
-    if (!summary.trim()) return "skip"; // blank event = free time
+    // Long Events (>= 4 hours) = definitely a holiday/day-off/all-day block — hard block
+    if (durationMins >= 240) return "hard-block";
 
-    // Hard block signals — never touch this time
-    const hardBlockSignals = [
-      "day off", "dayoff", "no lessons", "no lesson",
-      "private stuff", "private work", "non-sdt",
-      "school pick up", "school pickup", "school run",
-      "holiday", "holidays", "leave", "bali", "trip",
-      "sick", "medical appointment", "personal",
-      "car service", "unavailable", "away",
-      "total ability van", "smartbox"
-    ];
-    const isHard = hardBlockSignals.some(sig => lower.includes(sig));
-    if (isHard) return "hard-block";
+    // Very early or very late Events (before 7am or after 6pm) that are short
+    // are often personal things (school pickup, etc) — hard block
+    if (endM <= 420 || startM >= 1080) return "hard-block";
 
-    // Soft block: Time Held, Hold for X, Community OT holds, Active One holds
-    // These block time but admin may override if the hold relates to our client
-    const softBlockSignals = [
-      "hold for", "time held", "community ot", "commot",
-      "active one", "activeone", "ax with", "clinic"
-    ];
-    const isSoft = softBlockSignals.some(sig => lower.includes(sig));
-    if (isSoft) return "soft-block";
+    // Short Events during working hours — could be Time Held, Hold for X, or
+    // a personal item like a medical appointment. We can't distinguish without
+    // the title text, so treat as soft-block (blocks time, flags for admin)
+    if (durationMins > 0) return "soft-block";
 
-    // Any other event with content = treat as hard block by default
-    return "hard-block";
+    return "skip";
   }
 
   return "skip";
@@ -927,6 +915,88 @@ app.post("/clear-cache", (req, res) => {
   cachedToken = null;
   cachedTokenExpiry = 0;
   res.json({ cleared: before });
+});
+
+// ─── Classification Test: shows how the system classifies each appointment ──
+// Usage: /test-classify?instructor=Gabriel&date=2026-04-28
+// Shows: raw appointments → classification → which are kept as blocks/lessons
+app.get("/test-classify", async (req, res) => {
+  try {
+    const instructorName = req.query.instructor;
+    const date = req.query.date;
+    if (!instructorName || !date) {
+      return res.json({ error: "Usage: /test-classify?instructor=Gabriel&date=2026-04-28" });
+    }
+    const inst = INSTRUCTORS.find(i => i.name.toLowerCase() === instructorName.toLowerCase());
+    if (!inst) return res.json({ error: `Instructor '${instructorName}' not found` });
+
+    const dateObj = new Date(date + "T12:00:00+10:00");
+    const nextDay = new Date(dateObj.getTime() + 24 * 3600 * 1000);
+    const dateTo = toMelbDateStr(nextDay);
+
+    const rawAppts = await getAppointmentsForInstructor(inst, date, dateTo);
+    const forThisDay = rawAppts.filter(a => a.appointmentDate === date);
+
+    const classified = forThisDay.map(a => {
+      const cls = classifyAppointment(a);
+      const startM = timeToMins(a.startTime.slice(0, 5));
+      const endM = timeToMins(a.endTime.slice(0, 5));
+      return {
+        time: `${a.startTime.slice(0,5)}-${a.endTime.slice(0,5)}`,
+        durationMins: endM - startM,
+        status: a.status,
+        client: a.clientName || null,
+        notes: a.notes || null,
+        classification: cls,
+        blocksTime: cls === "lesson" || cls === "hard-block" || cls === "soft-block",
+        adminReviewFlag: cls === "soft-block"
+      };
+    }).sort((x, y) => timeToMins(x.time.slice(0, 5)) - timeToMins(y.time.slice(0, 5)));
+
+    // Also compute resulting gaps so we can see what windows remain
+    const blocks = classified.filter(c => c.blocksTime);
+    const gaps = [];
+    const earliestStart = inst.earliestStart ? timeToMins(inst.earliestStart) : 480;
+    const latestEnd = 1050;
+    const sortedByStart = [...blocks].sort((a, b) => timeToMins(a.time.slice(0, 5)) - timeToMins(b.time.slice(0, 5)));
+
+    let cursor = earliestStart;
+    for (const b of sortedByStart) {
+      const bStart = timeToMins(b.time.slice(0, 5));
+      const bEnd = timeToMins(b.time.slice(6, 11));
+      if (bStart > cursor) {
+        gaps.push({
+          from: minsToTime(cursor),
+          to: minsToTime(bStart),
+          lengthMins: bStart - cursor
+        });
+      }
+      cursor = Math.max(cursor, bEnd);
+    }
+    if (cursor < latestEnd) {
+      gaps.push({
+        from: minsToTime(cursor),
+        to: minsToTime(latestEnd),
+        lengthMins: latestEnd - cursor
+      });
+    }
+
+    res.json({
+      instructor: inst.name,
+      date,
+      totalAppointments: forThisDay.length,
+      classifiedAppointments: classified,
+      summary: {
+        lessons: classified.filter(c => c.classification === "lesson").length,
+        hardBlocks: classified.filter(c => c.classification === "hard-block").length,
+        softBlocks: classified.filter(c => c.classification === "soft-block").length,
+        skipped: classified.filter(c => c.classification === "skip").length
+      },
+      availableGapsThisDay: gaps
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ─── Diagnostic: show exactly what the system sees for one instructor/day ────
