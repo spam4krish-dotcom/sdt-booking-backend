@@ -234,7 +234,33 @@ document.getElementById("subBtn").addEventListener("click", function(){
   })
   .then(r => r.json().then(data => ({ ok: r.ok, status: r.status, data })))
   .then(result => {
-    if (!result.ok) throw new Error(result.data.error || "Server error: " + result.status);
+    if (!result.ok) {
+      // Structured error from backend
+      const errType = result.data.errorType || "general";
+      const errMsg = result.data.error || "Unknown error";
+      const errTitles = {
+        auth: "Authentication Error",
+        credits: "Anthropic Credits Exhausted",
+        rate_limit: "Rate Limit Reached",
+        nookal: "Nookal API Error",
+        timeout: "Request Timed Out",
+        network: "Network Error",
+        validation: "Missing Information",
+        general: "Error Occurred"
+      };
+      const title = errTitles[errType] || "Error Occurred";
+      const actions = {
+        auth: "Check that Railway environment variables (NOOKAL_API_KEY, ANTHROPIC_API_KEY) are correct and haven't expired.",
+        credits: "Top up Anthropic credits at console.anthropic.com, then try again.",
+        rate_limit: "Wait 30 seconds and try again.",
+        nookal: "Check Nookal API status. Keys may need to be regenerated in Nookal settings.",
+        timeout: "The Nookal or Google Maps API is slow. Wait a moment and try again.",
+        network: "Check your internet connection and try again.",
+        validation: "Fill in the missing fields and try again.",
+        general: "Try again. If the error persists, check Railway logs."
+      };
+      throw { title, message: errMsg, action: actions[errType] || "" };
+    }
     let text = "";
     const d = result.data;
     if (d.content && d.content.length) {
@@ -245,7 +271,11 @@ document.getElementById("subBtn").addEventListener("click", function(){
     setStatus("Analysis Complete", false);
   })
   .catch(e => {
-    document.getElementById("aiOut").innerHTML = `<div class='res'><div class='rh' style='background:#fef0eb;color:#e05a2b;'>Error Occurred</div><div class='rb'>${esc(e.message)}</div></div>`;
+    const title = e.title || "Error Occurred";
+    const message = e.message || String(e);
+    const action = e.action || "";
+    const body = action ? `${message}\n\nSuggested action: ${action}` : message;
+    document.getElementById("aiOut").innerHTML = `<div class='res'><div class='rh' style='background:#fef0eb;color:#e05a2b;'>⚠️ ${esc(title)}</div><div class='rb'>${esc(body)}</div></div>`;
     setStatus("Error", false);
   })
   .finally(() => { btn.disabled = false; });
