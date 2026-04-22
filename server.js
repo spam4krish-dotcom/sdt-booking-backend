@@ -969,7 +969,7 @@ app.get("/test-nookal", async (req, res) => {
   const GRAPHQL_ENDPOINT = "https://au-apiv3.nookal.com/graphql";
   const results = {};
 
-  // STEP 1: Get OAuth access token using client_credentials grant
+  // STEP 1: Get OAuth access token
   let accessToken = null;
   try {
     const tokenResponse = await axios.post(
@@ -983,58 +983,72 @@ app.get("/test-nookal", async (req, res) => {
         timeout: 10000
       }
     );
-    results.token_request = {
-      status: tokenResponse.status,
-      data: tokenResponse.data
-    };
-    accessToken = tokenResponse.data.access_token || tokenResponse.data.accessToken;
+    accessToken = tokenResponse.data.accessToken || tokenResponse.data.access_token;
+    results.token_obtained = !!accessToken;
   } catch (err) {
-    results.token_request = {
+    results.token_request_error = {
       status: err.response?.status,
-      error: err.message,
-      detail: typeof err.response?.data === "string"
-        ? err.response.data.substring(0, 500)
-        : err.response?.data
+      detail: err.response?.data || err.message
     };
+    return res.json(results);
   }
 
-  // STEP 2: Use the token to query locations (if we got one)
-  if (accessToken) {
-    try {
-      const locResponse = await axios.post(
-        GRAPHQL_ENDPOINT,
-        { query: `query { locations { id name status } }` },
-        {
-          headers: {
-            "Authorization": `Bearer ${accessToken}`,
-            "Content-Type": "application/json"
-          },
-          timeout: 10000
+  const gqlHeaders = {
+    "Authorization": `Bearer ${accessToken}`,
+    "Content-Type": "application/json"
+  };
+
+  // STEP 2: Introspect schema — what fields does 'location' type have?
+  try {
+    const introspectQuery = `
+      query {
+        __type(name: "location") {
+          name
+          fields {
+            name
+            type { name kind }
+          }
         }
-      );
-      results.locations_query = {
-        status: locResponse.status,
-        data: locResponse.data
-      };
-    } catch (err) {
-      results.locations_query = {
-        status: err.response?.status,
-        error: err.message,
-        detail: typeof err.response?.data === "string"
-          ? err.response.data.substring(0, 500)
-          : err.response?.data
-      };
-    }
-  } else {
-    results.locations_query = { skipped: "No access token received from step 1" };
+      }
+    `;
+    const r = await axios.post(GRAPHQL_ENDPOINT, { query: introspectQuery }, { headers: gqlHeaders, timeout: 10000 });
+    results.location_schema = r.data;
+  } catch (err) {
+    results.location_schema = { error: err.response?.data || err.message };
+  }
+
+  // STEP 3: Introspect top-level query fields — what queries are available?
+  try {
+    const queryListQuery = `
+      query {
+        __schema {
+          queryType {
+            fields {
+              name
+              args { name type { name kind } }
+            }
+          }
+        }
+      }
+    `;
+    const r = await axios.post(GRAPHQL_ENDPOINT, { query: queryListQuery }, { headers: gqlHeaders, timeout: 10000 });
+    results.available_queries = r.data;
+  } catch (err) {
+    results.available_queries = { error: err.response?.data || err.message };
+  }
+
+  // STEP 4: Try a simple locations query with just 'name'
+  try {
+    const r = await axios.post(GRAPHQL_ENDPOINT, {
+      query: `query { locations { name } }`
+    }, { headers: gqlHeaders, timeout: 10000 });
+    results.locations_simple = r.data;
+  } catch (err) {
+    results.locations_simple = { error: err.response?.data || err.message };
   }
 
   res.json({
-    endpoints: {
-      token: TOKEN_ENDPOINT,
-      graphql: GRAPHQL_ENDPOINT
-    },
-    api_key_length: apiKey?.length,
+    endpoints: { token: TOKEN_ENDPOINT, graphql: GRAPHQL_ENDPOINT },
     client_id: clientId,
     results
   });
