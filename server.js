@@ -1326,6 +1326,224 @@ app.post("/clear-cache", (req, res) => {
 });
 
 
+// ─── Deep diagnostic: full trace of slot calculation for one day ───────────
+// Usage: /debug-slot?instructor=Gabriel&date=2026-06-01&clientSuburb=Dandenong
+// Returns complete trace: appointments, gaps, travel calcs, buffer, snap, final times
+app.get("/debug-slot", async (req, res) => {
+  try {
+    const instructorName = req.query.instructor;
+    const date = req.query.date;
+    const clientSuburb = req.query.clientSuburb || req.query.suburb || "Melbourne";
+    const durationMins = parseInt(req.query.duration || "60");
+
+    if (!instructorName || !date) {
+      return res.json({
+        error: "Usage: /debug-slot?instructor=Gabriel&date=2026-06-01&clientSuburb=Dandenong&duration=60"
+      });
+    }
+    const inst = INSTRUCTORS.find(i => i.name.toLowerCase() === instructorName.toLowerCase());
+    if (!inst) return res.json({ error: `Instructor '${instructorName}' not found` });
+
+    const dateObj = new Date(date + "T12:00:00+10:00");
+    const nextDay = new Date(dateObj.getTime() + 24 * 3600 * 1000);
+    const dateTo = toMelbDateStr(nextDay);
+    const appts = await getAppointmentsForInstructor(inst, date, dateTo);
+    const forThisDay = appts.filter(a => a.appointmentDate === date);
+
+    const baseTravel = await getTravelTime(inst.base, clientSuburb);
+
+    // Classify + resolve each appointment
+    const resolved = [];
+    for (const a of forThisDay) {
+      const cls = classifyAppointment(a);
+      if (cls.kind === "skip") continue;
+
+      const startM = timeToMins(a.startTime.slice(0, 5));
+      const endM = timeToMins(a.endTime.slice(0, 5));
+      const entry = {
+        apptID: a.apptID,
+        time: `${a.startTime.slice(0,5)}-${a.endTime.slice(0,5)}`,
+        startMins: startM,
+        endMins: endM,
+        summary: a.summary,
+        description: (a.description || "").slice(0, 200),
+        kind: cls.kind,
+        label: cls.label,
+        clientName: cls.clientName || null,
+        locationForStart: inst.base,
+        locationForEnd: inst.base,
+        locationSource: "base-fallback",
+        extractedHoldClient: null
+      };
+
+      if (cls.kind === "lesson") {
+        const loc = await resolveAppointmentLocation({
+          clientName: cls.clientName || a.summary,
+          notes: a.description || a.notes
+        });
+        if (loc && !loc.unresolved) {
+          entry.locationForStart = loc.pickup || inst.base;
+          entry.locationForEnd = loc.dropoff || loc.pickup || inst.base;
+          entry.locationSource = loc.source;
+          entry.clientHomeSuburb = loc.clientHomeSuburb;
+        } else {
+          entry.locationSource = "lesson-unresolved";
+          entry.clientHomeSuburb = loc?.clientHomeSuburb || null;
+        }
+      } else if (cls.kind === "soft-block") {
+        const holdClient = extractHoldClientName(a.summary);
+        entry.extractedHoldClient = holdClient;
+        if (holdClient) {
+          const loc = await resolveAppointmentLocation({
+            clientName: holdClient,
+            notes: a.description || a.notes
+          });
+          if (loc && !loc.unresolved) {
+            entry.locationForStart = loc.pickup || inst.base;
+            entry.locationForEnd = loc.dropoff || loc.pickup || inst.base;
+            entry.locationSource = `soft-block: ${loc.source}`;
+            entry.clientHomeSuburb = loc.clientHomeSuburb;
+          } else {
+            entry.locationSource = "soft-block-unresolved-client";
+            entry.locationForStart = null;
+            entry.locationForEnd = null;
+          }
+        } else {
+          const loc = await resolveAppointmentLocation({ clientName: null, notes: a.description || a.notes });
+          if (loc && !loc.unresolved) {
+            entry.locationForStart = loc.pickup || inst.base;
+            entry.locationForEnd = loc.dropoff || loc.pickup || inst.base;
+            entry.locationSource = `soft-block-venue: ${loc.source}`;
+          }
+        }
+      }
+
+      const notesLocPreview = extractNotesLocation(a.description || a.notes);
+      entry.notesLocationParsed = notesLocPreview;
+
+      resolved.push(entry);
+    }
+
+    resolved.sort((a, b) => a.startMins - b.startMins);
+
+    const earliestStart = inst.earliestStart ? timeToMins(inst.earliestStart) : 480;
+    const latestEnd = 1050;
+    const BUFFER_MINS = 10;
+
+    const gaps = [];
+    if (resolved.length === 0) {
+      gaps.push({
+        earliestStart, latestEnd,
+        prevLoc: inst.base, nextLoc: null,
+        prevAppt: null, nextAppt: null,
+        prevAppointmentLabel: "(empty day — from base)"
+      });
+    } else {
+      if (resolved[0].startMins > earliestStart) {
+        gaps.push({
+          earliestStart, latestEnd: resolved[0].startMins,
+          prevLoc: inst.base, nextLoc: resolved[0].locationForStart,
+          prevAppt: null, nextAppt: resolved[0],
+          prevAppointmentLabel: "(first slot — from base)"
+        });
+      }
+      for (let i = 0; i < resolved.length - 1; i++) {
+        if (resolved[i + 1].startMins > resolved[i].endMins) {
+          gaps.push({
+            earliestStart: resolved[i].endMins,
+            latestEnd: resolved[i + 1].startMins,
+            prevLoc: resolved[i].locationForEnd,
+            nextLoc: resolved[i + 1].locationForStart,
+            prevAppt: resolved[i],
+            nextAppt: resolved[i + 1],
+            prevAppointmentLabel: `${resolved[i].label} (${resolved[i].kind})`
+          });
+        }
+      }
+      const last = resolved[resolved.length - 1];
+      if (last.endMins < latestEnd) {
+        gaps.push({
+          earliestStart: last.endMins, latestEnd,
+          prevLoc: last.locationForEnd, nextLoc: null,
+          prevAppt: last, nextAppt: null,
+          prevAppointmentLabel: `${last.label} (${last.kind}) — last of day`
+        });
+      }
+    }
+
+    const gapAnalysis = [];
+    for (const gap of gaps) {
+      const g = {
+        window: `${minsToTime(gap.earliestStart)}-${minsToTime(gap.latestEnd)}`,
+        windowLengthMins: gap.latestEnd - gap.earliestStart,
+        prevAppointment: gap.prevAppointmentLabel,
+        prevLocation: gap.prevLoc,
+        nextLocation: gap.nextLoc,
+        skipped: false,
+        skipReason: null
+      };
+
+      if (gap.prevLoc === null || gap.prevLoc === undefined) {
+        g.skipped = true;
+        g.skipReason = "prev location unresolved (soft-block hold client lookup failed)";
+        gapAnalysis.push(g);
+        continue;
+      }
+
+      const rawTravelIn = await getTravelTime(gap.prevLoc, clientSuburb);
+      const rawTravelOut = gap.nextLoc ? await getTravelTime(clientSuburb, gap.nextLoc) : 0;
+
+      const comingFromAppointment = gap.prevAppt != null;
+      const bufferInApplied = comingFromAppointment ? BUFFER_MINS : 0;
+      const bufferOutApplied = gap.nextLoc ? BUFFER_MINS : 0;
+
+      const travelInWithBuffer = rawTravelIn + bufferInApplied;
+      const travelOutWithBuffer = rawTravelOut + bufferOutApplied;
+
+      const rawMinStart = gap.earliestStart + travelInWithBuffer;
+      const snappedMinStart = snapTo15(rawMinStart);
+      const maxEnd = gap.latestEnd - travelOutWithBuffer;
+      const maxStart = maxEnd - durationMins;
+
+      g.calculation = {
+        prevLoc_to_clientSuburb: `${gap.prevLoc} → ${clientSuburb} = ${rawTravelIn} min (Google Maps)`,
+        clientSuburb_to_nextLoc: gap.nextLoc ? `${clientSuburb} → ${gap.nextLoc} = ${rawTravelOut} min (Google Maps)` : "(no next appt)",
+        comingFromAppointment,
+        bufferInApplied: `${bufferInApplied} min (${comingFromAppointment ? "has prev appt" : "from base, no buffer"})`,
+        bufferOutApplied: `${bufferOutApplied} min`,
+        gapEarliestStart: `${minsToTime(gap.earliestStart)} (${gap.earliestStart} min)`,
+        travelInWithBuffer: `${travelInWithBuffer} min (${rawTravelIn} travel + ${bufferInApplied} buffer)`,
+        rawMinStart: `${minsToTime(rawMinStart)} (${rawMinStart} min)`,
+        snappedMinStart: `${minsToTime(snappedMinStart)} (${snappedMinStart} min)`,
+        maxEnd: `${minsToTime(maxEnd)} (${maxEnd} min)`,
+        maxStart: `${minsToTime(maxStart)} (${maxStart} min)`,
+        slotFits: snappedMinStart <= maxStart,
+        slotFitsExplanation: snappedMinStart <= maxStart
+          ? `✅ slot fits — earliest start ${minsToTime(snappedMinStart)}, max start ${minsToTime(maxStart)}`
+          : `❌ slot too tight — earliest start ${minsToTime(snappedMinStart)} > max start ${minsToTime(maxStart)}`
+      };
+
+      gapAnalysis.push(g);
+    }
+
+    res.json({
+      instructor: inst.name,
+      instructorBase: inst.base,
+      date,
+      clientSuburb,
+      durationMins,
+      baseTravel_minutes: baseTravel,
+      earliestStart: minsToTime(earliestStart),
+      latestEnd: minsToTime(latestEnd),
+      bufferRule: "10 min buffer applied only when coming from a previous appointment (not from base)",
+      resolvedAppointments: resolved,
+      gapAnalysis
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
 // ─── Debug: show classification for one instructor/day ──────────────────────
 // Usage: /debug-day?instructor=Gabriel&date=2026-04-28
 app.get("/debug-day", async (req, res) => {
