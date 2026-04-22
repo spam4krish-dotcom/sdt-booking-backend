@@ -1033,7 +1033,7 @@ app.get("/test-nookal", async (req, res) => {
             firstName
             lastName
             addresses {
-              type
+              addrID
               addr1
               addr2
               addr3
@@ -1041,6 +1041,8 @@ app.get("/test-nookal", async (req, res) => {
               state
               postcode
               country
+              isDefault
+              active
             }
           }
         }
@@ -1054,10 +1056,12 @@ app.get("/test-nookal", async (req, res) => {
   // 4. Build the merged view: each appointment with client's home address where available
   const merged = appointments.map(a => {
     const c = a.clientID ? clientLookups[a.clientID] : null;
-    // client.addresses is a list - find home address (or first one)
+    // Find default address (isDefault === 1), or active, or first
     let homeAddr = null;
     if (c && Array.isArray(c.addresses) && c.addresses.length > 0) {
-      homeAddr = c.addresses.find(ad => ad.type && ad.type.toLowerCase().includes("home")) || c.addresses[0];
+      homeAddr = c.addresses.find(ad => ad.isDefault === 1)
+              || c.addresses.find(ad => ad.active === "1" || ad.active === 1)
+              || c.addresses[0];
     }
     return {
       date: a.appointmentDate,
@@ -1065,7 +1069,12 @@ app.get("/test-nookal", async (req, res) => {
       status: a.status,
       clientName: a.clientName,
       notesFromAppt: a.notes,
-      clientHomeAddress: homeAddr
+      clientHomeAddress: homeAddr ? {
+        address: [homeAddr.addr1, homeAddr.addr2, homeAddr.addr3].filter(Boolean).join(" "),
+        suburb: homeAddr.city,
+        state: homeAddr.state,
+        postcode: homeAddr.postcode
+      } : null
     };
   });
 
