@@ -267,6 +267,53 @@ async function getClientAddress(clientID) {
   }
 }
 
+// Known Nookal consultation types — any event with a description starting
+// with one of these is DEFINITELY a real lesson, regardless of summary content.
+// This is an authoritative whitelist (user-provided).
+const KNOWN_CONSULTATION_TYPES = [
+  "Driving Assesst- Privately Paying - NEW",
+  "Driver Training- Privately Paying - NEW",
+  "Driving Ax-Initial NDIS, OT or Pvte - NEW",
+  "Driving Ax - Follow-up NDIS, OT or Pvte - NEW",
+  "Driver Training for NDIS Participant- CURRENT",
+  "Ax/ReAx post NDIS lessons from existing funds",
+  "Driver Training for NDIS Self-Payer - Legacy",
+  "Driving Ax-Initial NDIS, OT or Pvte - 2023/24",
+  "Driving Ax - Follow-up NDIS, OT or Pvte-23/24",
+  "Driver Assessment for TAC claimant - 2025/26",
+  "Driver Training for TAC claimant - 2025/26",
+  "Travel to/from for TAC claimant - 2025/26",
+  "Driving Assessment for WCover client - 25/26",
+  "Driver Training for WCover client -2025/26",
+  "Travel time for WCover client - 2025/26",
+  "Van Driver Training for NDIS Participant-curr",
+  "METEC Hiring Fee",
+  "Learner Permit Training - Current",
+  "Driving Ax - Pvte Client (by arrangement",
+  "Driver Training - Pvte Client (by arrangement",
+  "Driver Training for NDIS Self-Payer ($200)",
+  "D/Training for NDIS Participant (full hr)",
+  "Driving Assessment for DVA client (regional)",
+  "Driver Training for DVA client",
+  "Driver Training for DVA client (regional)",
+  "Specialist van usage - Assessment",
+  "Specialist van usage - Training",
+  "Pvte lesson",
+  "Free lesson",
+  "D/Training for NDIS Participant (by arrangeme",
+  "Travel Time Fee",
+  "Driver Training- Private Paying Client-23/24",
+  "Driving Assesst- Private Paying Client-23/24",
+  "Travel for NDIS Participant-current"
+];
+
+// Check if description starts with any known consultation type
+function hasKnownConsultationType(description) {
+  if (!description) return false;
+  const descLower = description.toLowerCase();
+  return KNOWN_CONSULTATION_TYPES.some(ct => descLower.startsWith(ct.toLowerCase()));
+}
+
 // ─── Appointment Classification ──────────────────────────────────────────────
 // Returns: { kind, clientName, displayLabel }
 //   kind: "lesson" | "hard-block" | "soft-block" | "skip"
@@ -287,19 +334,44 @@ function classifyAppointment(a) {
     return { kind: "skip", reason: "empty" };
   }
 
+  // ─── AUTHORITATIVE LESSON CHECK ───
+  // If description starts with a known consultation type, this is DEFINITELY a lesson.
+  // This takes precedence over keyword heuristics to prevent false classifications
+  // (e.g. client name "Lucas Tripicchio" containing the substring "trip").
+  if (hasKnownConsultationType(description)) {
+    return {
+      kind: "lesson",
+      clientName: summary,
+      label: summary
+    };
+  }
+
+  // ─── Anything prefixed with "Event - " is ALWAYS a diary event, never a lesson ───
+  // Nookal convention: client lessons use just the client name ("Aaron Cutajar"),
+  // all other diary items are prefixed with "Event - ".
+  const isEventPrefixed = /^event\s*[-–]/i.test(summary);
+
   // ─── Hard blocks (never suggest during this time) ───
+  // Use WORD BOUNDARY matching on summary only — avoids false positives where
+  // a client's name contains a substring like "trip" (from "Tripicchio").
   const hardBlockSignals = [
     "day off", "dayoff", "no lessons", "no lesson",
     "private stuff", "private work", "non-sdt", "non sdt",
     "school pick up", "school pickup", "school run",
-    "holiday", "holidays", "leave", "bali", "trip",
-    "sick", "medical", "personal",
-    "car service", "unavailable", "away", "off sick",
+    "holiday", "holidays", "leave", "sick",
+    "medical appointment", "medical",
+    "car service", "unavailable",
     "total ability van", "smartbox", "lagos holiday",
-    "lunch break", "lunch"
+    "lunch break"
   ];
   const hardBlockCategories = ["holidays", "non-sdt work", "medical", "prefer not to work", "van booking"];
-  const isHardBySignal = hardBlockSignals.some(sig => summaryLower.includes(sig));
+
+  // Match with word boundaries where possible
+  const hardBlockRegex = new RegExp(
+    "\\b(" + hardBlockSignals.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+")).join("|") + ")\\b",
+    "i"
+  );
+  const isHardBySignal = hardBlockRegex.test(summary);
   const isHardByCategory = categories.some(cat => hardBlockCategories.includes(cat));
   if (isHardBySignal || isHardByCategory) {
     return { kind: "hard-block", reason: "unavailable time", label: summary };
@@ -307,35 +379,71 @@ function classifyAppointment(a) {
 
   // ─── Soft blocks (Time Held / holds — admin may override for specific clients) ───
   const softBlockSignals = [
-    "hold for", "hold ", "time held",
+    "hold for", "time held",
     "community ot", "commot", "comm ot",
     "active one", "activeone",
     "hold ax", "holding spot", "holding time", "holding regular"
   ];
   const softBlockCategories = ["time held", "general", "hold time for test", "miscellaneous"];
-  const isSoftBySignal = softBlockSignals.some(sig => summaryLower.includes(sig));
+
+  // Use regex with word boundaries
+  const softBlockRegex = new RegExp(
+    "\\b(" + softBlockSignals.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+")).join("|") + ")\\b",
+    "i"
+  );
+  // "Hold " without "for" — check summary starts with "Hold" followed by space
+  const startsWithHold = /^hold\s+[A-Z]/i.test(summary);
+  const isSoftBySignal = softBlockRegex.test(summary) || startsWithHold;
   const isSoftByCategory = categories.some(cat => softBlockCategories.includes(cat));
   if (isSoftBySignal || isSoftByCategory) {
     return { kind: "soft-block", reason: "reserved/hold", label: summary };
   }
 
-  // ─── Anything prefixed with "Event - " is ALWAYS a diary event, never a lesson ───
-  // This is Nookal's convention: client lessons use just the client name ("Aaron Cutajar"),
-  // while all other diary items are prefixed with "Event - ". If we got here and the
-  // summary starts with "Event -", it's a block we didn't match by keyword — default
-  // to hard-block (safer than suggesting a booking over it).
-  if (/^event\s*[-–]/i.test(summary)) {
+  // ─── "Event - X" prefix without a matched keyword → default to hard-block ───
+  if (isEventPrefixed) {
     return { kind: "hard-block", reason: "diary event (unmatched keyword)", label: summary };
   }
 
-  // ─── Real client lessons ───
+  // ─── Real client lessons (fallback) ───
   // In ICS, lessons appear as events named after the client (e.g. "Jeffrey Tran")
-  // If we got here and the entry has substantial content, treat as a lesson
   return {
     kind: "lesson",
     clientName: summary,
     label: summary
   };
+}
+
+// Strip the ICS-generated prefix from a description to isolate the real
+// appointment notes. ICS descriptions typically look like:
+//   "Driver Training for NDIS Participant- CURRENT at 01:45 pm, 12/05/26 with Lucas Tripicchio at ›Driving Matters Pty Ltd.GREENVALE"
+// We want just "GREENVALE" (the real appointment notes the admin typed in).
+function stripIcsDescriptionPrefix(description) {
+  if (!description) return "";
+
+  // Pattern 1: "Event details: X" → strip "Event details: "
+  const eventDetailsMatch = description.match(/^event\s+details\s*:\s*(.*)$/is);
+  if (eventDetailsMatch) {
+    const rest = eventDetailsMatch[1];
+    // Strip "Location: ..." suffix if present
+    const locationStripped = rest.replace(/\s*Location\s*:\s*[^\n]*$/i, "").trim();
+    return locationStripped;
+  }
+
+  // Pattern 2: strip everything up to and including "Pty Ltd." (or similar)
+  // Known ICS template ends with the instructor's company name, then real notes follow
+  const ptyMatch = description.match(/(?:Pty\s*Ltd|Clinic|Office|Practice)\.?\s*(.+)$/is);
+  if (ptyMatch && ptyMatch[1].trim()) {
+    return ptyMatch[1].trim();
+  }
+
+  // Pattern 3: "with <ClientName> at <LocationName>." — take what's after
+  const withAtMatch = description.match(/\s+with\s+[^,]+?\s+at\s+[^.]+\.(.+)$/is);
+  if (withAtMatch && withAtMatch[1].trim()) {
+    return withAtMatch[1].trim();
+  }
+
+  // Fallback: return the whole thing
+  return description;
 }
 
 // ─── Location extraction from notes ──────────────────────────────────────────
@@ -346,7 +454,11 @@ function classifyAppointment(a) {
 //   3. Named venue (school/clinic/hospital/centre) → { venue, venueSuburb }
 //   4. Suburb name → { suburb }
 //   5. Nothing useful → null
-function extractNotesLocation(notes) {
+function extractNotesLocation(rawNotes) {
+  if (!rawNotes || !rawNotes.trim()) return null;
+
+  // Strip the ICS template prefix so we only search the real appointment notes
+  const notes = stripIcsDescriptionPrefix(rawNotes);
   if (!notes || !notes.trim()) return null;
 
   // ─── Priority 1: Pickup + Dropoff pattern ───
@@ -364,10 +476,18 @@ function extractNotesLocation(notes) {
 
   // ─── Priority 2: Explicit street address ───
   // Matches patterns like "251 Mountain Hwy", "5 Cashel Court - BERWICK", "12 Smith St"
-  const streetAddressMatch = notes.match(/(\d{1,5}\s+[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*\s+(?:Street|St|Road|Rd|Avenue|Ave|Drive|Dr|Court|Ct|Crescent|Cres|Place|Pl|Parade|Pde|Way|Highway|Hwy|Boulevard|Blvd|Lane|Ln|Close|Cl|Terrace|Tce))\b[,\s-]*([A-Z][A-Z\s]{2,40}?)?(?:\n|$|\.|,|;|\)|\()/);
+  const streetAddressMatch = notes.match(/(\d{1,5}\s+[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*\s+(?:Street|St|Road|Rd|Avenue|Ave|Drive|Dr|Court|Ct|Crescent|Cres|Place|Pl|Parade|Pde|Way|Highway|Hwy|Boulevard|Blvd|Lane|Ln|Close|Cl|Terrace|Tce))\b/i);
   if (streetAddressMatch) {
     const streetPart = streetAddressMatch[1].trim();
-    const suburbPart = streetAddressMatch[2] ? cleanSuburb(streetAddressMatch[2]) : null;
+    // Try to find a suburb near this address (within 50 chars)
+    const startIdx = streetAddressMatch.index;
+    const endIdx = startIdx + streetAddressMatch[0].length;
+    const nearbyContext = notes.slice(Math.max(0, startIdx - 50), Math.min(notes.length, endIdx + 80));
+    const nearbyCaps = nearbyContext.match(/\b([A-Z]{3,}(?:\s+[A-Z]{2,})*)\b/g) || [];
+    let suburbPart = null;
+    for (const caps of nearbyCaps) {
+      if (isLikelySuburb(caps)) { suburbPart = cleanSuburb(caps); break; }
+    }
     const fullAddress = suburbPart ? `${streetPart}, ${suburbPart}` : streetPart;
     return {
       kind: "address",
@@ -386,17 +506,11 @@ function extractNotesLocation(notes) {
   }
 
   // ─── Priority 3: Named venue (schools, clinics, hospitals) ───
-  // Look for keywords that indicate a specific venue, then extract the full venue name + suburb
   const venuePatterns = [
-    // "Active One FRANKSTON", "ActiveOne clinic FRANKSTON"
     /\b(active\s*one|activeone)(?:\s+clinic)?\s+([A-Z][A-Z\s]{2,40}?)(?:\n|\s+(?:at|with|ax|lesson|for|prior|to)|$|\.|,)/i,
-    // "CommOT BRUNSWICK", "Community OT BRUNSWICK EAST"
     /\b(comm\s*ot|community\s*ot)\s+([A-Z][A-Z\s]{2,40}?)(?:\n|\s+(?:at|with|ax|lesson|for|prior|to)|$|\.|,)/i,
-    // "Epworth HAWTHORN"
     /\b(epworth)\s+([A-Z][A-Z\s]{2,40}?)(?:\n|\s+(?:at|with|ax|lesson|for|prior|to)|$|\.|,)/i,
-    // "Eastern Health WANTIRNA"
     /\b(eastern\s+health|western\s+health|northern\s+health|southern\s+health)\s+([A-Z][A-Z\s]{2,40}?)(?:\n|\s+(?:at|with|ax|lesson|for|prior|to)|\(|$|\.|,)/i,
-    // "X Hospital", "X Rehab"
     /\b([A-Z][a-zA-Z]+\s+(?:Hospital|Rehab|Rehabilitation|Medical\s+Centre|Health\s+Centre))\s+([A-Z][A-Z\s]{2,40}?)?(?:\n|\s|$|\.|,)/
   ];
   for (const pattern of venuePatterns) {
@@ -415,7 +529,6 @@ function extractNotesLocation(notes) {
   }
 
   // ─── Priority 4: Street address followed by "- SUBURB" (no street type word) ───
-  // e.g. "5 Cashel Court - BERWICK"
   const dashSuburbMatch = notes.match(/(\d+\s+[A-Z][A-Za-z\s]+?)\s*[-–]\s*([A-Z][A-Z\s]{2,40}?)(?:\s*$|\n|,)/);
   if (dashSuburbMatch) {
     const streetPart = dashSuburbMatch[1].trim();
@@ -457,16 +570,46 @@ function isLikelySuburb(s) {
   if (words.length > 4) return false;
   if (!words.every(w => /^[A-Z]{2,}$/.test(w))) return false;
 
+  // Expanded blocklist — includes Nookal consultation type fragments
   const NOT_SUBURBS = new Set([
-    "HOLD", "TEST", "LESSON", "NEW", "INITIAL", "PRE", "PLEASE", "COLLECT",
-    "FROM", "HOME", "NDIS", "TAC", "SDT", "LFA", "AX", "NOT", "DO", "OFFER",
+    // Admin/workflow
+    "HOLD", "TEST", "LESSON", "LESSONS", "NEW", "INITIAL", "PRE", "PLEASE", "COLLECT",
+    "FROM", "HOME", "NOT", "DO", "OFFER", "OFFERED", "REBOOK",
+    "CONFIRMED", "CONFIRMING", "PENDING", "WL", "APPROVAL", "APPROVED",
+    // Consultation type fragments
+    "CURRENT", "CURR", "LEGACY", "PARTICIPANT", "PARTICIPANTS",
+    "TRAINING", "FOLLOW", "FOLLOWUP", "ASSESSMENT", "ASSESSMENTS", "ASSESS",
+    "PAYING", "SELF", "PAYER", "MANAGED", "CLAIMANT", "CLAIMANTS",
+    "PRIVATE", "PRIVATELY", "PVTE", "PVT", "REAX",
+    // Funding
+    "NDIS", "TAC", "WCOVER", "WORKCOVER", "DVA", "SDT", "LFA", "AX",
+    // Known blocks
     "TOTAL", "ABILITY", "VAN", "SMARTBOX", "RETURN", "HOLIDAY", "HOLIDAYS",
-    "CONFIRMED", "PRIVATE", "EASTER", "SERVICE", "AWAY", "WITH", "THE", "THIS",
-    "WILL", "HAVE", "THAT", "DRIVING", "MATTERS", "PTY", "LTD", "SCHOOL",
-    "PICKUP", "DROPOFF", "JASON", "GREG", "MARC", "CHRISTIAN", "GABRIEL",
-    "SHERRI", "YVES", "COMMOT", "ACTIVEONE", "COMMUNITY", "OT", "CLINIC",
-    "EASY", "DRIVE", "PREVIOUS", "NEXT", "EVENT", "DETAILS",
-    "FASTING", "IMED", "ULTRASOUND", "BLOOD", "MEETING", "APPOINTMENT"
+    "EASTER", "SERVICE", "AWAY", "SICK", "MEDICAL", "APPOINTMENT",
+    "METEC", "HIRING", "LEARNER", "PERMIT",
+    // Generic
+    "WITH", "THE", "THIS", "THAT", "WILL", "HAVE", "HAS", "THEIR",
+    // Company
+    "DRIVING", "MATTERS", "PTY", "LTD", "DETAILS", "LOCATION",
+    // Schools/venue stopwords
+    "SCHOOL", "COLLEGE", "GRAMMAR", "ACADEMY", "HIGH",
+    "PICKUP", "DROPOFF",
+    // Instructor names
+    "JASON", "GREG", "MARC", "CHRISTIAN", "GABRIEL", "SHERRI", "YVES",
+    "LAGOS", "SIMMONDS", "EKKEL", "SEOW", "SALZMANN",
+    // Clinic types
+    "COMMOT", "ACTIVEONE", "COMMUNITY", "OT", "CLINIC",
+    "EASY", "DRIVE", "PREVIOUS", "NEXT",
+    // Event
+    "EVENT", "EVENTS",
+    // Random note words
+    "FASTING", "IMED", "ULTRASOUND", "BLOOD", "MEETING",
+    "SATELLITE", "SPINNER", "KNOB", "ELECTRONIC",
+    "HANDCONTROLS", "LOLLIPOP", "MONARCHS", "RADIAL", "EURO", "GRIP",
+    "ACCELERATOR", "ACC", "RB", "LH", "RH", "LHS", "RHS",
+    "ONGOING", "SERIES", "FUNDING", "FUNDED",
+    "INVOICE", "PAYMENT",
+    "VICROADS"
   ]);
   return !words.some(w => NOT_SUBURBS.has(w));
 }
@@ -533,15 +676,46 @@ async function getClientByName(fullName) {
   }
 }
 
-// Helper: extract "Hold for CLIENT NAME" from a soft-block summary
+// Helper: extract "Hold for CLIENT NAME" from a soft-block summary.
+// Returns { kind, name } where kind is "client" | "venue" | null
+//   client: a real person name we should look up in Nookal
+//   venue: a clinic/location name (e.g. "Community BRUNSWICK", "Active One Frankston")
+//          — don't look up as a client, resolve via notes location instead
+//   null: couldn't extract anything useful
 function extractHoldClientName(summary) {
-  if (!summary) return null;
+  if (!summary) return { kind: null };
   // Strip "Event - " prefix first
   const cleaned = summary.replace(/^event\s*[-–]\s*/i, "").trim();
+
   // Match "Hold for X", "HOLD for X", "Hold X", "HOLD FOR X"
-  const m = cleaned.match(/^hold\s+(?:for\s+)?([A-Za-z][A-Za-z\s'-]+?)(?:\s*[-–,]|\s+\(|\s*$)/i);
-  if (m) return m[1].trim();
-  return null;
+  const m = cleaned.match(/^hold\s+(?:for\s+)?([A-Za-z][A-Za-z\s'&-]+?)(?:\s*[-–,]|\s+\(|\s+regular|\s+ax|\s+spot|\s*$)/i);
+  if (!m) return { kind: null };
+
+  const extracted = m[1].trim();
+
+  // Check if this is a venue name rather than a client name
+  // Venue indicators:
+  //   - Contains "Community", "Active One", "ActiveOne", "CommOT", "Epworth", "Eastern Health", etc.
+  //   - Has any ALL-CAPS word (client names are Proper Case, suburbs are ALL CAPS)
+  //   - Is a known clinic type
+  const venueKeywords = /\b(community|active\s*one|activeone|comm\s*ot|commot|epworth|eastern\s+health|western\s+health|hospital|rehab|clinic|centre|center|office|health)\b/i;
+  if (venueKeywords.test(extracted)) {
+    return { kind: "venue", name: extracted };
+  }
+
+  // If any word is ALL CAPS (3+ letters), it's a suburb/venue not a person
+  const words = extracted.split(/\s+/);
+  const hasAllCapsWord = words.some(w => /^[A-Z]{3,}$/.test(w));
+  if (hasAllCapsWord) {
+    return { kind: "venue", name: extracted };
+  }
+
+  // Require at least 2 words for a client name (First + Last)
+  if (words.length < 2) {
+    return { kind: null };
+  }
+
+  return { kind: "client", name: extracted };
 }
 
 // ─── Smart location resolution ───────────────────────────────────────────────
@@ -775,37 +949,61 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
         });
       }
     } else if (cls.kind === "soft-block") {
-      // Extract the client name from "Hold for X" and look them up for location
-      const holdClient = extractHoldClientName(a.summary);
-      if (holdClient) {
+      // Extract what the hold is for — either a client name or a venue
+      const held = extractHoldClientName(a.summary);
+
+      if (held.kind === "client") {
+        // Real person — look them up in Nookal
         const apptForResolve = {
-          clientName: holdClient,
+          clientName: held.name,
           notes: a.description || a.notes
         };
         const loc = await resolveAppointmentLocation(apptForResolve);
         if (loc && !loc.unresolved) {
           locStart = loc.pickup || inst.base;
           locEnd = loc.dropoff || loc.pickup || inst.base;
-          locationSource = `soft-block: ${loc.source}`;
+          locationSource = `soft-block-client: ${loc.source}`;
         } else {
-          // Hold found but can't determine location — alert admin
+          // Client name extracted but lookup failed — admin alert
           adminAlerts.push({
             date: a.appointmentDate,
             time: `${a.startTime.slice(0, 5)}-${a.endTime.slice(0, 5)}`,
-            issue: "unresolved-hold-location",
-            details: `Found a hold for "${holdClient}" but could not determine their location. Cannot verify travel feasibility for nearby slots on this day.`
+            issue: "unresolved-hold-client",
+            details: `Found a hold for client "${held.name}" but could not locate them in Nookal. Travel times for slots near this hold cannot be verified.`
           });
-          locStart = null; locEnd = null; // explicitly null so later logic knows
+          locStart = null; locEnd = null;
         }
-      } else {
-        // Hold but no client name extractable (e.g. "Active One Frankston")
-        // Try notes location directly
-        const apptForResolve = { clientName: null, notes: a.description || a.notes };
+      } else if (held.kind === "venue") {
+        // Venue hold (e.g. "Community BRUNSWICK", "Active One Frankston")
+        // Don't try to look up as a client — resolve via notes/summary text
+        const apptForResolve = {
+          clientName: null,
+          notes: a.description || a.summary || ""
+        };
         const loc = await resolveAppointmentLocation(apptForResolve);
         if (loc && !loc.unresolved) {
           locStart = loc.pickup || inst.base;
           locEnd = loc.dropoff || loc.pickup || inst.base;
           locationSource = `soft-block-venue: ${loc.source}`;
+        } else {
+          // Venue hold but we can't resolve its location either — just block time
+          // Admin will see soft-blocks listed in review section
+          locStart = inst.base;
+          locEnd = inst.base;
+          locationSource = "soft-block-venue-unresolved";
+        }
+      } else {
+        // Couldn't parse the hold — try notes anyway
+        const apptForResolve = { clientName: null, notes: a.description || a.notes };
+        const loc = await resolveAppointmentLocation(apptForResolve);
+        if (loc && !loc.unresolved) {
+          locStart = loc.pickup || inst.base;
+          locEnd = loc.dropoff || loc.pickup || inst.base;
+          locationSource = `soft-block-fallback: ${loc.source}`;
+        } else {
+          locStart = inst.base;
+          locEnd = inst.base;
+          locationSource = "soft-block-no-data";
         }
       }
     }
@@ -1326,6 +1524,65 @@ app.post("/clear-cache", (req, res) => {
 });
 
 
+// ─── Raw ICS dump: show every field the ICS feed exposes for one day ──────
+// Usage: /debug-raw-ics?instructor=Greg&date=2026-05-08
+// Returns the raw node-ical VEVENT objects so we can see exactly what's available
+app.get("/debug-raw-ics", async (req, res) => {
+  try {
+    const instructorName = req.query.instructor;
+    const date = req.query.date;
+    if (!instructorName || !date) {
+      return res.json({ error: "Usage: /debug-raw-ics?instructor=Greg&date=2026-05-08" });
+    }
+    const inst = INSTRUCTORS.find(i => i.name.toLowerCase() === instructorName.toLowerCase());
+    if (!inst) return res.json({ error: `Instructor '${instructorName}' not found` });
+
+    // Fetch raw ICS data
+    const rawData = await fetchICSForInstructor(inst);
+    const targetDate = new Date(date + "T00:00:00+10:00");
+    const targetDateEnd = new Date(date + "T23:59:59+10:00");
+
+    const eventsOnDay = [];
+    for (const [uid, event] of Object.entries(rawData)) {
+      if (event.type !== "VEVENT") continue;
+      if (!event.start || !event.end) continue;
+      const eventStart = new Date(event.start);
+      if (eventStart < targetDate || eventStart > targetDateEnd) continue;
+
+      // Dump EVERY property on this VEVENT object
+      const allFields = {};
+      for (const key of Object.keys(event)) {
+        const val = event[key];
+        // Stringify dates, keep primitives as-is, ignore functions
+        if (val instanceof Date) {
+          allFields[key] = val.toISOString();
+        } else if (typeof val === "function") {
+          continue;
+        } else if (typeof val === "object" && val !== null) {
+          try { allFields[key] = JSON.parse(JSON.stringify(val)); }
+          catch { allFields[key] = String(val); }
+        } else {
+          allFields[key] = val;
+        }
+      }
+      eventsOnDay.push({
+        time: `${new Date(event.start).toLocaleTimeString("en-AU", { timeZone: "Australia/Melbourne", hour: "2-digit", minute: "2-digit", hour12: false })}-${new Date(event.end).toLocaleTimeString("en-AU", { timeZone: "Australia/Melbourne", hour: "2-digit", minute: "2-digit", hour12: false })}`,
+        summary: event.summary,
+        allRawFields: allFields
+      });
+    }
+
+    res.json({
+      instructor: inst.name,
+      date,
+      eventCount: eventsOnDay.length,
+      events: eventsOnDay
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
 // ─── Deep diagnostic: full trace of slot calculation for one day ───────────
 // Usage: /debug-slot?instructor=Gabriel&date=2026-06-01&clientSuburb=Dandenong
 // Returns complete trace: appointments, gaps, travel calcs, buffer, snap, final times
@@ -1391,29 +1648,41 @@ app.get("/debug-slot", async (req, res) => {
           entry.clientHomeSuburb = loc?.clientHomeSuburb || null;
         }
       } else if (cls.kind === "soft-block") {
-        const holdClient = extractHoldClientName(a.summary);
-        entry.extractedHoldClient = holdClient;
-        if (holdClient) {
+        const held = extractHoldClientName(a.summary);
+        entry.extractedHoldClient = held;
+        if (held.kind === "client") {
           const loc = await resolveAppointmentLocation({
-            clientName: holdClient,
+            clientName: held.name,
             notes: a.description || a.notes
           });
           if (loc && !loc.unresolved) {
             entry.locationForStart = loc.pickup || inst.base;
             entry.locationForEnd = loc.dropoff || loc.pickup || inst.base;
-            entry.locationSource = `soft-block: ${loc.source}`;
+            entry.locationSource = `soft-block-client: ${loc.source}`;
             entry.clientHomeSuburb = loc.clientHomeSuburb;
           } else {
-            entry.locationSource = "soft-block-unresolved-client";
+            entry.locationSource = "soft-block-client-lookup-failed";
             entry.locationForStart = null;
             entry.locationForEnd = null;
+          }
+        } else if (held.kind === "venue") {
+          const loc = await resolveAppointmentLocation({
+            clientName: null,
+            notes: a.description || a.summary || ""
+          });
+          if (loc && !loc.unresolved) {
+            entry.locationForStart = loc.pickup || inst.base;
+            entry.locationForEnd = loc.dropoff || loc.pickup || inst.base;
+            entry.locationSource = `soft-block-venue: ${loc.source}`;
+          } else {
+            entry.locationSource = "soft-block-venue-unresolved";
           }
         } else {
           const loc = await resolveAppointmentLocation({ clientName: null, notes: a.description || a.notes });
           if (loc && !loc.unresolved) {
             entry.locationForStart = loc.pickup || inst.base;
             entry.locationForEnd = loc.dropoff || loc.pickup || inst.base;
-            entry.locationSource = `soft-block-venue: ${loc.source}`;
+            entry.locationSource = `soft-block-fallback: ${loc.source}`;
           }
         }
       }
@@ -1595,21 +1864,27 @@ app.get("/debug-day", async (req, res) => {
           unresolved: loc.unresolved || false
         } : null;
       } else if (cls.kind === "soft-block") {
-        const holdClient = extractHoldClientName(a.summary);
-        if (holdClient) {
-          const loc = await resolveAppointmentLocation({
-            clientName: holdClient,
+        const held = extractHoldClientName(a.summary);
+        entry.holdClient = held;
+        let loc = null;
+        if (held.kind === "client") {
+          loc = await resolveAppointmentLocation({
+            clientName: held.name,
             notes: a.description || a.notes
           });
-          entry.holdClient = holdClient;
-          entry.resolvedLocation = loc ? {
-            pickup: loc.pickup,
-            dropoff: loc.dropoff,
-            source: loc.source,
-            clientHomeSuburb: loc.clientHomeSuburb,
-            unresolved: loc.unresolved || false
-          } : { unresolved: true };
+        } else if (held.kind === "venue") {
+          loc = await resolveAppointmentLocation({
+            clientName: null,
+            notes: a.description || a.summary || ""
+          });
         }
+        entry.resolvedLocation = loc ? {
+          pickup: loc.pickup,
+          dropoff: loc.dropoff,
+          source: loc.source,
+          clientHomeSuburb: loc.clientHomeSuburb,
+          unresolved: loc.unresolved || false
+        } : { unresolved: true };
       }
 
       classified.push(entry);
