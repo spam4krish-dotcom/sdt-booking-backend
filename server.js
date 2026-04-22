@@ -941,60 +941,68 @@ app.get("/debug-day", async (req, res) => {
     const inst = INSTRUCTORS.find(i => i.name.toLowerCase() === instructorName.toLowerCase());
     if (!inst) return res.json({ error: `Instructor '${instructorName}' not found` });
 
-    // Fetch raw appointments for this one day
-    const rawAppts = await getAppointmentsForInstructor(inst, date, date);
-
-    // Classify each one and show the reasoning
-    const classified = rawAppts.map(a => {
-      const cls = classifyAppointment(a);
-      return {
-        apptID: a.apptID,
-        start: a.startTime,
-        end: a.endTime,
-        status: a.status,
-        typeName: a.typeName,
-        clientID: a.clientID,
-        clientName: a.clientName,
-        notes: a.notes,
-        classification: cls,
-        startMins: timeToMins(a.startTime.slice(0, 5)),
-        endMins: timeToMins(a.endTime.slice(0, 5))
-      };
-    });
-
-    // Compute gaps the same way findAvailableSlots does
-    const relevant = classified.filter(a => a.classification !== "skip");
-    const sorted = [...relevant].sort((a, b) => a.startMins - b.startMins);
-
-    const gaps = [];
-    const earliestStart = inst.earliestStart ? timeToMins(inst.earliestStart) : 480;
-
-    if (sorted.length === 0) {
-      gaps.push({ from: minsToTime(earliestStart), to: "17:30", reason: "empty day" });
-    } else {
-      if (sorted[0].startMins > earliestStart) {
-        gaps.push({
-          from: minsToTime(earliestStart),
-          to: sorted[0].start.slice(0, 5),
-          reason: `before first appt (${sorted[0].clientName || sorted[0].notes?.slice(0, 30) || sorted[0].classification})`
-        });
-      }
-      for (let i = 0; i < sorted.length - 1; i++) {
-        if (sorted[i + 1].startMins > sorted[i].endMins) {
-          gaps.push({
-            from: sorted[i].end.slice(0, 5),
-            to: sorted[i + 1].start.slice(0, 5),
-            reason: `between ${sorted[i].classification} and ${sorted[i + 1].classification}`
-          });
+    // Fetch appointments with EVERY possible field the API exposes
+    const fullQuery = `
+      query {
+        appointments(
+          locationIDs: [${inst.locationID}]
+          providerIDs: [${inst.providerID}]
+          dateFrom: "${date}"
+          dateTo: "${date}"
+          pageLength: 100
+        ) {
+          apptID
+          appointmentDate
+          startTime
+          endTime
+          status
+          clientID
+          clientName
+          providerID
+          providerName
+          caseID
+          caseName
+          isNewClient
+          isNewCase
+          apptType
+          typeName
+          typeID
+          dateAdded
+          cancellationDate
+          notes
+          locationID
+          locationName
+          lastModified
+          emailReminderSent
+          arrived
+          confirmed
+          dna
+          contactID
+          addedBy
+          addedByName
+          metadata
+          response
+          otherNotes
+          lastModifiedBy
+          onlineBooking
         }
       }
-      const last = sorted[sorted.length - 1];
-      if (last.endMins < 1050) {
-        gaps.push({
-          from: last.end.slice(0, 5),
-          to: "17:30",
-          reason: `after last appt (${last.clientName || last.notes?.slice(0, 30) || last.classification})`
-        });
+    `;
+
+    const d = await nookalQuery(fullQuery);
+    const rawAppts = d.appointments || [];
+
+    // Also introspect ALL types that could be Event-related
+    const schemaQueries = {
+      appointment: `query { __type(name: "appointment") { fields { name type { name kind ofType { name } } } } }`
+    };
+    const schemas = {};
+    for (const [label, q] of Object.entries(schemaQueries)) {
+      try {
+        const r = await nookalQuery(q);
+        schemas[label] = r.__type?.fields;
+      } catch (e) {
+        schemas[label] = { error: e.message };
       }
     }
 
@@ -1002,13 +1010,8 @@ app.get("/debug-day", async (req, res) => {
       instructor: inst.name,
       date,
       totalAppointments: rawAppts.length,
-      classified,
-      blocksUsedForGapCalc: relevant.map(r => ({
-        time: `${r.start.slice(0,5)}-${r.end.slice(0,5)}`,
-        kind: r.classification,
-        summary: r.clientName || r.notes?.slice(0, 50) || r.typeName
-      })),
-      computedGaps: gaps
+      rawAppointmentsFullFields: rawAppts,
+      appointmentSchema: schemas.appointment
     });
   } catch (err) {
     res.status(500).json({ error: err.message, stack: err.stack });
