@@ -929,6 +929,92 @@ app.post("/clear-cache", (req, res) => {
   res.json({ cleared: before });
 });
 
+// ─── Diagnostic: show exactly what the system sees for one instructor/day ────
+// Usage: /debug-day?instructor=Gabriel&date=2026-04-28
+app.get("/debug-day", async (req, res) => {
+  try {
+    const instructorName = req.query.instructor;
+    const date = req.query.date;
+    if (!instructorName || !date) {
+      return res.json({ error: "Usage: /debug-day?instructor=Gabriel&date=2026-04-28" });
+    }
+    const inst = INSTRUCTORS.find(i => i.name.toLowerCase() === instructorName.toLowerCase());
+    if (!inst) return res.json({ error: `Instructor '${instructorName}' not found` });
+
+    // Fetch raw appointments for this one day
+    const rawAppts = await getAppointmentsForInstructor(inst, date, date);
+
+    // Classify each one and show the reasoning
+    const classified = rawAppts.map(a => {
+      const cls = classifyAppointment(a);
+      return {
+        apptID: a.apptID,
+        start: a.startTime,
+        end: a.endTime,
+        status: a.status,
+        typeName: a.typeName,
+        clientID: a.clientID,
+        clientName: a.clientName,
+        notes: a.notes,
+        classification: cls,
+        startMins: timeToMins(a.startTime.slice(0, 5)),
+        endMins: timeToMins(a.endTime.slice(0, 5))
+      };
+    });
+
+    // Compute gaps the same way findAvailableSlots does
+    const relevant = classified.filter(a => a.classification !== "skip");
+    const sorted = [...relevant].sort((a, b) => a.startMins - b.startMins);
+
+    const gaps = [];
+    const earliestStart = inst.earliestStart ? timeToMins(inst.earliestStart) : 480;
+
+    if (sorted.length === 0) {
+      gaps.push({ from: minsToTime(earliestStart), to: "17:30", reason: "empty day" });
+    } else {
+      if (sorted[0].startMins > earliestStart) {
+        gaps.push({
+          from: minsToTime(earliestStart),
+          to: sorted[0].start.slice(0, 5),
+          reason: `before first appt (${sorted[0].clientName || sorted[0].notes?.slice(0, 30) || sorted[0].classification})`
+        });
+      }
+      for (let i = 0; i < sorted.length - 1; i++) {
+        if (sorted[i + 1].startMins > sorted[i].endMins) {
+          gaps.push({
+            from: sorted[i].end.slice(0, 5),
+            to: sorted[i + 1].start.slice(0, 5),
+            reason: `between ${sorted[i].classification} and ${sorted[i + 1].classification}`
+          });
+        }
+      }
+      const last = sorted[sorted.length - 1];
+      if (last.endMins < 1050) {
+        gaps.push({
+          from: last.end.slice(0, 5),
+          to: "17:30",
+          reason: `after last appt (${last.clientName || last.notes?.slice(0, 30) || last.classification})`
+        });
+      }
+    }
+
+    res.json({
+      instructor: inst.name,
+      date,
+      totalAppointments: rawAppts.length,
+      classified,
+      blocksUsedForGapCalc: relevant.map(r => ({
+        time: `${r.start.slice(0,5)}-${r.end.slice(0,5)}`,
+        kind: r.classification,
+        summary: r.clientName || r.notes?.slice(0, 50) || r.typeName
+      })),
+      computedGaps: gaps
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
 // ─── Nookal API test endpoint ────────────────────────────────────────────────
 app.get("/test-nookal", async (req, res) => {
   try {
