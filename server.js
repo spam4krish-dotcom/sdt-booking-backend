@@ -339,40 +339,107 @@ function classifyAppointment(a) {
 }
 
 // ─── Location extraction from notes ──────────────────────────────────────────
+// Returns a structured object describing what the notes say about location.
+// Priority:
+//   1. Pickup + Dropoff pattern ("from X to home in Y") → { pickup, dropoff }
+//   2. Explicit street address in notes (e.g. "251 Mountain Hwy") → { address }
+//   3. Named venue (school/clinic/hospital/centre) → { venue, venueSuburb }
+//   4. Suburb name → { suburb }
+//   5. Nothing useful → null
 function extractNotesLocation(notes) {
   if (!notes || !notes.trim()) return null;
 
-  // Pattern: "to home in SUBURB" — dropoff
-  const dropoffMatch = notes.match(/\bto\s+home\s+in\s+([A-Z][A-Z\s]{2,40}?)(?:\n|$|\.|,)/i);
-  if (dropoffMatch) {
+  // ─── Priority 1: Pickup + Dropoff pattern ───
+  // "From School X to home in Y" or "from X to Y"
+  const pickupDropoff = notes.match(/from\s+(?:school\s+)?([A-Za-z][A-Za-z\s&'.-]{3,60}?)\s+to\s+home\s+in\s+([A-Z][A-Z\s]{2,40}?)(?:\n|$|\.|,|;)/i);
+  if (pickupDropoff) {
+    const pickupRaw = pickupDropoff[1].trim();
+    const dropoffRaw = cleanSuburb(pickupDropoff[2]);
     return {
-      pickup: extractPickupFromSchoolPattern(notes),
-      dropoff: cleanSuburb(dropoffMatch[1])
+      kind: "pickup-dropoff",
+      pickup: { venue: pickupRaw, isSchool: /\b(school|college|grammar|academy|high|primary|secondary)\b/i.test(pickupRaw) },
+      dropoff: { suburb: dropoffRaw }
     };
   }
 
-  // Pattern: "from [ClinicName] SUBURB" — pickup from clinic
-  const clinicMatch = notes.match(/from\s+[A-Za-z][A-Za-z\s]*?(?:clinic|CommOT|ActiveOne|Community\s+OT)\s+([A-Z][A-Z\s]{2,40}?)(?:\s|$|\.|,|\n|prior)/i);
-  if (clinicMatch) {
-    return { single: cleanSuburb(clinicMatch[1]) };
+  // ─── Priority 2: Explicit street address ───
+  // Matches patterns like "251 Mountain Hwy", "5 Cashel Court - BERWICK", "12 Smith St"
+  const streetAddressMatch = notes.match(/(\d{1,5}\s+[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*\s+(?:Street|St|Road|Rd|Avenue|Ave|Drive|Dr|Court|Ct|Crescent|Cres|Place|Pl|Parade|Pde|Way|Highway|Hwy|Boulevard|Blvd|Lane|Ln|Close|Cl|Terrace|Tce))\b[,\s-]*([A-Z][A-Z\s]{2,40}?)?(?:\n|$|\.|,|;|\)|\()/);
+  if (streetAddressMatch) {
+    const streetPart = streetAddressMatch[1].trim();
+    const suburbPart = streetAddressMatch[2] ? cleanSuburb(streetAddressMatch[2]) : null;
+    const fullAddress = suburbPart ? `${streetPart}, ${suburbPart}` : streetPart;
+    return {
+      kind: "address",
+      address: fullAddress,
+      suburb: suburbPart
+    };
   }
 
-  // Pattern: "street address - SUBURB"
-  const dashSuburbMatch = notes.match(/-\s*([A-Z][A-Z\s]{2,40}?)(?:\s*$|\n|,)/);
+  // Also try bracketed addresses: "(251 Mountain Hwy)"
+  const bracketedAddr = notes.match(/\((\d{1,5}\s+[^)]+?)\)/);
+  if (bracketedAddr) {
+    return {
+      kind: "address",
+      address: bracketedAddr[1].trim()
+    };
+  }
+
+  // ─── Priority 3: Named venue (schools, clinics, hospitals) ───
+  // Look for keywords that indicate a specific venue, then extract the full venue name + suburb
+  const venuePatterns = [
+    // "Active One FRANKSTON", "ActiveOne clinic FRANKSTON"
+    /\b(active\s*one|activeone)(?:\s+clinic)?\s+([A-Z][A-Z\s]{2,40}?)(?:\n|\s+(?:at|with|ax|lesson|for|prior|to)|$|\.|,)/i,
+    // "CommOT BRUNSWICK", "Community OT BRUNSWICK EAST"
+    /\b(comm\s*ot|community\s*ot)\s+([A-Z][A-Z\s]{2,40}?)(?:\n|\s+(?:at|with|ax|lesson|for|prior|to)|$|\.|,)/i,
+    // "Epworth HAWTHORN"
+    /\b(epworth)\s+([A-Z][A-Z\s]{2,40}?)(?:\n|\s+(?:at|with|ax|lesson|for|prior|to)|$|\.|,)/i,
+    // "Eastern Health WANTIRNA"
+    /\b(eastern\s+health|western\s+health|northern\s+health|southern\s+health)\s+([A-Z][A-Z\s]{2,40}?)(?:\n|\s+(?:at|with|ax|lesson|for|prior|to)|\(|$|\.|,)/i,
+    // "X Hospital", "X Rehab"
+    /\b([A-Z][a-zA-Z]+\s+(?:Hospital|Rehab|Rehabilitation|Medical\s+Centre|Health\s+Centre))\s+([A-Z][A-Z\s]{2,40}?)?(?:\n|\s|$|\.|,)/
+  ];
+  for (const pattern of venuePatterns) {
+    const m = notes.match(pattern);
+    if (m) {
+      const venueName = cleanSuburb(m[1]);
+      const venueSuburb = m[2] ? cleanSuburb(m[2]) : null;
+      if (venueSuburb && isLikelySuburb(venueSuburb)) {
+        return {
+          kind: "venue",
+          venue: `${venueName} ${venueSuburb}`,
+          venueSuburb
+        };
+      }
+    }
+  }
+
+  // ─── Priority 4: Street address followed by "- SUBURB" (no street type word) ───
+  // e.g. "5 Cashel Court - BERWICK"
+  const dashSuburbMatch = notes.match(/(\d+\s+[A-Z][A-Za-z\s]+?)\s*[-–]\s*([A-Z][A-Z\s]{2,40}?)(?:\s*$|\n|,)/);
   if (dashSuburbMatch) {
-    const candidate = cleanSuburb(dashSuburbMatch[1]);
-    if (isLikelySuburb(candidate)) return { single: candidate };
+    const streetPart = dashSuburbMatch[1].trim();
+    const suburbPart = cleanSuburb(dashSuburbMatch[2]);
+    if (isLikelySuburb(suburbPart)) {
+      return {
+        kind: "address",
+        address: `${streetPart}, ${suburbPart}`,
+        suburb: suburbPart
+      };
+    }
   }
 
-  // Pattern: first line is all caps
+  // ─── Priority 5: First-line suburb ───
   const firstLine = notes.split(/\n|\r/)[0].trim();
-  if (isLikelySuburb(firstLine)) return { single: firstLine };
+  if (isLikelySuburb(firstLine)) {
+    return { kind: "suburb", suburb: firstLine };
+  }
 
-  // Fallback: find ALL CAPS phrase
+  // ─── Fallback: any ALL CAPS phrase that looks like a suburb ───
   const capsMatches = notes.match(/\b[A-Z][A-Z\s]{2,30}\b/g) || [];
   for (const m of capsMatches) {
     const cleaned = cleanSuburb(m);
-    if (isLikelySuburb(cleaned)) return { single: cleaned };
+    if (isLikelySuburb(cleaned)) return { kind: "suburb", suburb: cleaned };
   }
 
   return null;
@@ -398,15 +465,10 @@ function isLikelySuburb(s) {
     "WILL", "HAVE", "THAT", "DRIVING", "MATTERS", "PTY", "LTD", "SCHOOL",
     "PICKUP", "DROPOFF", "JASON", "GREG", "MARC", "CHRISTIAN", "GABRIEL",
     "SHERRI", "YVES", "COMMOT", "ACTIVEONE", "COMMUNITY", "OT", "CLINIC",
-    "EASY", "DRIVE", "PREVIOUS", "NEXT"
+    "EASY", "DRIVE", "PREVIOUS", "NEXT", "EVENT", "DETAILS",
+    "FASTING", "IMED", "ULTRASOUND", "BLOOD", "MEETING", "APPOINTMENT"
   ]);
   return !words.some(w => NOT_SUBURBS.has(w));
-}
-
-function extractPickupFromSchoolPattern(notes) {
-  const m = notes.match(/from\s+(?:school\s+)?([A-Z][A-Z\s]{2,40}?)\s+to/i);
-  if (m) return cleanSuburb(m[1]);
-  return null;
 }
 
 // Lookup client by name (since ICS doesn't give us clientID).
@@ -471,8 +533,22 @@ async function getClientByName(fullName) {
   }
 }
 
+// Helper: extract "Hold for CLIENT NAME" from a soft-block summary
+function extractHoldClientName(summary) {
+  if (!summary) return null;
+  // Strip "Event - " prefix first
+  const cleaned = summary.replace(/^event\s*[-–]\s*/i, "").trim();
+  // Match "Hold for X", "HOLD for X", "Hold X", "HOLD FOR X"
+  const m = cleaned.match(/^hold\s+(?:for\s+)?([A-Za-z][A-Za-z\s'-]+?)(?:\s*[-–,]|\s+\(|\s*$)/i);
+  if (m) return m[1].trim();
+  return null;
+}
+
 // ─── Smart location resolution ───────────────────────────────────────────────
-// Returns full street address when available, suburb as fallback
+// Returns { pickup, dropoff, clientHomeSuburb, clientName, noteText, source, unresolved }
+// pickup/dropoff are full strings suitable for Google Maps geocoding
+// source describes which data path was used (for debugging)
+// unresolved=true means we couldn't determine location — caller should alert admin
 async function resolveAppointmentLocation(appt) {
   // Try by clientID first if available, otherwise by clientName
   let clientAddr = null;
@@ -485,49 +561,99 @@ async function resolveAppointmentLocation(appt) {
   const homeFull = clientAddr?.addr1
     ? `${clientAddr.addr1}, ${clientAddr.suburb} ${clientAddr.state || "VIC"} ${clientAddr.postcode || ""}`.trim()
     : homeSuburb;
+
   const notesLoc = extractNotesLocation(appt.notes);
 
-  if (notesLoc?.dropoff) {
-    // Dropoff matches home — use full home address for dropoff
-    const dropoffFull = (homeSuburb && notesLoc.dropoff.toUpperCase() === homeSuburb.toUpperCase())
+  const base = {
+    clientHomeSuburb: homeSuburb,
+    clientName: appt.clientName,
+    noteText: appt.notes
+  };
+
+  // ─── Pickup + Dropoff pattern ───
+  if (notesLoc?.kind === "pickup-dropoff") {
+    // Pickup is usually a school/venue that needs geocoding by name
+    // Dropoff suburb: if matches home, use full home address; otherwise use suburb string
+    const pickupString = notesLoc.pickup.isSchool
+      ? `${notesLoc.pickup.venue}, Victoria, Australia`  // let Google Maps geocode the school name
+      : notesLoc.pickup.venue;
+    const dropoffString = (homeSuburb && notesLoc.dropoff.suburb.toUpperCase() === homeSuburb.toUpperCase())
       ? homeFull
-      : notesLoc.dropoff;
+      : notesLoc.dropoff.suburb;
     return {
-      pickup: notesLoc.pickup || homeFull,
-      dropoff: dropoffFull,
-      clientHomeSuburb: homeSuburb,
-      clientName: appt.clientName,
-      noteText: appt.notes
+      ...base,
+      pickup: pickupString,
+      dropoff: dropoffString,
+      source: "notes-pickup-dropoff"
     };
   }
 
-  if (notesLoc?.single) {
-    const notesSuburb = notesLoc.single;
-    // Notes match home suburb → use full home address
+  // ─── Explicit street address in notes ───
+  if (notesLoc?.kind === "address") {
+    // Use the exact address for both pickup and dropoff (assessments/clinic visits
+    // start and finish at the same place unless pickup-dropoff pattern above)
+    const addrStr = notesLoc.address.includes(",") || /VIC|\b3\d{3}\b/i.test(notesLoc.address)
+      ? notesLoc.address
+      : `${notesLoc.address}, Victoria, Australia`;
+    return {
+      ...base,
+      pickup: addrStr,
+      dropoff: addrStr,
+      source: "notes-address"
+    };
+  }
+
+  // ─── Named venue (school/clinic/hospital) ───
+  if (notesLoc?.kind === "venue") {
+    // Ask Google Maps to geocode the full venue name (e.g. "Active One FRANKSTON")
+    const venueStr = `${notesLoc.venue}, Victoria, Australia`;
+    return {
+      ...base,
+      pickup: venueStr,
+      dropoff: venueStr,
+      source: "notes-venue"
+    };
+  }
+
+  // ─── Plain suburb in notes ───
+  if (notesLoc?.kind === "suburb") {
+    const notesSuburb = notesLoc.suburb;
+    // If notes suburb matches home suburb → use full home address
     if (homeSuburb && notesSuburb.toUpperCase() === homeSuburb.toUpperCase()) {
       return {
-        pickup: homeFull, dropoff: homeFull,
-        clientHomeSuburb: homeSuburb, clientName: appt.clientName,
-        noteText: appt.notes
+        ...base,
+        pickup: homeFull,
+        dropoff: homeFull,
+        source: "notes-suburb-matches-home"
       };
     }
-    // Notes differ from home — use the notes suburb (pickup point)
+    // Notes suburb differs from home — use the notes suburb (pickup point)
     return {
-      pickup: notesSuburb, dropoff: notesSuburb,
-      clientHomeSuburb: homeSuburb, clientName: appt.clientName,
-      noteText: appt.notes
+      ...base,
+      pickup: notesSuburb,
+      dropoff: notesSuburb,
+      source: "notes-suburb-differs-from-home"
     };
   }
 
+  // ─── No notes location, fall back to home ───
   if (homeFull) {
     return {
-      pickup: homeFull, dropoff: homeFull,
-      clientHomeSuburb: homeSuburb, clientName: appt.clientName,
-      noteText: appt.notes
+      ...base,
+      pickup: homeFull,
+      dropoff: homeFull,
+      source: "home-fallback"
     };
   }
 
-  return null;
+  // ─── Nothing resolved ───
+  return {
+    ...base,
+    pickup: null,
+    dropoff: null,
+    source: "unresolved",
+    unresolved: true
+  };
 }
 
 // ─── Google Maps Travel Time ─────────────────────────────────────────────────
@@ -606,7 +732,10 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
   }
 
   // Group by date with resolved locations
+  // Also collect admin alerts for unresolved soft-block client lookups
   const byDate = {};
+  const adminAlerts = []; // [{date, time, issue, details}]
+
   for (const a of appointments) {
     const cls = classifyAppointment(a);
     if (cls.kind === "skip") continue;
@@ -619,6 +748,7 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
     let locStart = inst.base;
     let locEnd = inst.base;
     let prevClientName = null;
+    let locationSource = "base";
 
     if (cls.kind === "lesson") {
       // Set the summary as clientName so resolveAppointmentLocation can try to
@@ -629,14 +759,57 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
         notes: a.description || a.notes
       };
       const loc = await resolveAppointmentLocation(apptForResolve);
-      if (loc) {
+      if (loc && !loc.unresolved) {
         locStart = loc.pickup || inst.base;
         locEnd = loc.dropoff || loc.pickup || inst.base;
         prevClientName = cls.clientName;
+        locationSource = loc.source;
       } else {
         prevClientName = cls.clientName;
+        // Couldn't resolve lesson location — alert admin
+        adminAlerts.push({
+          date: a.appointmentDate,
+          time: `${a.startTime.slice(0, 5)}-${a.endTime.slice(0, 5)}`,
+          issue: "unresolved-lesson-location",
+          details: `Could not determine where ${cls.clientName}'s lesson is — no address on file and notes are ambiguous.`
+        });
+      }
+    } else if (cls.kind === "soft-block") {
+      // Extract the client name from "Hold for X" and look them up for location
+      const holdClient = extractHoldClientName(a.summary);
+      if (holdClient) {
+        const apptForResolve = {
+          clientName: holdClient,
+          notes: a.description || a.notes
+        };
+        const loc = await resolveAppointmentLocation(apptForResolve);
+        if (loc && !loc.unresolved) {
+          locStart = loc.pickup || inst.base;
+          locEnd = loc.dropoff || loc.pickup || inst.base;
+          locationSource = `soft-block: ${loc.source}`;
+        } else {
+          // Hold found but can't determine location — alert admin
+          adminAlerts.push({
+            date: a.appointmentDate,
+            time: `${a.startTime.slice(0, 5)}-${a.endTime.slice(0, 5)}`,
+            issue: "unresolved-hold-location",
+            details: `Found a hold for "${holdClient}" but could not determine their location. Cannot verify travel feasibility for nearby slots on this day.`
+          });
+          locStart = null; locEnd = null; // explicitly null so later logic knows
+        }
+      } else {
+        // Hold but no client name extractable (e.g. "Active One Frankston")
+        // Try notes location directly
+        const apptForResolve = { clientName: null, notes: a.description || a.notes };
+        const loc = await resolveAppointmentLocation(apptForResolve);
+        if (loc && !loc.unresolved) {
+          locStart = loc.pickup || inst.base;
+          locEnd = loc.dropoff || loc.pickup || inst.base;
+          locationSource = `soft-block-venue: ${loc.source}`;
+        }
       }
     }
+    // hard-blocks keep locStart/locEnd as inst.base (instructor is effectively "off")
 
     byDate[a.appointmentDate].push({
       startMins: startM,
@@ -648,7 +821,8 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
       note: a.description || "",
       clientName: prevClientName,
       startTime: a.startTime.slice(0, 5),
-      endTime: a.endTime.slice(0, 5)
+      endTime: a.endTime.slice(0, 5),
+      locationSource
     });
   }
 
@@ -722,18 +896,36 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
     const softBlocksOnDay = sorted.filter(s => s.kind === "soft-block").map(s => ({
       startTime: s.startTime,
       endTime: s.endTime,
-      note: s.note.split("\n")[0].slice(0, 60)
+      note: s.note.split("\n")[0].slice(0, 60),
+      label: s.label.slice(0, 60)
+    }));
+
+    // Detect hard blocks that happen on this day — for context (e.g. late start after holidays)
+    const hardBlocksOnDay = sorted.filter(s => s.kind === "hard-block").map(s => ({
+      startTime: s.startTime,
+      endTime: s.endTime,
+      label: s.label.slice(0, 60)
     }));
 
     const BUFFER_MINS = 10; // Travel buffer for changeover, toilet, traffic
 
     for (const gap of gaps) {
+      // If previous location couldn't be resolved (soft-block with unresolved client),
+      // skip this gap — we can't safely calculate travel. Admin will see the alert.
+      if (gap.prevLoc === null || gap.prevLoc === undefined) continue;
+
       const rawTravelIn = await getTravelTime(gap.prevLoc, clientSuburb);
       const rawTravelOut = gap.nextLoc ? await getTravelTime(clientSuburb, gap.nextLoc) : 0;
 
-      // Add buffer to travel times
-      const travelInWithBuffer = rawTravelIn + BUFFER_MINS;
-      const travelOutWithBuffer = rawTravelOut + BUFFER_MINS;
+      // Buffer rule: 10-min buffer only applies when coming FROM a previous appointment
+      // (lesson or soft-block). No buffer when starting fresh from base (instructor hasn't
+      // just finished another lesson that needs changeover/toilet time).
+      const comingFromAppointment = gap.prevAppt != null;
+      const bufferInApplied = comingFromAppointment ? BUFFER_MINS : 0;
+      const bufferOutApplied = gap.nextLoc ? BUFFER_MINS : 0;
+
+      const travelInWithBuffer = rawTravelIn + bufferInApplied;
+      const travelOutWithBuffer = rawTravelOut + bufferOutApplied;
 
       const minStart = snapTo15(gap.earliestStart + travelInWithBuffer);
       const maxEnd = gap.latestEnd - travelOutWithBuffer;
@@ -772,6 +964,13 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
       const pmPeak = startMins >= 900 && startMins <= 1080 && travellingFromLesson;
       const peakTrafficWarning = amPeak || pmPeak;
 
+      // Check if this slot is first availability after a hard block that finished today
+      // e.g. "LATE START AFTER HOLS" ending at 13:00, slot starts 13:45
+      const priorHardBlock = hardBlocksOnDay.find(hb => {
+        const hbEnd = timeToMins(hb.endTime);
+        return hbEnd <= gap.earliestStart && (gap.earliestStart - hbEnd) <= 60;
+      });
+
       slots.push({
         instructor: inst.name,
         base: inst.base,
@@ -781,14 +980,19 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
         period: matchedBlock.block,
         travelIn: rawTravelIn,
         travelOut: rawTravelOut,
-        bufferMins: BUFFER_MINS,
+        bufferMinsApplied: bufferInApplied, // actual buffer used (0 if from base)
         baseTravel,
         prevLocation: gap.prevLoc,
         nextLocation: gap.nextLoc,
         prevClientName: gap.prevAppt?.clientName || null,
         prevEndTime: gap.prevAppt?.endTime || null,
+        prevAppointmentNote: gap.prevAppt?.note?.split("\n")[0]?.slice(0, 80) || null,
+        prevAppointmentLabel: gap.prevAppt?.label?.slice(0, 80) || null,
         nextClientName: gap.nextAppt?.clientName || null,
         nextStartTime: gap.nextAppt?.startTime || null,
+        nextAppointmentLabel: gap.nextAppt?.label?.slice(0, 80) || null,
+        comingFromBase: !comingFromAppointment,
+        priorHardBlock: priorHardBlock ? priorHardBlock.label : null,
         tier,
         totalApptsThatDay: sorted.filter(s => s.kind === "lesson").length,
         softBlocksOnDay,
@@ -800,7 +1004,7 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
     d.setDate(d.getDate() + 1);
   }
 
-  return slots;
+  return { slots, adminAlerts };
 }
 
 // ─── Scoring ─────────────────────────────────────────────────────────────────
@@ -893,12 +1097,19 @@ app.post("/analyse", async (req, res) => {
     debugLog.push(`Availability parsed: ${JSON.stringify(availPref)}`);
 
     const allSlots = [];
+    const allAdminAlerts = [];
     const fetchErrors = [];
     for (const inst of eligibleInstructors) {
       try {
-        const slots = await findAvailableSlots(inst, clientSuburb, durationMins, availPref);
-        allSlots.push(...slots);
-        debugLog.push(`${inst.name}: ${slots.length} valid slots`);
+        const result = await findAvailableSlots(inst, clientSuburb, durationMins, availPref);
+        allSlots.push(...result.slots);
+        if (result.adminAlerts?.length) {
+          // Tag each alert with the instructor so admin knows who it's about
+          for (const alert of result.adminAlerts) {
+            allAdminAlerts.push({ instructor: inst.name, ...alert });
+          }
+        }
+        debugLog.push(`${inst.name}: ${result.slots.length} valid slots, ${result.adminAlerts?.length || 0} alerts`);
       } catch (err) {
         debugLog.push(`ERROR fetching ${inst.name}: ${err.message}`);
         fetchErrors.push({ instructor: inst.name, error: err.message });
@@ -953,10 +1164,15 @@ Suggested actions for admin:
       };
       const instData = INSTRUCTORS.find(x => x.name === s.instructor);
 
-      // Build "coming from" description
+      // Build "coming from" description with context from appointment notes
       let comingFrom;
       if (s.prevClientName) {
-        comingFrom = `from lesson with ${s.prevClientName} in ${s.prevLocation} (finishes ${s.prevEndTime})`;
+        const contextNote = s.prevAppointmentNote && s.prevAppointmentNote !== s.prevClientName
+          ? ` — ${s.prevAppointmentNote}`
+          : "";
+        comingFrom = `from lesson with ${s.prevClientName}${contextNote} (finishes ${s.prevEndTime})`;
+      } else if (s.priorHardBlock) {
+        comingFrom = `from base in ${s.base} (first availability after "${s.priorHardBlock}")`;
       } else {
         comingFrom = `from base in ${s.base}`;
       }
@@ -964,7 +1180,7 @@ Suggested actions for admin:
       // Build "next lesson" description
       let nextLesson;
       if (s.nextClientName) {
-        nextLesson = `then lesson with ${s.nextClientName} in ${s.nextLocation} at ${s.nextStartTime}`;
+        nextLesson = `then lesson with ${s.nextClientName} at ${s.nextStartTime}`;
       } else if (s.nextLocation) {
         nextLesson = `then on to ${s.nextLocation} at ${s.nextStartTime}`;
       } else {
@@ -974,13 +1190,17 @@ Suggested actions for admin:
       const peakFlag = s.peakTrafficWarning ? `\n  ⚠️ ${s.peakPeriod} — travel may take longer than estimated` : "";
 
       const softBlockNote = s.softBlocksOnDay && s.softBlocksOnDay.length > 0
-        ? `\n  Soft holds on this day: ${s.softBlocksOnDay.map(b => `${b.startTime}-${b.endTime} "${b.note}"`).join("; ")}`
+        ? `\n  Soft holds on this day: ${s.softBlocksOnDay.map(b => `${b.startTime}-${b.endTime} "${b.label || b.note}"`).join("; ")}`
         : "";
+
+      const bufferNote = s.bufferMinsApplied > 0
+        ? `${s.bufferMinsApplied} min buffer applied`
+        : "no buffer (coming from base)";
 
       return `Slot ${i + 1}: ${s.instructor} — ${formatDate(s.date)} (${s.dayName}) at ${s.suggestedStart}
   ${tierLabels[s.tier]}
   Coming ${comingFrom}
-  Travel in: ${s.travelIn} min (${s.bufferMins} min buffer applied)
+  Travel in: ${s.travelIn} min (${bufferNote})
   After the lesson: ${nextLesson}
   Travel out: ${s.travelOut} min
   Base: ${s.base} → ${clientSuburb}: ${s.baseTravel} min
@@ -988,16 +1208,23 @@ Suggested actions for admin:
   Lessons booked that day: ${s.totalApptsThatDay}${peakFlag}${softBlockNote}`;
     }).join("\n\n");
 
+    // Build admin alerts section if any
+    const adminAlertsText = allAdminAlerts.length > 0
+      ? `\n\nADMIN ALERTS (unresolved data — admin may need to verify):\n` +
+        allAdminAlerts.map(a => `- ${a.instructor} ${formatDate(a.date)} ${a.time}: ${a.details}`).join("\n")
+      : "";
+
     const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training. You help office staff choose the best 3 slots from a list of pre-verified options.
 
 Pick the 3 best slots from the provided list. Present each with:
 - Option number, instructor name, date/time
 - Tier label
-- 2-3 sentences on: day/time fit, where instructor is coming from (use the "Coming from" line - mention the previous client's name if there is one), what's happening after the lesson
+- 2-3 sentences on: day/time fit, where instructor is coming from (use the "Coming from" line - mention the previous client's name AND any additional context from the appointment notes if present), what's happening after the lesson
 
 Rules:
 - Use ONLY the slots provided — do not invent any dates or times
-- When describing travel, use the exact "Coming from" line provided (include the previous client's name and finish time if shown)
+- When describing travel, use the exact "Coming from" line provided. If it mentions additional context (e.g. "— Ax with OT Jo Coleman"), include that context in your written response
+- If "first availability after X" is mentioned, include that context so admin knows instructor is returning from a break
 - If the slot shows a ⚠️ peak traffic warning, include it in your response as a note under that option
 - Tier 1 = ideal, Tier 2 = good, Tier 3 = workable (mention the instructor will already be in the area), Tier 4 = stretch (add a ⚠️ note)
 - If all slots are from one instructor because they're the only eligible one, say so
@@ -1005,11 +1232,13 @@ Rules:
 - No client-facing language (no "Hello [name]", no "would you like to book")
 
 AT THE END OF YOUR RESPONSE, add an "Admin Review" section ONLY if any of the selected slots have "Soft holds on this day" listed. In that section:
-- Mention each soft hold by date and what it says (e.g., "Tuesday 12/05: Gabriel has a 'Hold for Zain Karim' from 12:00-13:00")
+- Mention each soft hold by date and what it says
 - Say "Admin: verify these holds before booking — they may be for this client or related clients, or they may need to remain reserved"
-- Do NOT add the Admin Review section for hard blocks (day off, school pickup etc) — those slots will never be suggested anyway
+- Do NOT add the Admin Review section for hard blocks — those slots will never be suggested anyway
 
-If no soft holds exist on any selected slots, do not include the Admin Review section at all.`;
+IF the user message contains "ADMIN ALERTS" below the slots, add a separate "Unresolved Data Alerts" section at the very end listing each alert verbatim. These are cases where the system couldn't verify something (e.g. a hold's location). Do not filter these — list them all.
+
+If no soft holds and no admin alerts exist, do not include any review sections at all.`;
 
     const userMessage = `CLIENT: ${booking.clientName || "(not specified)"}
 SUBURB: ${clientSuburb}
@@ -1017,7 +1246,7 @@ MODS: ${normalisedMods.join(", ") || "none"}
 AVAILABILITY: ${availString || "not specified"}
 
 VERIFIED SLOTS:
-${slotDescriptions}`;
+${slotDescriptions}${adminAlertsText}`;
 
     const aiRes = await axios.post("https://api.anthropic.com/v1/messages", {
       model: "claude-sonnet-4-20250514",
@@ -1109,15 +1338,20 @@ app.get("/debug-day", async (req, res) => {
     const inst = INSTRUCTORS.find(i => i.name.toLowerCase() === instructorName.toLowerCase());
     if (!inst) return res.json({ error: `Instructor '${instructorName}' not found` });
 
-    // Fetch ICS for just that date
-    const appts = await getAppointmentsForInstructor(inst, date, date);
+    // Fetch ICS for the day + next day to ensure proper range response
+    const dateObj = new Date(date + "T12:00:00+10:00");
+    const nextDay = new Date(dateObj.getTime() + 24 * 3600 * 1000);
+    const dateTo = toMelbDateStr(nextDay);
+    const appts = await getAppointmentsForInstructor(inst, date, dateTo);
     const forThisDay = appts.filter(a => a.appointmentDate === date);
 
-    const classified = forThisDay.map(a => {
+    // Classify each AND resolve location (so we see what the booking engine actually uses)
+    const classified = [];
+    for (const a of forThisDay) {
       const cls = classifyAppointment(a);
       const startM = timeToMins(a.startTime.slice(0, 5));
       const endM = timeToMins(a.endTime.slice(0, 5));
-      return {
+      const entry = {
         time: `${a.startTime.slice(0,5)}-${a.endTime.slice(0,5)}`,
         durationMins: endM - startM,
         summary: a.summary,
@@ -1128,7 +1362,41 @@ app.get("/debug-day", async (req, res) => {
         reason: cls.reason,
         blocksTime: cls.kind === "lesson" || cls.kind === "hard-block" || cls.kind === "soft-block"
       };
-    }).sort((x, y) => timeToMins(x.time.slice(0, 5)) - timeToMins(y.time.slice(0, 5)));
+
+      // For lessons and soft-block holds, also show the resolved location
+      if (cls.kind === "lesson") {
+        const loc = await resolveAppointmentLocation({
+          clientName: cls.clientName || a.summary,
+          notes: a.description || a.notes
+        });
+        entry.resolvedLocation = loc ? {
+          pickup: loc.pickup,
+          dropoff: loc.dropoff,
+          source: loc.source,
+          clientHomeSuburb: loc.clientHomeSuburb,
+          unresolved: loc.unresolved || false
+        } : null;
+      } else if (cls.kind === "soft-block") {
+        const holdClient = extractHoldClientName(a.summary);
+        if (holdClient) {
+          const loc = await resolveAppointmentLocation({
+            clientName: holdClient,
+            notes: a.description || a.notes
+          });
+          entry.holdClient = holdClient;
+          entry.resolvedLocation = loc ? {
+            pickup: loc.pickup,
+            dropoff: loc.dropoff,
+            source: loc.source,
+            clientHomeSuburb: loc.clientHomeSuburb,
+            unresolved: loc.unresolved || false
+          } : { unresolved: true };
+        }
+      }
+
+      classified.push(entry);
+    }
+    classified.sort((x, y) => timeToMins(x.time.slice(0, 5)) - timeToMins(y.time.slice(0, 5)));
 
     // Compute gaps
     const blocks = classified.filter(c => c.blocksTime);
