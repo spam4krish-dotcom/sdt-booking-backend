@@ -206,17 +206,44 @@ async function getClientAddress(clientID) {
 }
 
 // ─── Appointment Classification ──────────────────────────────────────────────
+// Returns: "lesson" | "hard-block" | "soft-block" | "skip"
+// hard-block = day off, holiday, personal, school pickup (never book during)
+// soft-block = Time Held / HOLD for X (blocks time but note for admin review)
 function classifyAppointment(a) {
   if (a.status === "StdAppt") return "lesson";
   if (a.status === "Cancelled") return "skip";
   if (a.status === "Note") return "skip";
 
   if (a.status === "Event") {
-    const hasContent = (a.notes && a.notes.trim()) || (a.typeName && a.typeName.trim());
-    const blockCategories = ["time held", "holidays", "non-sdt work", "medical", "general"];
-    const isBlock = blockCategories.some(cat => (a.typeName || "").toLowerCase().includes(cat));
-    if (hasContent || isBlock) return "block";
-    return "skip";
+    const summary = (a.notes || "") + " " + (a.typeName || "");
+    const lower = summary.toLowerCase();
+
+    if (!summary.trim()) return "skip"; // blank event = free time
+
+    // Hard block signals — never touch this time
+    const hardBlockSignals = [
+      "day off", "dayoff", "no lessons", "no lesson",
+      "private stuff", "private work", "non-sdt",
+      "school pick up", "school pickup", "school run",
+      "holiday", "holidays", "leave", "bali", "trip",
+      "sick", "medical appointment", "personal",
+      "car service", "unavailable", "away",
+      "total ability van", "smartbox"
+    ];
+    const isHard = hardBlockSignals.some(sig => lower.includes(sig));
+    if (isHard) return "hard-block";
+
+    // Soft block: Time Held, Hold for X, Community OT holds, Active One holds
+    // These block time but admin may override if the hold relates to our client
+    const softBlockSignals = [
+      "hold for", "time held", "community ot", "commot",
+      "active one", "activeone", "ax with", "clinic"
+    ];
+    const isSoft = softBlockSignals.some(sig => lower.includes(sig));
+    if (isSoft) return "soft-block";
+
+    // Any other event with content = treat as hard block by default
+    return "hard-block";
   }
 
   return "skip";
@@ -294,15 +321,23 @@ function extractPickupFromSchoolPattern(notes) {
 }
 
 // ─── Smart location resolution ───────────────────────────────────────────────
+// Returns full street address when available, suburb as fallback
 async function resolveAppointmentLocation(appt) {
   const clientAddr = appt.clientID ? await getClientAddress(appt.clientID) : null;
   const homeSuburb = clientAddr?.suburb || null;
+  const homeFull = clientAddr?.addr1
+    ? `${clientAddr.addr1}, ${clientAddr.suburb} ${clientAddr.state || "VIC"} ${clientAddr.postcode || ""}`.trim()
+    : homeSuburb;
   const notesLoc = extractNotesLocation(appt.notes);
 
   if (notesLoc?.dropoff) {
+    // Dropoff matches home — use full home address for dropoff
+    const dropoffFull = (homeSuburb && notesLoc.dropoff.toUpperCase() === homeSuburb.toUpperCase())
+      ? homeFull
+      : notesLoc.dropoff;
     return {
-      pickup: notesLoc.pickup || homeSuburb,
-      dropoff: notesLoc.dropoff,
+      pickup: notesLoc.pickup || homeFull,
+      dropoff: dropoffFull,
       clientHomeSuburb: homeSuburb,
       clientName: appt.clientName,
       noteText: appt.notes
@@ -311,13 +346,15 @@ async function resolveAppointmentLocation(appt) {
 
   if (notesLoc?.single) {
     const notesSuburb = notesLoc.single;
+    // Notes match home suburb → use full home address
     if (homeSuburb && notesSuburb.toUpperCase() === homeSuburb.toUpperCase()) {
       return {
-        pickup: homeSuburb, dropoff: homeSuburb,
+        pickup: homeFull, dropoff: homeFull,
         clientHomeSuburb: homeSuburb, clientName: appt.clientName,
         noteText: appt.notes
       };
     }
+    // Notes differ from home — use the notes suburb (pickup point)
     return {
       pickup: notesSuburb, dropoff: notesSuburb,
       clientHomeSuburb: homeSuburb, clientName: appt.clientName,
@@ -325,9 +362,9 @@ async function resolveAppointmentLocation(appt) {
     };
   }
 
-  if (homeSuburb) {
+  if (homeFull) {
     return {
-      pickup: homeSuburb, dropoff: homeSuburb,
+      pickup: homeFull, dropoff: homeFull,
       clientHomeSuburb: homeSuburb, clientName: appt.clientName,
       noteText: appt.notes
     };
@@ -342,12 +379,17 @@ async function getTravelTime(origin, destination) {
   const key = `${origin.toUpperCase()}|${destination.toUpperCase()}`;
   if (travelCache[key] !== undefined) return travelCache[key];
 
+  // If the origin/destination already contains ", VIC" or a postcode, don't append
+  const needsContext = (s) => !/(,\s*VIC|\b3\d{3}\b|Australia)/i.test(s);
+  const originStr = needsContext(origin) ? `${origin}, Victoria, Australia` : origin;
+  const destStr = needsContext(destination) ? `${destination}, Victoria, Australia` : destination;
+
   try {
     const url = `https://maps.googleapis.com/maps/api/distancematrix/json`;
     const r = await axios.get(url, {
       params: {
-        origins: `${origin}, Victoria, Australia`,
-        destinations: `${destination}, Victoria, Australia`,
+        origins: originStr,
+        destinations: destStr,
         mode: "driving",
         key: GOOGLE_MAPS_API_KEY
       },
@@ -419,12 +461,14 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
 
     let locStart = inst.base;
     let locEnd = inst.base;
+    let prevClientName = null;
 
     if (cls === "lesson") {
       const loc = await resolveAppointmentLocation(a);
       if (loc) {
         locStart = loc.pickup || inst.base;
         locEnd = loc.dropoff || loc.pickup || inst.base;
+        prevClientName = a.clientName;
       }
     }
 
@@ -433,8 +477,11 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
       endMins: endM,
       locationForStart: locStart,
       locationForEnd: locEnd,
-      kind: cls,
-      note: a.notes || a.typeName || ""
+      kind: cls, // "lesson" | "hard-block" | "soft-block"
+      note: a.notes || a.typeName || "",
+      clientName: prevClientName,
+      startTime: a.startTime.slice(0, 5),
+      endTime: a.endTime.slice(0, 5)
     });
   }
 
@@ -457,18 +504,26 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
     const dayBlocks = byDate[dateStr] || [];
     const earliestStart = inst.earliestStart ? timeToMins(inst.earliestStart) : 480;
 
+    // Both hard AND soft blocks prevent booking during their time
+    // (soft blocks just add a flag for admin review)
     const sorted = [...dayBlocks].sort((a, b) => a.startMins - b.startMins);
     const gaps = [];
 
     if (sorted.length === 0) {
-      gaps.push({ earliestStart: earliestStart, latestEnd: 1050, prevLoc: inst.base, nextLoc: null });
+      gaps.push({
+        earliestStart: earliestStart, latestEnd: 1050,
+        prevLoc: inst.base, nextLoc: null,
+        prevAppt: null, nextAppt: null
+      });
     } else {
       if (sorted[0].startMins > earliestStart) {
         gaps.push({
           earliestStart: earliestStart,
           latestEnd: sorted[0].startMins,
           prevLoc: inst.base,
-          nextLoc: sorted[0].locationForStart
+          nextLoc: sorted[0].locationForStart,
+          prevAppt: null,
+          nextAppt: sorted[0]
         });
       }
       for (let i = 0; i < sorted.length - 1; i++) {
@@ -477,7 +532,9 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
             earliestStart: sorted[i].endMins,
             latestEnd: sorted[i + 1].startMins,
             prevLoc: sorted[i].locationForEnd,
-            nextLoc: sorted[i + 1].locationForStart
+            nextLoc: sorted[i + 1].locationForStart,
+            prevAppt: sorted[i],
+            nextAppt: sorted[i + 1]
           });
         }
       }
@@ -487,17 +544,32 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
           earliestStart: last.endMins,
           latestEnd: 1050,
           prevLoc: last.locationForEnd,
-          nextLoc: null
+          nextLoc: null,
+          prevAppt: last,
+          nextAppt: null
         });
       }
     }
 
-    for (const gap of gaps) {
-      const travelIn = await getTravelTime(gap.prevLoc, clientSuburb);
-      const travelOut = gap.nextLoc ? await getTravelTime(clientSuburb, gap.nextLoc) : 0;
+    // Detect soft blocks that happen on this day — for admin review notes
+    const softBlocksOnDay = sorted.filter(s => s.kind === "soft-block").map(s => ({
+      startTime: s.startTime,
+      endTime: s.endTime,
+      note: s.note.split("\n")[0].slice(0, 60)
+    }));
 
-      const minStart = snapTo15(gap.earliestStart + travelIn);
-      const maxEnd = gap.latestEnd - travelOut;
+    const BUFFER_MINS = 10; // Travel buffer for changeover, toilet, traffic
+
+    for (const gap of gaps) {
+      const rawTravelIn = await getTravelTime(gap.prevLoc, clientSuburb);
+      const rawTravelOut = gap.nextLoc ? await getTravelTime(clientSuburb, gap.nextLoc) : 0;
+
+      // Add buffer to travel times
+      const travelInWithBuffer = rawTravelIn + BUFFER_MINS;
+      const travelOutWithBuffer = rawTravelOut + BUFFER_MINS;
+
+      const minStart = snapTo15(gap.earliestStart + travelInWithBuffer);
+      const maxEnd = gap.latestEnd - travelOutWithBuffer;
       const maxStart = maxEnd - durationMins;
 
       if (minStart > maxStart) continue;
@@ -517,13 +589,21 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
 
       const maxT = inst.maxTravelFromBase || 60;
       const inNaturalZone = inst.allAreas || baseTravel <= maxT;
-      const nearbyOnDay = travelIn <= 20;
+      const nearbyOnDay = rawTravelIn <= 20;
 
       let tier;
       if (inNaturalZone && nearbyOnDay) tier = 1;
       else if (inNaturalZone && !nearbyOnDay) tier = 2;
       else if (!inNaturalZone && nearbyOnDay) tier = 3;
       else tier = 4;
+
+      // Peak traffic flag: AM peak 7:30-9:15, PM peak 15:00-18:00
+      // Only flag if instructor is coming from a previous lesson (not base/home)
+      const startMins = matchedBlock.start;
+      const travellingFromLesson = gap.prevAppt && gap.prevAppt.kind === "lesson";
+      const amPeak = startMins >= 450 && startMins <= 555 && travellingFromLesson;
+      const pmPeak = startMins >= 900 && startMins <= 1080 && travellingFromLesson;
+      const peakTrafficWarning = amPeak || pmPeak;
 
       slots.push({
         instructor: inst.name,
@@ -532,14 +612,21 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
         dayName,
         suggestedStart: minsToTime(matchedBlock.start),
         period: matchedBlock.block,
-        travelIn,
-        travelOut,
+        travelIn: rawTravelIn,
+        travelOut: rawTravelOut,
+        bufferMins: BUFFER_MINS,
         baseTravel,
         prevLocation: gap.prevLoc,
         nextLocation: gap.nextLoc,
+        prevClientName: gap.prevAppt?.clientName || null,
+        prevEndTime: gap.prevAppt?.endTime || null,
+        nextClientName: gap.nextAppt?.clientName || null,
+        nextStartTime: gap.nextAppt?.startTime || null,
         tier,
         totalApptsThatDay: sorted.filter(s => s.kind === "lesson").length,
-        blocksOnDay: sorted.filter(s => s.kind === "block").map(s => s.note.slice(0, 40))
+        softBlocksOnDay,
+        peakTrafficWarning,
+        peakPeriod: amPeak ? "AM peak" : (pmPeak ? "PM peak" : null)
       });
     }
 
@@ -698,29 +785,64 @@ Suggested actions for admin:
         4: "Tier 4 — Stretch (outside zone, no nearby lessons)"
       };
       const instData = INSTRUCTORS.find(x => x.name === s.instructor);
+
+      // Build "coming from" description
+      let comingFrom;
+      if (s.prevClientName) {
+        comingFrom = `from lesson with ${s.prevClientName} in ${s.prevLocation} (finishes ${s.prevEndTime})`;
+      } else {
+        comingFrom = `from base in ${s.base}`;
+      }
+
+      // Build "next lesson" description
+      let nextLesson;
+      if (s.nextClientName) {
+        nextLesson = `then lesson with ${s.nextClientName} in ${s.nextLocation} at ${s.nextStartTime}`;
+      } else if (s.nextLocation) {
+        nextLesson = `then on to ${s.nextLocation} at ${s.nextStartTime}`;
+      } else {
+        nextLesson = "last lesson of the day";
+      }
+
+      const peakFlag = s.peakTrafficWarning ? `\n  ⚠️ ${s.peakPeriod} — travel may take longer than estimated` : "";
+
+      const softBlockNote = s.softBlocksOnDay && s.softBlocksOnDay.length > 0
+        ? `\n  Soft holds on this day: ${s.softBlocksOnDay.map(b => `${b.startTime}-${b.endTime} "${b.note}"`).join("; ")}`
+        : "";
+
       return `Slot ${i + 1}: ${s.instructor} — ${formatDate(s.date)} (${s.dayName}) at ${s.suggestedStart}
   ${tierLabels[s.tier]}
-  Travel in: ${s.travelIn} min from ${s.prevLocation || s.base}
-  Travel out: ${s.travelOut} min to ${s.nextLocation || "no next lesson"}
+  Coming ${comingFrom}
+  Travel in: ${s.travelIn} min (${s.bufferMins} min buffer applied)
+  After the lesson: ${nextLesson}
+  Travel out: ${s.travelOut} min
   Base: ${s.base} → ${clientSuburb}: ${s.baseTravel} min
   Zone: ${instData?.preferredZone}
-  Other lessons on day: ${s.totalApptsThatDay}`;
+  Lessons booked that day: ${s.totalApptsThatDay}${peakFlag}${softBlockNote}`;
     }).join("\n\n");
 
     const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training. You help office staff choose the best 3 slots from a list of pre-verified options.
 
 Pick the 3 best slots from the provided list. Present each with:
 - Option number, instructor name, date/time
-- Tier label (from the slot data)
-- 2-3 sentences on why: day/time fit, where instructor is coming from that day, what's before/after
+- Tier label
+- 2-3 sentences on: day/time fit, where instructor is coming from (use the "Coming from" line - mention the previous client's name if there is one), what's happening after the lesson
 
 Rules:
 - Use ONLY the slots provided — do not invent any dates or times
-- Always describe where the instructor is coming from that day (use the Travel in field), never default to "from base" if there's a real prev location
-- Tier 1 = ideal, Tier 2 = good, Tier 3 = workable (mention the instructor will already be in the area), Tier 4 = stretch (always add a ⚠️ note)
+- When describing travel, use the exact "Coming from" line provided (include the previous client's name and finish time if shown)
+- If the slot shows a ⚠️ peak traffic warning, include it in your response as a note under that option
+- Tier 1 = ideal, Tier 2 = good, Tier 3 = workable (mention the instructor will already be in the area), Tier 4 = stretch (add a ⚠️ note)
 - If all slots are from one instructor because they're the only eligible one, say so
 - Keep language practical — this is for office staff making booking decisions
-- No client-facing language (no "Hello [name]", no "would you like to book")`;
+- No client-facing language (no "Hello [name]", no "would you like to book")
+
+AT THE END OF YOUR RESPONSE, add an "Admin Review" section ONLY if any of the selected slots have "Soft holds on this day" listed. In that section:
+- Mention each soft hold by date and what it says (e.g., "Tuesday 12/05: Gabriel has a 'Hold for Zain Karim' from 12:00-13:00")
+- Say "Admin: verify these holds before booking — they may be for this client or related clients, or they may need to remain reserved"
+- Do NOT add the Admin Review section for hard blocks (day off, school pickup etc) — those slots will never be suggested anyway
+
+If no soft holds exist on any selected slots, do not include the Admin Review section at all.`;
 
     const userMessage = `CLIENT: ${booking.clientName || "(not specified)"}
 SUBURB: ${clientSuburb}
