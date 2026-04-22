@@ -942,13 +942,18 @@ app.get("/debug-day", async (req, res) => {
     if (!inst) return res.json({ error: `Instructor '${instructorName}' not found` });
 
     // Fetch appointments with EVERY possible field the API exposes
+    // Use date range of the one day + next day so the API returns properly
+    const dateObj = new Date(date + "T12:00:00+10:00");
+    const nextDay = new Date(dateObj.getTime() + 24 * 3600 * 1000);
+    const dateTo = toMelbDateStr(nextDay);
+
     const fullQuery = `
       query {
         appointments(
           locationIDs: [${inst.locationID}]
           providerIDs: [${inst.providerID}]
           dateFrom: "${date}"
-          dateTo: "${date}"
+          dateTo: "${dateTo}"
           pageLength: 100
         ) {
           apptID
@@ -990,7 +995,9 @@ app.get("/debug-day", async (req, res) => {
     `;
 
     const d = await nookalQuery(fullQuery);
-    const rawAppts = d.appointments || [];
+    const allAppts = d.appointments || [];
+    // Filter to only the requested date (we queried date+1 to get proper response)
+    const rawAppts = allAppts.filter(a => a.appointmentDate === date);
 
     // Also introspect ALL types that could be Event-related
     const schemaQueries = {
