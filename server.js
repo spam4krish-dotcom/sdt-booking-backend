@@ -1052,7 +1052,7 @@ app.get("/test-nookal", async (req, res) => {
   await runQuery("staff_list", `
     query {
       staff {
-        staffID firstName lastName locationIDs isProvider
+        staffID firstName lastName locations isProvider
       }
     }
   `);
@@ -1064,15 +1064,18 @@ app.get("/test-nookal", async (req, res) => {
   await runQuery("appointments_today", `
     query {
       appointments(dateFrom: "${today}", dateTo: "${tomorrow}") {
-        appointmentID
+        apptID
         appointmentDate
-        appointmentStartTime
-        appointmentEndTime
-        appointmentLength
+        startTime
+        endTime
         locationID
+        locationName
         providerID
+        providerName
         clientID
+        clientName
         notes
+        status
       }
     }
   `);
