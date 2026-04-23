@@ -895,14 +895,44 @@ async function resolveAppointmentLocation(appt) {
 // Also caches the distance in metres so we can check radii without re-querying.
 const distanceCache = {}; // { "origin|destination": metres }
 
+// Expand common street-type abbreviations so Google Maps geocoding is unambiguous.
+// Examples: "251 Mountain Hwy" → "251 Mountain Highway"
+// This matters because Google can fuzzy-match common abbreviations to the wrong street.
+function expandStreetAbbreviations(addr) {
+  if (!addr) return addr;
+  const replacements = [
+    [/\bHwy\b\.?/gi, "Highway"],
+    [/\bSt\b\.?(?!\s+\w+\s+\b(?:North|South|East|West)\b)/gi, "Street"],  // "St" → "Street", but not "St Kilda"
+    [/\bRd\b\.?/gi, "Road"],
+    [/\bAve\b\.?/gi, "Avenue"],
+    [/\bDr\b\.?/gi, "Drive"],
+    [/\bCt\b\.?/gi, "Court"],
+    [/\bCres\b\.?/gi, "Crescent"],
+    [/\bPl\b\.?/gi, "Place"],
+    [/\bPde\b\.?/gi, "Parade"],
+    [/\bBlvd\b\.?/gi, "Boulevard"],
+    [/\bLn\b\.?/gi, "Lane"],
+    [/\bCl\b\.?/gi, "Close"],
+    [/\bTce\b\.?/gi, "Terrace"]
+  ];
+  let result = addr;
+  for (const [pattern, replacement] of replacements) {
+    result = result.replace(pattern, replacement);
+  }
+  return result;
+}
+
 async function getTravelTime(origin, destination) {
   if (!origin || !destination) return 30;
-  const key = `${origin.toUpperCase()}|${destination.toUpperCase()}`;
+  // Normalise abbreviations BEFORE caching so we don't have duplicate cache keys
+  const originClean = expandStreetAbbreviations(origin);
+  const destClean = expandStreetAbbreviations(destination);
+  const key = `${originClean.toUpperCase()}|${destClean.toUpperCase()}`;
   if (travelCache[key] !== undefined) return travelCache[key];
 
   const needsContext = (s) => !/(,\s*VIC|\b3\d{3}\b|Australia)/i.test(s);
-  const originStr = needsContext(origin) ? `${origin}, Victoria, Australia` : origin;
-  const destStr = needsContext(destination) ? `${destination}, Victoria, Australia` : destination;
+  const originStr = needsContext(originClean) ? `${originClean}, Victoria, Australia` : originClean;
+  const destStr = needsContext(destClean) ? `${destClean}, Victoria, Australia` : destClean;
 
   try {
     const url = `https://maps.googleapis.com/maps/api/distancematrix/json`;
@@ -1557,10 +1587,10 @@ Suggested actions for admin:
       let nextLesson;
       if (s.nextClientName) {
         nextLesson = `then lesson with ${s.nextClientName} at ${s.nextStartTime}`;
-      } else if (s.nextLocation) {
+      } else if (s.nextLocation && s.nextStartTime) {
         nextLesson = `then on to ${s.nextLocation} at ${s.nextStartTime}`;
       } else {
-        nextLesson = "last lesson of the day";
+        nextLesson = "no further appointments scheduled (instructor is free after this lesson)";
       }
 
       const peakFlag = s.peakTrafficWarning ? `\n  ⚠️ ${s.peakPeriod} — travel may take longer than estimated` : "";
@@ -1664,7 +1694,8 @@ Pick the 3 best slots from the provided list. Present each with:
 - 2-3 sentences on: day/time fit, where instructor is coming from (use the "Coming from" line - mention the previous client's name AND any additional context from the appointment notes if present), what's happening after the lesson
 
 Rules:
-- Use ONLY the slots provided — do not invent any dates or times
+- Use ONLY the slots provided — do not invent any dates, times, client names, or next-appointment details
+- If "After the lesson:" shows "no further appointments scheduled", DO NOT invent a next lesson or travel destination. Just say this is the last slot of the day with no onward pressure.
 - When describing travel, use the exact "Coming from" line provided. If it mentions additional context (e.g. "— Ax with OT Jo Coleman"), include that context in your written response
 - If "first availability after X" is mentioned, include that context so admin knows instructor is returning from a break
 - If the slot shows a ⚠️ peak traffic warning, include it in your response as a note under that option
@@ -1754,17 +1785,23 @@ app.get("/health", (req, res) => {
 });
 
 // ─── Cache clear (for when a client moves or we need fresh data) ─────────────
-app.post("/clear-cache", (req, res) => {
+// Accepts both GET and POST so admin can hit it from a browser URL bar.
+function handleClearCache(req, res) {
   const before = {
     clients: Object.keys(clientAddressCache).length,
-    travel: Object.keys(travelCache).length
+    travel: Object.keys(travelCache).length,
+    ics: Object.keys(icsCache).length
   };
   for (const k of Object.keys(clientAddressCache)) delete clientAddressCache[k];
+  for (const k of Object.keys(clientByNameCache)) delete clientByNameCache[k];
   for (const k of Object.keys(travelCache)) delete travelCache[k];
+  for (const k of Object.keys(icsCache)) delete icsCache[k];
   cachedToken = null;
   cachedTokenExpiry = 0;
-  res.json({ cleared: before });
-});
+  res.json({ cleared: before, message: "All caches cleared. Next request will be slower (cold start)." });
+}
+app.get("/clear-cache", handleClearCache);
+app.post("/clear-cache", handleClearCache);
 
 
 // ─── Raw ICS dump: show every field the ICS feed exposes for one day ──────
