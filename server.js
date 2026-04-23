@@ -321,7 +321,12 @@ function hasKnownConsultationType(description) {
 //     - hard-block: instructor unavailable (holidays/day off/sick/non-sdt/etc.)
 //     - clinic-hold: held for Active One or Community OT (eligible for admin alert)
 //     - private-hold: held for a private client (Sherri's style, no alert)
-//     - skip: empty/cancelled/irrelevant
+//     - skip: empty/cancelled/note-reminder/irrelevant
+//
+// Colour signals in ICS (observed consistently across all instructors):
+//   Blue Category   → lesson
+//   Purple Category → Event (hold/block of various kinds)
+//   Orange Category → Note (admin reminder — SKIP, doesn't block time)
 function classifyAppointment(a) {
   const summary = (a.summary || "").trim();
   const summaryLower = summary.toLowerCase();
@@ -336,6 +341,18 @@ function classifyAppointment(a) {
   // Empty/blank entries
   if (!summary && !description) {
     return { kind: "skip", reason: "empty" };
+  }
+
+  // ─── Orange Category = Note (admin reminder, not a real block) ───
+  // Nookal "Note" entries are admin reminders like "No Addie today" or
+  // "SMARTBOX RETURN" — they don't block time, the instructor can still book
+  // around them. They appear in the diary (usually orange/yellow tint) but
+  // are informational only. Detectable by Orange Category + summary === "Note"
+  // AND/OR description starting with "Note details:".
+  const isOrangeCategory = categories.includes("orange category");
+  const descriptionStartsWithNote = /^note\s+details\s*:/i.test(description);
+  if (isOrangeCategory || summary.toLowerCase() === "note" || descriptionStartsWithNote) {
+    return { kind: "skip", reason: "note (admin reminder, not a block)" };
   }
 
   // ─── PRIMARY SIGNAL: ICS colour category ───
@@ -368,7 +385,8 @@ function classifyAppointment(a) {
       "lunch break",
       "job interview", "doctor", "dentist", "ultrasound", "blood test",
       "vic roads", "vicroads", "meet vic",
-      "personal", "myotherapist"
+      "personal", "myotherapist",
+      "soccer training", "sports training"
     ];
     const hardBlockRegex = new RegExp(
       "\\b(" + hardBlockSignals.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+")).join("|") + ")\\b",
