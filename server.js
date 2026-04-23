@@ -1155,45 +1155,71 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
     // Both hard AND soft blocks prevent booking during their time
     // (soft blocks just add a flag for admin review)
     const sorted = [...dayBlocks].sort((a, b) => a.startMins - b.startMins);
-    const gaps = [];
 
-    if (sorted.length === 0) {
+    // Gap calculation: walk through sorted blocks with a cursor that tracks the
+    // farthest point any block ends. This correctly handles OVERLAPPING blocks —
+    // e.g. a full-day Van Day hard-block from 08:30-18:00 with a smaller private
+    // hold at 09:00-10:00 nested inside it. The earlier pairwise logic saw the
+    // private hold ending at 10:00 and opened a false gap 10:00-18:00 because
+    // it didn't know Van Day was still going.
+    const sortedForGaps = sorted;
+
+    // Walk the sorted list, tracking cursor = max end time seen so far.
+    const gaps = [];
+    let cursor = earliestStart;
+    let lastBlockBeforeCursor = null; // the entry whose endMins pushed cursor here
+
+    // Gap before the first block
+    if (sortedForGaps.length === 0) {
       gaps.push({
-        earliestStart: earliestStart, latestEnd: 1050,
+        earliestStart, latestEnd: 1050,
         prevLoc: inst.base, nextLoc: null,
         prevAppt: null, nextAppt: null
       });
     } else {
-      if (sorted[0].startMins > earliestStart) {
+      const first = sortedForGaps[0];
+      if (first.startMins > earliestStart) {
         gaps.push({
-          earliestStart: earliestStart,
-          latestEnd: sorted[0].startMins,
+          earliestStart,
+          latestEnd: first.startMins,
           prevLoc: inst.base,
-          nextLoc: sorted[0].locationForStart,
+          nextLoc: first.locationForStart,
           prevAppt: null,
-          nextAppt: sorted[0]
+          nextAppt: first
         });
       }
-      for (let i = 0; i < sorted.length - 1; i++) {
-        if (sorted[i + 1].startMins > sorted[i].endMins) {
+      cursor = Math.max(earliestStart, first.endMins);
+      lastBlockBeforeCursor = first;
+
+      // Walk the rest, merging overlaps and opening gaps where they exist
+      for (let i = 1; i < sortedForGaps.length; i++) {
+        const entry = sortedForGaps[i];
+        if (entry.startMins > cursor) {
+          // Found a gap: from cursor → entry.startMins
           gaps.push({
-            earliestStart: sorted[i].endMins,
-            latestEnd: sorted[i + 1].startMins,
-            prevLoc: sorted[i].locationForEnd,
-            nextLoc: sorted[i + 1].locationForStart,
-            prevAppt: sorted[i],
-            nextAppt: sorted[i + 1]
+            earliestStart: cursor,
+            latestEnd: entry.startMins,
+            prevLoc: lastBlockBeforeCursor.locationForEnd,
+            nextLoc: entry.locationForStart,
+            prevAppt: lastBlockBeforeCursor,
+            nextAppt: entry
           });
         }
+        // Advance the cursor to the furthest end so far; track which block holds it
+        if (entry.endMins > cursor) {
+          cursor = entry.endMins;
+          lastBlockBeforeCursor = entry;
+        }
       }
-      const last = sorted[sorted.length - 1];
-      if (last.endMins < 1050) {
+
+      // Gap after the last block
+      if (cursor < 1050) {
         gaps.push({
-          earliestStart: last.endMins,
+          earliestStart: cursor,
           latestEnd: 1050,
-          prevLoc: last.locationForEnd,
+          prevLoc: lastBlockBeforeCursor.locationForEnd,
           nextLoc: null,
-          prevAppt: last,
+          prevAppt: lastBlockBeforeCursor,
           nextAppt: null
         });
       }
@@ -1922,7 +1948,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-24-anti-fabrication-hold-context";
+const BUILD_ID = "2026-04-24-gap-overlap-fix";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2115,6 +2141,7 @@ app.get("/debug-slot", async (req, res) => {
     const latestEnd = 1050;
     const BUFFER_MINS = 10;
 
+    // Gap calc with cursor-based walk to handle overlapping blocks properly
     const gaps = [];
     if (resolved.length === 0) {
       gaps.push({
@@ -2124,6 +2151,9 @@ app.get("/debug-slot", async (req, res) => {
         prevAppointmentLabel: "(empty day — from base)"
       });
     } else {
+      let cursor = earliestStart;
+      let lastBefore = null;
+
       if (resolved[0].startMins > earliestStart) {
         gaps.push({
           earliestStart, latestEnd: resolved[0].startMins,
@@ -2132,26 +2162,34 @@ app.get("/debug-slot", async (req, res) => {
           prevAppointmentLabel: "(first slot — from base)"
         });
       }
-      for (let i = 0; i < resolved.length - 1; i++) {
-        if (resolved[i + 1].startMins > resolved[i].endMins) {
+      cursor = Math.max(earliestStart, resolved[0].endMins);
+      lastBefore = resolved[0];
+
+      for (let i = 1; i < resolved.length; i++) {
+        const entry = resolved[i];
+        if (entry.startMins > cursor) {
           gaps.push({
-            earliestStart: resolved[i].endMins,
-            latestEnd: resolved[i + 1].startMins,
-            prevLoc: resolved[i].locationForEnd,
-            nextLoc: resolved[i + 1].locationForStart,
-            prevAppt: resolved[i],
-            nextAppt: resolved[i + 1],
-            prevAppointmentLabel: `${resolved[i].label} (${resolved[i].kind})`
+            earliestStart: cursor,
+            latestEnd: entry.startMins,
+            prevLoc: lastBefore.locationForEnd,
+            nextLoc: entry.locationForStart,
+            prevAppt: lastBefore,
+            nextAppt: entry,
+            prevAppointmentLabel: `${lastBefore.label} (${lastBefore.kind})`
           });
         }
+        if (entry.endMins > cursor) {
+          cursor = entry.endMins;
+          lastBefore = entry;
+        }
       }
-      const last = resolved[resolved.length - 1];
-      if (last.endMins < latestEnd) {
+
+      if (cursor < latestEnd) {
         gaps.push({
-          earliestStart: last.endMins, latestEnd,
-          prevLoc: last.locationForEnd, nextLoc: null,
-          prevAppt: last, nextAppt: null,
-          prevAppointmentLabel: `${last.label} (${last.kind}) — last of day`
+          earliestStart: cursor, latestEnd,
+          prevLoc: lastBefore.locationForEnd, nextLoc: null,
+          prevAppt: lastBefore, nextAppt: null,
+          prevAppointmentLabel: `${lastBefore.label} (${lastBefore.kind}) — last of day`
         });
       }
     }
