@@ -77,7 +77,7 @@ const INSTRUCTORS = [
     maxTravelFromBase: 35,
     hardZone: true,
     preferredZone: "Mornington Peninsula only — Rye, Rosebud, Mornington, Mt Eliza, Dromana, Safety Beach, Sorrento.",
-    icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fgA7lzqZCrNH6P0mJPZWpJqu4G4d87qHmXHYUUq3ZhplneSIXp12lfHZzfvGyQdDw%3D%3D"
+    icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaJ6xepUO6AS0mQIBuSqW%2BOWjh2dEdLM2ryJYQBbgLemmcR6jFHgrJeGdQCO3yfSW7dInaTI63gFq7aNCi2ArGCg%3D%3D"
   }
 ];
 
@@ -517,13 +517,13 @@ function extractNotesLocation(rawNotes) {
   const streetAddressMatch = notes.match(/(\d{1,5}\s+[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*\s+(?:Street|St|Road|Rd|Avenue|Ave|Drive|Dr|Court|Ct|Crescent|Cres|Place|Pl|Parade|Pde|Way|Highway|Hwy|Boulevard|Blvd|Lane|Ln|Close|Cl|Terrace|Tce))\b/i);
   if (streetAddressMatch) {
     const streetPart = streetAddressMatch[1].trim();
-    // Try to find a suburb near this address (within 50 chars)
-    const startIdx = streetAddressMatch.index;
-    const endIdx = startIdx + streetAddressMatch[0].length;
-    const nearbyContext = notes.slice(Math.max(0, startIdx - 50), Math.min(notes.length, endIdx + 80));
-    const nearbyCaps = nearbyContext.match(/\b([A-Z]{3,}(?:\s+[A-Z]{2,})*)\b/g) || [];
+    // Search the WHOLE notes string for a suburb-like ALL CAPS word.
+    // Street addresses often have the suburb elsewhere in the description.
+    // e.g. "WANTIRNA Ax with OT ... Eastern Health Wantirna 251 Mountain Hwy"
+    // — suburb "WANTIRNA" is at start, address is later.
+    const allCaps = notes.match(/\b([A-Z]{3,}(?:\s+[A-Z]{2,})*)\b/g) || [];
     let suburbPart = null;
-    for (const caps of nearbyCaps) {
+    for (const caps of allCaps) {
       if (isLikelySuburb(caps)) { suburbPart = cleanSuburb(caps); break; }
     }
     const fullAddress = suburbPart ? `${streetPart}, ${suburbPart}` : streetPart;
