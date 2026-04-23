@@ -1670,14 +1670,15 @@ Suggested actions for admin:
       adminAlertsText += alertLines.join("\n");
     }
 
-    // Filter data alerts: only show alerts that affect the dates of our top-3
-    // recommended slots. An unresolved lesson on an unrelated date doesn't need
-    // admin attention — it doesn't affect this booking.
-    const selectedInstructorDates = new Set(
-      selected.map(s => `${s.instructor}|${s.date}`)
+    // Filter data alerts: only show alerts relevant to the top 3 scored slots
+    // (what Claude is most likely to present). Scoping to the full top-10 candidates
+    // lets Gabriel/other low-ranked slots' alerts leak into Yves-only responses.
+    const topThreeSlots = selected.slice(0, 3);
+    const topThreeInstructorDates = new Set(
+      topThreeSlots.map(s => `${s.instructor}|${s.date}`)
     );
     const relevantDataAlerts = allAdminAlerts.filter(a =>
-      selectedInstructorDates.has(`${a.instructor}|${a.date}`)
+      topThreeInstructorDates.has(`${a.instructor}|${a.date}`)
     );
 
     if (relevantDataAlerts.length > 0) {
@@ -1773,7 +1774,7 @@ ${slotDescriptions}${adminAlertsText}`;
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-24-abbreviations-prompt-cleanup";
+const BUILD_ID = "2026-04-24-data-alerts-top3-scoping";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
