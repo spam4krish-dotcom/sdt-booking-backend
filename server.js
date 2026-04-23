@@ -22,13 +22,30 @@ const NOOKAL_GRAPHQL_URL = "https://au-apiv3.nookal.com/graphql";
 //     ICS gives us clean titles/categories the API doesn't expose
 //   - locationID + providerID: used for API client address lookups only
 //     Gabriel + Christian share Driving Matters Pty Ltd (locationID 1)
+// Zone lists derived from 2 years of real diary data (23/4/24 — 23/4/26).
+// coreZone = suburbs regularly served (2+ visits/year, or typical pattern area)
+// stretchZone = suburbs served occasionally but legitimately (1-2 visits/year)
+// Anything outside both requires "nearby lesson that day" to be suggested.
 const INSTRUCTORS = [
   {
     name: "Christian", base: "Montmorency", locationID: 1, providerID: 32,
     mods: ["LFA", "Spinner", "Electronic Spinner", "Hand Controls", "Satellite", "Extension Pedals", "Indicator Extension"],
     allAreas: true,
     maxTravelFromBase: 65,
-    preferredZone: "All Melbourne areas by arrangement",
+    maxRadiusKm: 60, // Christian has been everywhere; use generous fallback
+    coreZone: [
+      "Montmorency", "Thomastown", "Greensborough", "Heidelberg Heights", "Heidelberg",
+      "Yallambie", "Preston", "Lalor", "Kew", "Brunswick", "Brunswick East",
+      "Clifton Hill", "Fitzroy", "Rowville", "Essendon", "Highett", "Hampton",
+      "Chadstone", "Boronia", "Mill Park", "Wollert", "Mount Waverley",
+      "Hawthorn", "Brighton", "Beaumaris", "Greenvale", "Wheelers Hill"
+    ],
+    stretchZone: [
+      "Frankston", "Narre Warren South", "Narre Warren", "Berwick", "Pakenham",
+      "Mount Evelyn", "Wyndham Vale", "Noble Park", "Warragul", "Tarneit",
+      "Lyndhurst", "Altona Meadows", "Aspendale Gardens", "Bundoora"
+    ],
+    preferredZone: "All Melbourne areas by arrangement (historically served everywhere east, north, SE)",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fnXpnN%2FtMeidfD9E6WmLBWPsPF881mF4%2FDKjqX6mENEnlggTWF2jMn8Em8aKgSGXA%3D%3D"
   },
   {
@@ -36,47 +53,115 @@ const INSTRUCTORS = [
     mods: ["LFA", "Spinner", "Electronic Spinner", "Hand Controls", "Satellite", "O-Ring", "Monarchs", "Indicator Extension"],
     earliestStart: "09:30",
     maxTravelFromBase: 55,
-    zoneByArrangement: true,
-    preferredZone: "East Melbourne — Croydon, Ringwood, Box Hill, Frankston corridor. Will go further by arrangement.",
+    maxRadiusKm: 35,
+    coreZone: [
+      "Croydon North", "Croydon", "Croydon South", "Croydon Hills", "Ringwood",
+      "Ringwood North", "Ringwood East", "Bayswater North", "Bayswater",
+      "Warrandyte", "Donvale", "Kilsyth", "Glen Waverley", "Kew", "Camberwell",
+      "Wheelers Hill", "Mont Albert North", "Mont Albert", "Balwyn", "Box Hill",
+      "Templestowe", "Eltham", "Surrey Hills", "Mitcham", "Vermont"
+    ],
+    stretchZone: [
+      "Narre Warren", "Frankston", "Chelsea Heights", "Chelsea", "Bonbeach",
+      "Lalor", "Heidelberg West", "Keysborough", "Ashwood", "Hawthorn",
+      "Mount Waverley", "Glen Waverley", "Williamstown", "Dandenong North",
+      "Brighton", "Lynbrook", "Black Rock"
+    ],
+    preferredZone: "East Melbourne — Croydon, Ringwood, Box Hill, Templestowe corridor. Occasionally SE to Frankston.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2a52GEgwyPVJ%2B0I6mOab2rD4%2Bmqr7EYvQGR9ykfeKAj%2F"
   },
   {
     name: "Greg", base: "Kilsyth", locationID: 41, providerID: 77,
     mods: ["LFA", "Spinner", "Electronic Spinner", "Monarchs", "Indicator Extension"],
     maxTravelFromBase: 55,
-    zoneByArrangement: true,
-    preferredZone: "Extended East & South-East Melbourne — Kilsyth, Ringwood, Knox, Dandenong, Frankston, Bayside.",
+    maxRadiusKm: 45,
+    coreZone: [
+      "Kilsyth", "Mooroolbark", "Croydon", "Croydon North", "Croydon South",
+      "Ringwood", "Ringwood North", "Blackburn", "Blackburn South",
+      "Box Hill North", "Warrandyte North", "Mill Park", "Reservoir",
+      "Frankston", "Carrum Downs", "Mentone", "Brighton", "Caulfield South",
+      "Malvern East", "Wheelers Hill", "Hawthorn", "Ferntree Gully", "Boronia",
+      "Pascoe Vale", "Preston", "Heidelberg Heights", "Cranbourne", "Caulfield North"
+    ],
+    stretchZone: [
+      "Brighton", "Coburg", "Coburg North", "Caroline Springs", "Belgrave Heights",
+      "Cranbourne East", "Patterson Lakes", "Footscray", "Braybrook", "Elwood",
+      "Ormond", "Bentleigh East", "Hughesdale", "Epping", "Mickleham", "Albanvale"
+    ],
+    preferredZone: "Extended East & SE — Kilsyth, Ringwood, Blackburn, Frankston corridor, Bayside (Brighton, Caulfield), inner north (Preston, Coburg).",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2fgA7lzqZCrNH6P0mJPZWpJqu4G4d87qHmXHYUUq3ZhplneSIXp12lfHZzfvGyQdDw%3D%3D"
   },
   {
     name: "Jason", base: "Wandin North", locationID: 23, providerID: 59,
     mods: ["LFA", "Spinner"],
     maxTravelFromBase: 55,
-    zoneByArrangement: true,
-    preferredZone: "East Melbourne & Yarra Valley — Wandin, Lilydale, Mooroolbark, Ringwood, Knox, SE up to Bayside.",
+    maxRadiusKm: 35,
+    coreZone: [
+      "Wandin North", "Wandin", "Mooroolbark", "Lilydale", "Kilsyth",
+      "Croydon", "Croydon Hills", "Warrandyte", "Ringwood", "Ringwood East",
+      "Cockatoo", "Healesville", "Research", "Tecoma", "Monbulk"
+    ],
+    stretchZone: [
+      "Canterbury", "Hawthorn", "Hawthorn East", "Camberwell", "Glen Iris",
+      "Glen Waverley", "Ferntree Gully", "Donvale", "Knoxfield", "Rowville",
+      "Lynbrook", "Pakenham", "Scoresby"
+    ],
+    preferredZone: "East Melbourne & Yarra Valley — Wandin, Lilydale, Mooroolbark, Ringwood, Knox. Occasional Camberwell/Hawthorn.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Sks8REnxfIzFLWWhJgXRykKsTkQKIlND6Q3P8UWc8WWFJCS5Y5gIU0xiqPfnSz%2FkQ%3D%3D"
   },
   {
     name: "Marc", base: "Werribee", locationID: 51, providerID: 90,
     mods: ["LFA", "Spinner", "Electronic Spinner", "Extension Pedals", "Indicator Extension"],
     maxTravelFromBase: 55,
-    preferredZone: "West Melbourne — Werribee, Hoppers Crossing, Tarneit, Melton, Sunshine, Footscray, Altona, Laverton.",
+    maxRadiusKm: 45,
+    coreZone: [
+      "Werribee", "Hoppers Crossing", "Tarneit", "Wyndham Vale", "Melton",
+      "Melton West", "Melton South", "Cairnlea", "Hillside", "Sunbury",
+      "Tullamarine", "Seabrook", "Laverton North", "Laverton", "Truganina",
+      "Point Cook", "Delahay", "Caroline Springs", "Doreen", "Northcote",
+      "Gowanbrae", "Pascoe Vale", "Broadmeadows", "Brunswick", "Brunswick West",
+      "Parkville", "Avondale Heights", "Bundoora", "Kensington"
+    ],
+    stretchZone: [
+      "Roxburgh Park", "Collingwood", "Middle Park", "Preston", "Essendon",
+      "Ivanhoe", "Altona", "Sth Morang", "Lalor"
+    ],
+    preferredZone: "West Melbourne + inner north. Werribee/Hoppers/Tarneit/Melton core, also Sunbury, Brunswick, Parkville, Northcote, Broadmeadows corridor.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2ecoRZN2xzdtmsUYY9vDrAuMuEJAzQSivaNXrwqSOqrMT982Jq4gficfE9XDNSVl0A%3D%3D"
   },
   {
     name: "Sherri", base: "Wandin North", locationID: 5, providerID: 38,
     mods: [],
     maxTravelFromBase: 50,
-    zoneByArrangement: true,
-    preferredZone: "Wandin to Ringwood radius. Will travel further if lessons are planned. Also covers Warragul area.",
+    maxRadiusKm: 35,
+    coreZone: [
+      "Wandin North", "Wandin", "Lilydale", "Chirnside Park", "Park Orchards",
+      "Montrose", "Kilsyth", "Mooroolbark", "Croydon", "Rowville",
+      "Upper Ferntree Gully", "Wantirna South", "Hurstbridge"
+    ],
+    stretchZone: [
+      "Frankston South", "Frankston North", "Keysborough", "Prahran",
+      "Clyde North", "Cranbourne West", "Narre Warren", "Narre Warren North",
+      "Narre Warren South", "Berwick", "Lyndhurst"
+    ],
+    preferredZone: "East to Ringwood corridor (Lilydale, Chirnside Park, Montrose). Private clients occasionally Frankston South, Keysborough, Prahran, SE suburbs.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaGeCeSgeSmXf%2F4kKI9OvU2Qm9F8eQzb%2B6bu2IC%2FLaNBOOWmK9yskJZYl8guOGtP67bXXfuA0nBVLMaaPL2rsqew%3D%3D"
   },
   {
     name: "Yves", base: "Rye", locationID: 29, providerID: 62,
     mods: ["LFA", "Spinner", "Electronic Spinner", "Indicator Extension"],
     maxTravelFromBase: 35,
+    maxRadiusKm: 35,
     hardZone: true,
-    preferredZone: "Mornington Peninsula only — Rye, Rosebud, Mornington, Mt Eliza, Dromana, Safety Beach, Sorrento.",
+    coreZone: [
+      "Rye", "Rosebud", "Tootgarook", "Capel Sound", "Dromana",
+      "Mornington", "Mount Eliza", "Safety Beach", "Sorrento",
+      "Hastings", "Somerville", "Tyabb", "Crib Point", "Cape Schanck"
+    ],
+    stretchZone: [
+      "Frankston"  // edge of Peninsula only
+    ],
+    preferredZone: "Mornington Peninsula only (hard zone). Rye, Rosebud, Mornington, Mt Eliza, Dromana, Safety Beach, Sorrento, Hastings, Somerville, Tyabb.",
     icsUrl: "https://calsync.nookal.com/icsFile.php?HhXBkBCdHTLQaK4lrqfVa9ew%2FKnxwK8N60bfEsnM4Tix4fvM5lyQStblMTQiqaNaJ6xepUO6AS0mQIBuSqW%2BOWjh2dEdLM2ryJYQBbgLemmcR6jFHgrJeGdQCO3yfSW7dInaTI63gFq7aNCi2ArGCg%3D%3D"
   }
 ];
@@ -354,14 +439,32 @@ function classifyAppointment(a) {
   }
 
   // ─── Orange Category = Note (admin reminder, not a real block) ───
-  // Nookal "Note" entries are admin reminders like "No Addie today" or
-  // "SMARTBOX RETURN" — they don't block time, the instructor can still book
-  // around them. They appear in the diary (usually orange/yellow tint) but
-  // are informational only. Detectable by Orange Category + summary === "Note"
-  // AND/OR description starting with "Note details:".
+  // Short Notes are admin reminders like "No Addie today" — they don't block time.
+  // Long Notes (>= 4 hours) are effectively day-off markers (e.g. a 13-hour
+  // "SMARTBOX RETURN" Note) and should hard-block the time to prevent slot
+  // suggestions in those windows.
   const isOrangeCategory = categories.includes("orange category");
   const descriptionStartsWithNote = /^note\s+details\s*:/i.test(description);
   if (isOrangeCategory || summary.toLowerCase() === "note" || descriptionStartsWithNote) {
+    // Compute duration — if the Note spans 4+ hours, treat as hard-block
+    if (a.startTime && a.endTime) {
+      const startM = timeToMins(a.startTime.slice(0, 5));
+      const endM = timeToMins(a.endTime.slice(0, 5));
+      const durationMins = endM - startM;
+      if (durationMins >= 240) {
+        // Long Note = effectively a day-off block
+        // Extract the real note content from description for label
+        const noteContent = description.replace(/^note\s+details\s*:\s*/i, "")
+                                       .replace(/location\s*:[^\n]*$/i, "")
+                                       .trim()
+                                       .slice(0, 60);
+        return {
+          kind: "hard-block",
+          reason: "long note (effectively day-off)",
+          label: noteContent ? `Note: ${noteContent}` : "Long-duration admin note"
+        };
+      }
+    }
     return { kind: "skip", reason: "note (admin reminder, not a block)" };
   }
 
@@ -396,7 +499,11 @@ function classifyAppointment(a) {
       "job interview", "doctor", "dentist", "ultrasound", "blood test",
       "vic roads", "vicroads", "meet vic",
       "personal", "myotherapist",
-      "soccer training", "sports training"
+      "soccer training", "sports training",
+      // Non-SDT private work patterns (instructors doing test-prep for outside clients)
+      "pre test lesson", "initial lesson test",
+      // "X to Y" test-route pattern (e.g. "LILYDALE to HEALESVILLE")
+      // harder to match via simple keywords — caught by pickup-dropoff detection below
     ];
     const hardBlockRegex = new RegExp(
       "\\b(" + hardBlockSignals.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+")).join("|") + ")\\b",
@@ -404,6 +511,19 @@ function classifyAppointment(a) {
     );
     if (hardBlockRegex.test(summary)) {
       return { kind: "hard-block", reason: "unavailable", label: summary };
+    }
+
+    // Non-SDT private instructor work: Purple Event with " TEST" or "TEST" preceded by a name.
+    // Patterns: "Event - Dash Clark TEST", "Event - Savannah Kipping INITIAL LESSON TEST",
+    // "Event - Jane Smith PRE TEST LESSON". Since we're inside the Purple Event branch,
+    // a summary ending in TEST or containing " TEST " is Non-SDT instructor work.
+    if (/\btest\b/i.test(summary)) {
+      return { kind: "hard-block", reason: "non-sdt work (instructor private test-prep)", label: summary };
+    }
+
+    // Also detect "X to Y" test routes (Jason's pattern like "LILYDALE to HEALESVILLE")
+    if (/^event\s*[-–]\s*[A-Z][A-Z\s]+\s+to\s+[A-Z][A-Z\s]+$/i.test(summary.trim())) {
+      return { kind: "hard-block", reason: "test route (non-sdt)", label: summary };
     }
 
     // Clinic-partnership holds (worth admin alert when nearby)
@@ -1010,6 +1130,102 @@ function matchClinicPartner(summary) {
   return null;
 }
 
+// ─── Zone helpers ────────────────────────────────────────────────────────────
+// Extract a suburb name from a location string. Handles "14 Davey Street, Frankston VIC 3199",
+// "88 Reynolds Road, Doncaster East VIC 3109", etc. Falls back to the string itself if it's
+// already just a suburb.
+function extractSuburbFromLocation(loc) {
+  if (!loc) return null;
+  const s = String(loc).trim();
+
+  // Pattern 1: address with suburb before VIC/postcode, e.g. "14 Davey Street, Frankston VIC 3199"
+  // Capture the phrase right before VIC or 4-digit postcode
+  const beforeVic = s.match(/,\s*([A-Za-z][A-Za-z\s]{2,40}?)\s+(?:VIC|Victoria|,|\b3\d{3}\b)/i);
+  if (beforeVic) {
+    return beforeVic[1].trim().replace(/\s+/g, " ");
+  }
+
+  // Pattern 2: "SUBURB NAME, VIC 3XXX" no leading comma
+  const withPostcode = s.match(/([A-Za-z][A-Za-z\s]{2,40}?)\s+(?:VIC|Victoria)\s+3\d{3}/i);
+  if (withPostcode) {
+    return withPostcode[1].trim().replace(/\s+/g, " ");
+  }
+
+  // Pattern 3: all caps with no context, e.g. "WANTIRNA" or "FRANKSTON Civic Centre"
+  // Take the first capitalized 3+ char word if it looks like a suburb
+  const firstCaps = s.match(/^([A-Z][A-Za-z\s-]+?)(?:,|\s+VIC|\s+Vic|\s+3\d{3}|$)/);
+  if (firstCaps) {
+    // Try to trim trailing junk like "Civic Centre"
+    const candidate = firstCaps[1].trim().replace(/\s+(Civic|Centre|Station|Clinic|Hospital|College|Grammar|Street|Road|Avenue|Drive|Court)\b.*$/i, "");
+    if (candidate.length >= 3) return candidate.replace(/\s+/g, " ");
+  }
+
+  // Last resort: first line
+  const firstLine = s.split(/\n|\r/)[0].trim();
+  if (firstLine.length <= 40) return firstLine.replace(/\s+/g, " ");
+  return null;
+}
+
+// Normalise a suburb name for comparison (lower-case, trim, remove punctuation)
+function normSuburb(s) {
+  if (!s) return "";
+  return String(s).toLowerCase().trim().replace(/[.,]/g, "").replace(/\s+/g, " ");
+}
+
+// Check if a client suburb is in an instructor's core zone, stretch zone, or neither.
+// Returns: "core" | "stretch" | "outside"
+function getZoneFit(instructor, clientSuburb) {
+  const cs = normSuburb(clientSuburb);
+  if (!cs) return "outside";
+
+  // Try exact suburb match first
+  const coreMatch = (instructor.coreZone || []).some(z => normSuburb(z) === cs);
+  if (coreMatch) return "core";
+
+  const stretchMatch = (instructor.stretchZone || []).some(z => normSuburb(z) === cs);
+  if (stretchMatch) return "stretch";
+
+  // Check if client suburb contains or is contained by a zone entry
+  // (handles "Frankston South" partial-matching to "Frankston" in Yves stretch list)
+  const csWords = cs.split(" ");
+  const coreLoose = (instructor.coreZone || []).some(z => {
+    const zn = normSuburb(z);
+    return cs.includes(zn) || zn.includes(cs);
+  });
+  if (coreLoose) return "core";
+
+  const stretchLoose = (instructor.stretchZone || []).some(z => {
+    const zn = normSuburb(z);
+    return cs.includes(zn) || zn.includes(cs);
+  });
+  if (stretchLoose) return "stretch";
+
+  return "outside";
+}
+
+// Check if any of the instructor's REAL appointments that day are within 15km
+// of the client's location. Used to detect "already in the area" scenarios.
+// Only counts lesson (Blue Category client appointments) and clinic-holds —
+// private-holds have unreliable locations so we don't use them for this check.
+async function hasNearbyAppointmentSameDay(appointmentsForDay, clientAddress) {
+  const NEARBY_THRESHOLD_KM = 15;
+  for (const a of appointmentsForDay) {
+    if (a.kind !== "lesson" && a.kind !== "clinic-hold") continue;
+    if (!a.locationForStart) continue;
+    const dist = await getDistanceKm(a.locationForStart, clientAddress);
+    if (dist !== null && dist <= NEARBY_THRESHOLD_KM) {
+      return {
+        found: true,
+        distanceKm: Math.round(dist * 10) / 10,
+        nearbyClient: a.clientName || a.label,
+        nearbyLocation: a.locationForStart,
+        nearbyTime: a.startTime
+      };
+    }
+  }
+  return { found: false };
+}
+
 // ─── Availability Parsing ────────────────────────────────────────────────────
 const TIME_BLOCKS = {
   "early-morning": [480, 600],
@@ -1041,8 +1257,21 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
   const startDate = toMelbDateStr(now);
   const endDate = toMelbDateStr(new Date(now.getTime() + weeksToScan * 7 * 24 * 3600 * 1000));
 
+  // Extract client's suburb from the address for zone checks
+  const clientSuburbName = extractSuburbFromLocation(clientSuburb) || clientSuburb;
+  const zoneFit = getZoneFit(inst, clientSuburbName);
+
+  // Yves: hard zone — if client is outside Peninsula, skip entirely
+  if (inst.hardZone && zoneFit === "outside") {
+    return { slots: [], adminAlerts: [], allClinicHolds: [] };
+  }
+
   const baseTravel = await getTravelTime(inst.base, clientSuburb);
-  if (inst.hardZone && baseTravel > inst.maxTravelFromBase) {
+  // Also check distance from base for non-zone-list matches
+  const baseDistanceKm = await getDistanceKm(inst.base, clientSuburb);
+
+  // Hard-zone fallback via distance if zone list doesn't have the suburb
+  if (inst.hardZone && baseDistanceKm !== null && baseDistanceKm > inst.maxRadiusKm) {
     return { slots: [], adminAlerts: [], allClinicHolds: [] };
   }
 
@@ -1307,15 +1536,30 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
       }
       if (!matchedBlock) continue;
 
-      const maxT = inst.maxTravelFromBase || 60;
-      const inNaturalZone = inst.allAreas || baseTravel <= maxT;
-      const nearbyOnDay = rawTravelIn <= 20;
+      // ─── Smart zone-aware tier calculation ───
+      // Check if instructor is already "in the area" via any real lesson/clinic-hold within 15km
+      const nearbyInfo = await hasNearbyAppointmentSameDay(sorted, clientSuburb);
 
+      // Tier logic:
+      //   Client in CORE zone + travelIn ≤ 25 min → Tier 1 (ideal)
+      //   Client in CORE zone + travelIn > 25 min → Tier 2 (good but longer travel)
+      //   Client in STRETCH zone + has nearby lesson same day → Tier 2 (already in area)
+      //   Client in STRETCH zone + no nearby → Tier 3 (occasional reach)
+      //   Client OUTSIDE zones + has nearby lesson → Tier 3 (area visit)
+      //   Client OUTSIDE zones + no nearby lesson → Tier 4 ⚠️ stretch (heavily de-ranked)
       let tier;
-      if (inNaturalZone && nearbyOnDay) tier = 1;
-      else if (inNaturalZone && !nearbyOnDay) tier = 2;
-      else if (!inNaturalZone && nearbyOnDay) tier = 3;
-      else tier = 4;
+      let tierReason = "";
+      if (zoneFit === "core") {
+        if (rawTravelIn <= 25) { tier = 1; tierReason = "in core zone, short travel"; }
+        else { tier = 2; tierReason = "in core zone, longer travel"; }
+      } else if (zoneFit === "stretch") {
+        if (nearbyInfo.found) { tier = 2; tierReason = `in stretch zone, nearby lesson same day (${nearbyInfo.nearbyClient} ${nearbyInfo.nearbyTime})`; }
+        else { tier = 3; tierReason = "in stretch zone, no nearby lessons"; }
+      } else {
+        // outside all zones
+        if (nearbyInfo.found) { tier = 3; tierReason = `already in area (${nearbyInfo.nearbyClient} ${nearbyInfo.nearbyTime}, ${nearbyInfo.distanceKm}km away)`; }
+        else { tier = 4; tierReason = "outside usual zones, empty day — stretch"; }
+      }
 
       // Peak traffic flag: AM peak 7:30-9:15, PM peak 15:00-18:00
       // Only flag if instructor is coming from a previous lesson (not base/home)
@@ -1343,12 +1587,20 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
         travelOut: rawTravelOut,
         bufferMinsApplied: bufferInApplied,
         baseTravel,
+        baseDistanceKm,
+        zoneFit,
+        tierReason,
+        nearbyOnDay: nearbyInfo.found,
+        nearbyClient: nearbyInfo.nearbyClient || null,
+        nearbyTime: nearbyInfo.nearbyTime || null,
         prevLocation: gap.prevLoc,
         nextLocation: gap.nextLoc,
         prevClientName: gap.prevAppt?.clientName || null,
         prevEndTime: gap.prevAppt?.endTime || null,
-        prevAppointmentKind: gap.prevAppt?.kind || null,  // "lesson" | "clinic-hold" | "private-hold" | "hard-block" | null
-        prevAppointmentNote: gap.prevAppt?.note?.split("\n")[0]?.slice(0, 80) || null,
+        prevAppointmentKind: gap.prevAppt?.kind || null,
+        prevAppointmentNote: gap.prevAppt?.note
+          ? stripIcsDescriptionPrefix(gap.prevAppt.note).split("\n")[0].slice(0, 60) || null
+          : null,
         prevAppointmentLabel: gap.prevAppt?.label?.slice(0, 80) || null,
         nextClientName: gap.nextAppt?.clientName || null,
         nextStartTime: gap.nextAppt?.startTime || null,
@@ -1373,20 +1625,28 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
 // ─── Scoring ─────────────────────────────────────────────────────────────────
 function scoreSlot(slot) {
   let score = 0;
+  // Tier is the biggest factor — Tier 4 is a significant penalty so it only
+  // appears if nothing else is available.
   if (slot.tier === 1) score += 500;
   else if (slot.tier === 2) score += 300;
   else if (slot.tier === 3) score += 100;
-  else score -= 100;
+  else score -= 500; // Tier 4 = aggressive de-rank
 
+  // Travel time penalty scales linearly with travel minutes
   score -= slot.travelIn * 5;
   if (slot.travelIn <= 5) score += 150;
   else if (slot.travelIn <= 10) score += 100;
   else if (slot.travelIn <= 20) score += 50;
 
+  // Base distance bonus (instructor lives close to client's suburb)
   if (slot.baseTravel <= 15) score += 40;
   else if (slot.baseTravel <= 30) score += 20;
   else if (slot.baseTravel > 55) score -= 30;
 
+  // Bonus if instructor is already in the area that day
+  if (slot.nearbyOnDay) score += 80;
+
+  // Earlier dates preferred (slight bias so admin gets earliest-available first)
   score -= (new Date(slot.date) - new Date()) / (1000 * 60 * 60 * 24) * 0.3;
   return score;
 }
@@ -1592,10 +1852,10 @@ Suggested actions for admin:
 
     const slotDescriptions = selected.map((s, i) => {
       const tierLabels = {
-        1: "Tier 1 — Ideal (in zone, nearby on day)",
-        2: "Tier 2 — Good (in natural zone)",
-        3: "Tier 3 — Workable (outside zone but nearby on day)",
-        4: "Tier 4 — Stretch (outside zone, no nearby lessons)"
+        1: "Tier 1 — Ideal (in core zone, short travel)",
+        2: "Tier 2 — Good (in core zone with longer travel, or stretch zone while already in area)",
+        3: "Tier 3 — Area visit (outside usual zone but instructor is already nearby that day)",
+        4: "Tier 4 — Stretch ⚠️ (outside zones and instructor not in the area — uses for edge cases only)"
       };
       const instData = INSTRUCTORS.find(x => x.name === s.instructor);
 
@@ -1606,10 +1866,8 @@ Suggested actions for admin:
           : "";
         comingFrom = `from lesson with ${s.prevClientName}${contextNote} (finishes ${s.prevEndTime})`;
       } else if (s.prevAppointmentKind === "clinic-hold") {
-        // Clinic-partner hold just ended (e Active One Frankston)
         comingFrom = `from a ${s.prevAppointmentLabel} hold (ends ${s.prevEndTime}) — instructor was at the clinic`;
       } else if (s.prevAppointmentKind === "private-hold") {
-        // Private hold just ended. We don't know exact location (admin can verify).
         comingFrom = `from a "${s.prevAppointmentLabel}" hold ending ${s.prevEndTime} — exact location not confirmed, admin should verify`;
       } else if (s.priorHardBlock) {
         comingFrom = `from base in ${s.base} (first availability after "${s.priorHardBlock}")`;
@@ -1632,14 +1890,19 @@ Suggested actions for admin:
         ? `${s.bufferMinsApplied} min buffer applied`
         : "no buffer (coming from base)";
 
+      // Add in-area context line for Tier 2/3 "already in area" slots
+      const inAreaNote = s.nearbyOnDay && s.tier >= 2
+        ? `\n  In area: ${s.instructor} is already near ${clientSuburb} that day (nearby lesson with ${s.nearbyClient} at ${s.nearbyTime})`
+        : "";
+
       return `Slot ${i + 1}: ${s.instructor} — ${formatDate(s.date)} (${s.dayName}) at ${s.suggestedStart}
   ${tierLabels[s.tier]}
+  Zone fit: ${s.zoneFit} (${s.tierReason})
   Coming ${comingFrom}
   Travel in: ${s.travelIn} min (${bufferNote})
   After the lesson: ${nextLesson}
   Travel out: ${s.travelOut} min
-  Base: ${s.base} → ${clientSuburb}: ${s.baseTravel} min
-  Zone: ${instData?.preferredZone}
+  Base: ${s.base} → ${clientSuburb}: ${s.baseTravel} min${inAreaNote}
   Lessons booked that day: ${s.totalApptsThatDay}${peakFlag}`;
     }).join("\n\n");
 
@@ -1749,7 +2012,11 @@ Style rules:
 - Use the exact "Coming from" line provided. If it says "from a private hold" or "from a clinic hold", describe that accurately — don't say "from lesson with X".
 - If "After the lesson:" says "no further appointments scheduled — do not invent a next appointment", obey that literally. Say the instructor is free after, full stop.
 - If the slot shows a ⚠️ peak traffic warning, mention it
-- Tier 1 = ideal, Tier 2 = good, Tier 3 = workable (already in area), Tier 4 = stretch (add ⚠️)
+- If a slot has an "In area:" line, mention this context in your write-up — it's WHY the slot works despite the instructor being outside their usual zone (e.g. "Christian is already in Frankston for his 2pm lesson, so the earlier slot fits nicely")
+- Tier 1 = ideal (core zone, short travel) — strong recommendation
+- Tier 2 = good (longer travel in zone, or stretch zone with nearby lesson) — solid choice, mention any in-area context
+- Tier 3 = area visit (outside usual zone but instructor's diary puts them nearby that day) — explain the "already in area" reasoning
+- Tier 4 ⚠️ stretch — the instructor doesn't usually work in this area AND isn't in the area that day. Add an explicit ⚠️ warning. Only use if nothing better is available.
 - If only one instructor had eligible slots, explain why others weren't viable
 - Practical tone for office staff, not client-facing
 
@@ -1948,7 +2215,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-24-gap-overlap-fix";
+const BUILD_ID = "2026-04-24-smart-zones-v1";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
