@@ -996,12 +996,15 @@ function parseAvailability(availString) {
 // ─── Core matcher ────────────────────────────────────────────────────────────
 async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, weeksToScan = 17) {
   const slots = [];
+  const allClinicHolds = []; // [{date, dayName, startTime, endTime, label, clinic}]
   const now = new Date();
   const startDate = toMelbDateStr(now);
   const endDate = toMelbDateStr(new Date(now.getTime() + weeksToScan * 7 * 24 * 3600 * 1000));
 
   const baseTravel = await getTravelTime(inst.base, clientSuburb);
-  if (inst.hardZone && baseTravel > inst.maxTravelFromBase) return [];
+  if (inst.hardZone && baseTravel > inst.maxTravelFromBase) {
+    return { slots: [], adminAlerts: [], allClinicHolds: [] };
+  }
 
   let appointments;
   try {
@@ -1164,6 +1167,28 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
       clinic: s.clinic
     }));
 
+    // Also collect into the day-independent list so we can alert even when
+    // this instructor doesn't make the top 3 (the holds themselves might be
+    // what's blocking them from being a good match).
+    for (const ch of clinicHoldsOnDay) {
+      // Only include if the day matches the client's availability preference
+      // (no point alerting about a Friday hold when client only asks Wednesdays)
+      const prefForThisDay = availPref[dayName];
+      const clientInterestedInThisDay = !prefForThisDay && Object.keys(availPref).length === 0
+        ? true
+        : !!prefForThisDay;
+      if (clientInterestedInThisDay) {
+        allClinicHolds.push({
+          date: dateStr,
+          dayName,
+          startTime: ch.startTime,
+          endTime: ch.endTime,
+          label: ch.label,
+          clinic: ch.clinic
+        });
+      }
+    }
+
     // Private client holds on this day — block time, no alert
     const privateHoldsOnDay = sorted.filter(s => s.kind === "private-hold").map(s => ({
       startTime: s.startTime,
@@ -1275,7 +1300,7 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
     d.setDate(d.getDate() + 1);
   }
 
-  return { slots, adminAlerts };
+  return { slots, adminAlerts, allClinicHolds };
 }
 
 // ─── Scoring ─────────────────────────────────────────────────────────────────
@@ -1369,18 +1394,23 @@ app.post("/analyse", async (req, res) => {
 
     const allSlots = [];
     const allAdminAlerts = [];
+    const allInstructorClinicHolds = []; // [{instructor, date, dayName, startTime, endTime, label, clinic}]
     const fetchErrors = [];
     for (const inst of eligibleInstructors) {
       try {
         const result = await findAvailableSlots(inst, clientSuburb, durationMins, availPref);
         allSlots.push(...result.slots);
         if (result.adminAlerts?.length) {
-          // Tag each alert with the instructor so admin knows who it's about
           for (const alert of result.adminAlerts) {
             allAdminAlerts.push({ instructor: inst.name, ...alert });
           }
         }
-        debugLog.push(`${inst.name}: ${result.slots.length} valid slots, ${result.adminAlerts?.length || 0} alerts`);
+        if (result.allClinicHolds?.length) {
+          for (const ch of result.allClinicHolds) {
+            allInstructorClinicHolds.push({ instructor: inst.name, ...ch });
+          }
+        }
+        debugLog.push(`${inst.name}: ${result.slots.length} valid slots, ${result.adminAlerts?.length || 0} alerts, ${result.allClinicHolds?.length || 0} clinic holds in avail window`);
       } catch (err) {
         debugLog.push(`ERROR fetching ${inst.name}: ${err.message}`);
         fetchErrors.push({ instructor: inst.name, error: err.message });
@@ -1427,18 +1457,27 @@ Suggested actions for admin:
     debugLog.push(`Selected top ${selected.length} slots for Claude`);
 
     // ─── Check clinic-partnership holds for admin alerts ───
-    // For each selected slot, see if there's a clinic hold on the same day that
-    // might free up, AND the client is within the clinic's radius.
-    // We collect these into a separate alerts list that Claude will include.
+    // Two cases:
+    //   1. A recommended slot is near a clinic hold (the slot still went through,
+    //      but admin might consider swapping to the hold time if the clinic doesn't need it)
+    //   2. An eligible instructor had clinic holds that blocked them from being
+    //      recommended AT ALL — admin should know the booking could work great
+    //      for this client if the clinic releases its hold.
     const clinicHoldAlerts = [];
+    const seenAlertKeys = new Set();
+
+    // Case 1: selected slot has clinic holds on same day (within radius)
     for (const s of selected) {
       if (!s.clinicHoldsOnDay || s.clinicHoldsOnDay.length === 0) continue;
       for (const hold of s.clinicHoldsOnDay) {
         if (!hold.clinic) continue;
-        // Check if client is within clinic's radius
         const distanceKm = await getDistanceKm(hold.clinic.address, clientSuburb);
         if (distanceKm !== null && distanceKm <= hold.clinic.radiusKm) {
+          const key = `${s.instructor}|${s.date}|${hold.startTime}`;
+          if (seenAlertKeys.has(key)) continue;
+          seenAlertKeys.add(key);
           clinicHoldAlerts.push({
+            type: "adjacent-to-selected",
             instructor: s.instructor,
             date: s.date,
             slotTime: s.suggestedStart,
@@ -1449,6 +1488,39 @@ Suggested actions for admin:
           });
         }
       }
+    }
+
+    // Case 2: instructors with clinic holds in client-availability windows who
+    // weren't selected. If the client is within the clinic's radius, this is
+    // exactly the kind of scenario admin wants to know about — the clinic hold
+    // is blocking what could be a great match.
+    const selectedInstructorNames = new Set(selected.map(s => s.instructor));
+    for (const ch of allInstructorClinicHolds) {
+      // Skip if this instructor already contributed selected slots AND was already alerted
+      // (we've already handled their adjacent-to-selected case above)
+      const distanceKm = await getDistanceKm(ch.clinic.address, clientSuburb);
+      if (distanceKm === null || distanceKm > ch.clinic.radiusKm) continue;
+
+      const key = `${ch.instructor}|${ch.date}|${ch.startTime}`;
+      if (seenAlertKeys.has(key)) continue;
+      seenAlertKeys.add(key);
+
+      // Only flag as "blocked" if this instructor has no selected slot on that date
+      const hasSelectedSlotThisDate = selected.some(s =>
+        s.instructor === ch.instructor && s.date === ch.date
+      );
+
+      clinicHoldAlerts.push({
+        type: hasSelectedSlotThisDate ? "adjacent-to-selected" : "blocking-unselected",
+        instructor: ch.instructor,
+        date: ch.date,
+        dayName: ch.dayName,
+        slotTime: null,
+        holdStart: ch.startTime,
+        holdEnd: ch.endTime,
+        clinicName: ch.clinic.name,
+        distanceKm: Math.round(distanceKm * 10) / 10
+      });
     }
 
     const slotDescriptions = selected.map((s, i) => {
@@ -1502,9 +1574,13 @@ Suggested actions for admin:
     let adminAlertsText = "";
     if (clinicHoldAlerts.length > 0) {
       adminAlertsText += `\n\nCLINIC PARTNERSHIP ALERTS (worth checking with clinic — slot may free up):\n`;
-      adminAlertsText += clinicHoldAlerts.map(a =>
-        `- ${a.instructor} has a potential slot on ${formatDate(a.date)} at ${a.slotTime} near ${clientSuburb}. ${a.clinicName} has a hold at ${a.holdStart}-${a.holdEnd} (${a.distanceKm}km away). Check with ${a.clinicName} if that hold is still needed.`
-      ).join("\n");
+      adminAlertsText += clinicHoldAlerts.map(a => {
+        if (a.type === "blocking-unselected") {
+          return `- ${a.instructor} could be a great match for this client on ${formatDate(a.date)} (${a.dayName}), but ${a.clinicName} has a hold at ${a.holdStart}-${a.holdEnd} (${a.distanceKm}km from client). Check with ${a.clinicName} — if they've confirmed no booking for that slot, ${a.instructor} could take this client instead.`;
+        }
+        // adjacent-to-selected
+        return `- ${a.instructor} has a recommended slot on ${formatDate(a.date)} at ${a.slotTime}. ${a.clinicName} also has a hold at ${a.holdStart}-${a.holdEnd} (${a.distanceKm}km from client). Check with ${a.clinicName} if that hold is still needed — might be a better fit.`;
+      }).join("\n");
     }
 
     // Filter data alerts: only show alerts that affect the dates of our top-3
