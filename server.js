@@ -315,122 +315,132 @@ function hasKnownConsultationType(description) {
 }
 
 // ─── Appointment Classification ──────────────────────────────────────────────
-// Returns: { kind, clientName, displayLabel }
-//   kind: "lesson" | "hard-block" | "soft-block" | "skip"
-//   Uses ICS summary text which has real titles from the diary.
+// Returns: { kind, clientName, label, clinic? }
+//   kind: "lesson" | "hard-block" | "clinic-hold" | "private-hold" | "skip"
+//     - lesson: real client appointment (Blue Category)
+//     - hard-block: instructor unavailable (holidays/day off/sick/non-sdt/etc.)
+//     - clinic-hold: held for Active One or Community OT (eligible for admin alert)
+//     - private-hold: held for a private client (Sherri's style, no alert)
+//     - skip: empty/cancelled/irrelevant
 function classifyAppointment(a) {
   const summary = (a.summary || "").trim();
   const summaryLower = summary.toLowerCase();
   const description = (a.description || "").trim();
   const categories = (a.categories || []).map(c => String(c).toLowerCase());
 
-  // Skip cancelled events — ICS export usually excludes them but guard anyway
+  // Skip cancelled events
   if (summaryLower.includes("cancelled") || summaryLower.includes("cancellation")) {
     return { kind: "skip", reason: "cancelled" };
   }
 
-  // Empty/blank entries — shouldn't happen but guard
+  // Empty/blank entries
   if (!summary && !description) {
     return { kind: "skip", reason: "empty" };
   }
 
-  // ─── AUTHORITATIVE LESSON CHECK ───
-  // If description starts with a known consultation type, this is DEFINITELY a lesson.
-  // This takes precedence over keyword heuristics to prevent false classifications
-  // (e.g. client name "Lucas Tripicchio" containing the substring "trip").
+  // ─── PRIMARY SIGNAL: ICS colour category ───
+  // Blue Category = real lesson; Purple Category = Event (block/hold)
+  // Nookal assigns these reliably per entry type, giving us a clean binary.
+  const isBlueCategory = categories.includes("blue category");
+  const isPurpleCategory = categories.includes("purple category");
+
+  // ─── Blue Category = lesson ───
+  // Cross-check: description must start with a known consultation type
+  if (isBlueCategory) {
+    if (hasKnownConsultationType(description)) {
+      return { kind: "lesson", clientName: summary, label: summary };
+    }
+    // Blue but no known consultation type — still treat as lesson (safer default)
+    return { kind: "lesson", clientName: summary, label: summary };
+  }
+
+  // ─── Purple Category = Event; sub-classify by summary ───
+  if (isPurpleCategory || /^event\s*[-–]/i.test(summary)) {
+    // Hard block keywords (with word-boundary matching to avoid substring traps)
+    const hardBlockSignals = [
+      "day off", "dayoff", "no lessons", "no lesson",
+      "private stuff", "private work", "non-sdt", "non sdt",
+      "school pick up", "school pickup", "school run",
+      "holiday", "holidays", "leave on", "sick",
+      "medical appointment", "medical",
+      "car service", "unavailable",
+      "total ability van", "smartbox", "lagos holiday",
+      "lunch break",
+      "job interview", "doctor", "dentist", "ultrasound", "blood test",
+      "vic roads", "vicroads", "meet vic",
+      "personal", "myotherapist"
+    ];
+    const hardBlockRegex = new RegExp(
+      "\\b(" + hardBlockSignals.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+")).join("|") + ")\\b",
+      "i"
+    );
+    if (hardBlockRegex.test(summary)) {
+      return { kind: "hard-block", reason: "unavailable", label: summary };
+    }
+
+    // Clinic-partnership holds (worth admin alert when nearby)
+    const clinic = matchClinicPartner(summary);
+    if (clinic) {
+      return { kind: "clinic-hold", label: summary, clinic };
+    }
+
+    // Any other Purple event = private hold (blocks time, no admin alert)
+    return { kind: "private-hold", label: summary };
+  }
+
+  // ─── Fallback: no category, try heuristics ───
+  // If description starts with known consultation type → lesson
   if (hasKnownConsultationType(description)) {
-    return {
-      kind: "lesson",
-      clientName: summary,
-      label: summary
-    };
+    return { kind: "lesson", clientName: summary, label: summary };
   }
 
-  // ─── Anything prefixed with "Event - " is ALWAYS a diary event, never a lesson ───
-  // Nookal convention: client lessons use just the client name ("Aaron Cutajar"),
-  // all other diary items are prefixed with "Event - ".
-  const isEventPrefixed = /^event\s*[-–]/i.test(summary);
-
-  // ─── Hard blocks (never suggest during this time) ───
-  // Use WORD BOUNDARY matching on summary only — avoids false positives where
-  // a client's name contains a substring like "trip" (from "Tripicchio").
-  const hardBlockSignals = [
-    "day off", "dayoff", "no lessons", "no lesson",
-    "private stuff", "private work", "non-sdt", "non sdt",
-    "school pick up", "school pickup", "school run",
-    "holiday", "holidays", "leave", "sick",
-    "medical appointment", "medical",
-    "car service", "unavailable",
-    "total ability van", "smartbox", "lagos holiday",
-    "lunch break"
-  ];
-  const hardBlockCategories = ["holidays", "non-sdt work", "medical", "prefer not to work", "van booking"];
-
-  // Match with word boundaries where possible
-  const hardBlockRegex = new RegExp(
-    "\\b(" + hardBlockSignals.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+")).join("|") + ")\\b",
-    "i"
-  );
-  const isHardBySignal = hardBlockRegex.test(summary);
-  const isHardByCategory = categories.some(cat => hardBlockCategories.includes(cat));
-  if (isHardBySignal || isHardByCategory) {
-    return { kind: "hard-block", reason: "unavailable time", label: summary };
+  // "Event - X" prefix without a match → default to private-hold (safer than suggesting)
+  if (/^event\s*[-–]/i.test(summary)) {
+    return { kind: "private-hold", label: summary };
   }
 
-  // ─── Soft blocks (Time Held / holds — admin may override for specific clients) ───
-  const softBlockSignals = [
-    "hold for", "time held",
-    "community ot", "commot", "comm ot",
-    "active one", "activeone",
-    "hold ax", "holding spot", "holding time", "holding regular"
-  ];
-  const softBlockCategories = ["time held", "general", "hold time for test", "miscellaneous"];
-
-  // Use regex with word boundaries
-  const softBlockRegex = new RegExp(
-    "\\b(" + softBlockSignals.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+")).join("|") + ")\\b",
-    "i"
-  );
-  // "Hold " without "for" — check summary starts with "Hold" followed by space
-  const startsWithHold = /^hold\s+[A-Z]/i.test(summary);
-  const isSoftBySignal = softBlockRegex.test(summary) || startsWithHold;
-  const isSoftByCategory = categories.some(cat => softBlockCategories.includes(cat));
-  if (isSoftBySignal || isSoftByCategory) {
-    return { kind: "soft-block", reason: "reserved/hold", label: summary };
-  }
-
-  // ─── "Event - X" prefix without a matched keyword → default to hard-block ───
-  if (isEventPrefixed) {
-    return { kind: "hard-block", reason: "diary event (unmatched keyword)", label: summary };
-  }
-
-  // ─── Real client lessons (fallback) ───
-  // In ICS, lessons appear as events named after the client (e.g. "Jeffrey Tran")
-  return {
-    kind: "lesson",
-    clientName: summary,
-    label: summary
-  };
+  // Last resort: treat as lesson (client name in summary)
+  return { kind: "lesson", clientName: summary, label: summary };
 }
 
 // Strip the ICS-generated prefix from a description to isolate the real
-// appointment notes. ICS descriptions typically look like:
-//   "Driver Training for NDIS Participant- CURRENT at 01:45 pm, 12/05/26 with Lucas Tripicchio at ›Driving Matters Pty Ltd.GREENVALE"
-// We want just "GREENVALE" (the real appointment notes the admin typed in).
+// appointment notes. ICS descriptions have two common forms:
+//   Lessons: "Driver Training for NDIS Participant- CURRENT at 01:45 pm, 12/05/26 with Lucas Tripicchio at Marc Seow.MELTON"
+//            (separator is ".Marc Seow." or ".Driving Matters Pty Ltd.")
+//   Events:  "Event details: Location: Marc Seow"
+//            (everything useful is in Summary; description has the free-form admin notes at the top)
 function stripIcsDescriptionPrefix(description) {
   if (!description) return "";
 
-  // Pattern 1: "Event details: X" → strip "Event details: "
+  // Pattern 1: "Event details: X[newline]Location: Y" → extract X (the actual notes)
   const eventDetailsMatch = description.match(/^event\s+details\s*:\s*(.*)$/is);
   if (eventDetailsMatch) {
     const rest = eventDetailsMatch[1];
-    // Strip "Location: ..." suffix if present
+    // Strip trailing "Location: ..."
     const locationStripped = rest.replace(/\s*Location\s*:\s*[^\n]*$/i, "").trim();
     return locationStripped;
   }
 
-  // Pattern 2: strip everything up to and including "Pty Ltd." (or similar)
-  // Known ICS template ends with the instructor's company name, then real notes follow
+  // Pattern 2a: Strip everything up to the LAST occurrence of the instructor location separator.
+  // The Nookal ICS template appends ".<LocationName>." before the real appointment notes.
+  // Known location-field values seen in ICS: "Driving Matters Pty Ltd", "Marc Seow",
+  // "Greg Ekkel", "Sherri Simmonds", "Jason Simmonds", "Yves Salzmann".
+  const instructorLocations = [
+    "Driving Matters Pty Ltd",
+    "Marc Seow", "Greg Ekkel", "Sherri Simmonds", "Jason Simmonds",
+    "Yves Salzmann", "Christian Lagos", "Gabriel Lagos"
+  ];
+  for (const loc of instructorLocations) {
+    // Match ".Loc." or "Loc." or "›Loc." with optional trailing content
+    const escaped = loc.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(`[›·]?${escaped}\\.?\\s*(.+)$`, "is");
+    const m = description.match(re);
+    if (m && m[1].trim()) {
+      return m[1].trim();
+    }
+  }
+
+  // Pattern 2b: Generic "Pty Ltd." ending
   const ptyMatch = description.match(/(?:Pty\s*Ltd|Clinic|Office|Practice)\.?\s*(.+)$/is);
   if (ptyMatch && ptyMatch[1].trim()) {
     return ptyMatch[1].trim();
@@ -676,7 +686,7 @@ async function getClientByName(fullName) {
   }
 }
 
-// Helper: extract "Hold for CLIENT NAME" from a soft-block summary.
+// Helper: extract "Hold for CLIENT NAME" from a hold summary.
 // Returns { kind, name } where kind is "client" | "venue" | null
 //   client: a real person name we should look up in Nookal
 //   venue: a clinic/location name (e.g. "Community BRUNSWICK", "Active One Frankston")
@@ -831,12 +841,15 @@ async function resolveAppointmentLocation(appt) {
 }
 
 // ─── Google Maps Travel Time ─────────────────────────────────────────────────
+// Returns duration in minutes (for travel calcs).
+// Also caches the distance in metres so we can check radii without re-querying.
+const distanceCache = {}; // { "origin|destination": metres }
+
 async function getTravelTime(origin, destination) {
   if (!origin || !destination) return 30;
   const key = `${origin.toUpperCase()}|${destination.toUpperCase()}`;
   if (travelCache[key] !== undefined) return travelCache[key];
 
-  // If the origin/destination already contains ", VIC" or a postcode, don't append
   const needsContext = (s) => !/(,\s*VIC|\b3\d{3}\b|Australia)/i.test(s);
   const originStr = needsContext(origin) ? `${origin}, Victoria, Australia` : origin;
   const destStr = needsContext(destination) ? `${destination}, Victoria, Australia` : destination;
@@ -853,16 +866,68 @@ async function getTravelTime(origin, destination) {
       timeout: 8000
     });
     const row = r.data?.rows?.[0]?.elements?.[0];
-    if (row?.status === "OK" && row.duration?.value) {
-      const mins = Math.round(row.duration.value / 60);
-      travelCache[key] = mins;
-      return mins;
+    if (row?.status === "OK") {
+      if (row.duration?.value) {
+        const mins = Math.round(row.duration.value / 60);
+        travelCache[key] = mins;
+        if (row.distance?.value) distanceCache[key] = row.distance.value;
+        return mins;
+      }
     }
   } catch (err) {
     console.error("Google Maps error:", err.message);
   }
   travelCache[key] = 30;
   return 30;
+}
+
+// Get distance in km between two locations (uses cache if populated by getTravelTime)
+async function getDistanceKm(origin, destination) {
+  if (!origin || !destination) return null;
+  const key = `${origin.toUpperCase()}|${destination.toUpperCase()}`;
+  if (distanceCache[key] !== undefined) return distanceCache[key] / 1000;
+
+  // Trigger a query to populate the cache
+  await getTravelTime(origin, destination);
+  if (distanceCache[key] !== undefined) return distanceCache[key] / 1000;
+  return null;
+}
+
+// ─── Clinic partnership configuration ────────────────────────────────────────
+// When a clinic-partner hold exists on a day and the client's location is
+// within the specified radius of the clinic, the system raises an admin alert
+// suggesting they check if the hold is still needed.
+const CLINIC_PARTNERS = [
+  {
+    name: "Active One Frankston",
+    address: "25 Yuille Street, Frankston, Victoria, Australia",
+    radiusKm: 15,
+    matchPatterns: [
+      /active\s*one\s+frankston/i,
+      /activeone\s+frankston/i
+    ]
+  },
+  {
+    name: "Community OT Brunswick East",
+    address: "310 Lygon Street, Brunswick East, Victoria, Australia",
+    radiusKm: 10,
+    matchPatterns: [
+      /community\s+ot/i,
+      /comm\s*ot/i,
+      /commot/i
+    ]
+  }
+];
+
+// Check if a summary matches any known clinic partner
+function matchClinicPartner(summary) {
+  if (!summary) return null;
+  for (const clinic of CLINIC_PARTNERS) {
+    for (const pattern of clinic.matchPatterns) {
+      if (pattern.test(summary)) return clinic;
+    }
+  }
+  return null;
 }
 
 // ─── Availability Parsing ────────────────────────────────────────────────────
@@ -906,7 +971,7 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
   }
 
   // Group by date with resolved locations
-  // Also collect admin alerts for unresolved soft-block client lookups
+  // Also collect admin alerts for unresolved client lookups
   const byDate = {};
   const adminAlerts = []; // [{date, time, issue, details}]
 
@@ -948,64 +1013,21 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
           details: `Could not determine where ${cls.clientName}'s lesson is — no address on file and notes are ambiguous.`
         });
       }
-    } else if (cls.kind === "soft-block") {
-      // Extract what the hold is for — either a client name or a venue
-      const held = extractHoldClientName(a.summary);
-
-      if (held.kind === "client") {
-        // Real person — look them up in Nookal
-        const apptForResolve = {
-          clientName: held.name,
-          notes: a.description || a.notes
-        };
-        const loc = await resolveAppointmentLocation(apptForResolve);
-        if (loc && !loc.unresolved) {
-          locStart = loc.pickup || inst.base;
-          locEnd = loc.dropoff || loc.pickup || inst.base;
-          locationSource = `soft-block-client: ${loc.source}`;
-        } else {
-          // Client name extracted but lookup failed — admin alert
-          adminAlerts.push({
-            date: a.appointmentDate,
-            time: `${a.startTime.slice(0, 5)}-${a.endTime.slice(0, 5)}`,
-            issue: "unresolved-hold-client",
-            details: `Found a hold for client "${held.name}" but could not locate them in Nookal. Travel times for slots near this hold cannot be verified.`
-          });
-          locStart = null; locEnd = null;
-        }
-      } else if (held.kind === "venue") {
-        // Venue hold (e.g. "Community BRUNSWICK", "Active One Frankston")
-        // Don't try to look up as a client — resolve via notes/summary text
-        const apptForResolve = {
-          clientName: null,
-          notes: a.description || a.summary || ""
-        };
-        const loc = await resolveAppointmentLocation(apptForResolve);
-        if (loc && !loc.unresolved) {
-          locStart = loc.pickup || inst.base;
-          locEnd = loc.dropoff || loc.pickup || inst.base;
-          locationSource = `soft-block-venue: ${loc.source}`;
-        } else {
-          // Venue hold but we can't resolve its location either — just block time
-          // Admin will see soft-blocks listed in review section
-          locStart = inst.base;
-          locEnd = inst.base;
-          locationSource = "soft-block-venue-unresolved";
-        }
-      } else {
-        // Couldn't parse the hold — try notes anyway
-        const apptForResolve = { clientName: null, notes: a.description || a.notes };
-        const loc = await resolveAppointmentLocation(apptForResolve);
-        if (loc && !loc.unresolved) {
-          locStart = loc.pickup || inst.base;
-          locEnd = loc.dropoff || loc.pickup || inst.base;
-          locationSource = `soft-block-fallback: ${loc.source}`;
-        } else {
-          locStart = inst.base;
-          locEnd = inst.base;
-          locationSource = "soft-block-no-data";
-        }
-      }
+    } else if (cls.kind === "clinic-hold") {
+      // Clinic partnership hold (Active One Frankston / Community OT).
+      // These don't need a location lookup — we know the clinic address.
+      // For travel calcs, the instructor is AT the clinic during the hold.
+      locStart = cls.clinic.address;
+      locEnd = cls.clinic.address;
+      locationSource = `clinic-hold: ${cls.clinic.name}`;
+    } else if (cls.kind === "private-hold") {
+      // Private client hold (e.g. "Hold for Jessica Mills", "Event - Luca Silvan").
+      // Instructor has this time reserved; we don't know exactly where they'll be.
+      // Fall back to base as a neutral assumption — it'll make adjacent slots
+      // look conservative (slightly more travel time required), which is safe.
+      locStart = inst.base;
+      locEnd = inst.base;
+      locationSource = "private-hold (base assumed)";
     }
     // hard-blocks keep locStart/locEnd as inst.base (instructor is effectively "off")
 
@@ -1014,10 +1036,11 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
       endMins: endM,
       locationForStart: locStart,
       locationForEnd: locEnd,
-      kind: cls.kind, // "lesson" | "hard-block" | "soft-block"
+      kind: cls.kind, // "lesson" | "hard-block" | "clinic-hold" | "private-hold"
       label: cls.label || a.summary || "",
       note: a.description || "",
       clientName: prevClientName,
+      clinic: cls.clinic || null,  // populated for clinic-hold entries
       startTime: a.startTime.slice(0, 5),
       endTime: a.endTime.slice(0, 5),
       locationSource
@@ -1090,11 +1113,18 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
       }
     }
 
-    // Detect soft blocks that happen on this day — for admin review notes
-    const softBlocksOnDay = sorted.filter(s => s.kind === "soft-block").map(s => ({
+    // Clinic partnership holds on this day — eligible for admin alerts if slot is nearby
+    const clinicHoldsOnDay = sorted.filter(s => s.kind === "clinic-hold").map(s => ({
       startTime: s.startTime,
       endTime: s.endTime,
-      note: s.note.split("\n")[0].slice(0, 60),
+      label: s.label.slice(0, 60),
+      clinic: s.clinic
+    }));
+
+    // Private client holds on this day — block time, no alert
+    const privateHoldsOnDay = sorted.filter(s => s.kind === "private-hold").map(s => ({
+      startTime: s.startTime,
+      endTime: s.endTime,
       label: s.label.slice(0, 60)
     }));
 
@@ -1108,15 +1138,14 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
     const BUFFER_MINS = 10; // Travel buffer for changeover, toilet, traffic
 
     for (const gap of gaps) {
-      // If previous location couldn't be resolved (soft-block with unresolved client),
-      // skip this gap — we can't safely calculate travel. Admin will see the alert.
+      // If previous location couldn't be resolved, skip this gap
       if (gap.prevLoc === null || gap.prevLoc === undefined) continue;
 
       const rawTravelIn = await getTravelTime(gap.prevLoc, clientSuburb);
       const rawTravelOut = gap.nextLoc ? await getTravelTime(clientSuburb, gap.nextLoc) : 0;
 
       // Buffer rule: 10-min buffer only applies when coming FROM a previous appointment
-      // (lesson or soft-block). No buffer when starting fresh from base (instructor hasn't
+      // (lesson or hold). No buffer when starting fresh from base (instructor hasn't
       // just finished another lesson that needs changeover/toilet time).
       const comingFromAppointment = gap.prevAppt != null;
       const bufferInApplied = comingFromAppointment ? BUFFER_MINS : 0;
@@ -1178,7 +1207,7 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
         period: matchedBlock.block,
         travelIn: rawTravelIn,
         travelOut: rawTravelOut,
-        bufferMinsApplied: bufferInApplied, // actual buffer used (0 if from base)
+        bufferMinsApplied: bufferInApplied,
         baseTravel,
         prevLocation: gap.prevLoc,
         nextLocation: gap.nextLoc,
@@ -1193,7 +1222,8 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
         priorHardBlock: priorHardBlock ? priorHardBlock.label : null,
         tier,
         totalApptsThatDay: sorted.filter(s => s.kind === "lesson").length,
-        softBlocksOnDay,
+        clinicHoldsOnDay,       // for admin alerts (Active One / Community OT)
+        privateHoldsOnDay,      // shown in admin review for context
         peakTrafficWarning,
         peakPeriod: amPeak ? "AM peak" : (pmPeak ? "PM peak" : null)
       });
@@ -1353,6 +1383,31 @@ Suggested actions for admin:
 
     debugLog.push(`Selected top ${selected.length} slots for Claude`);
 
+    // ─── Check clinic-partnership holds for admin alerts ───
+    // For each selected slot, see if there's a clinic hold on the same day that
+    // might free up, AND the client is within the clinic's radius.
+    // We collect these into a separate alerts list that Claude will include.
+    const clinicHoldAlerts = [];
+    for (const s of selected) {
+      if (!s.clinicHoldsOnDay || s.clinicHoldsOnDay.length === 0) continue;
+      for (const hold of s.clinicHoldsOnDay) {
+        if (!hold.clinic) continue;
+        // Check if client is within clinic's radius
+        const distanceKm = await getDistanceKm(hold.clinic.address, clientSuburb);
+        if (distanceKm !== null && distanceKm <= hold.clinic.radiusKm) {
+          clinicHoldAlerts.push({
+            instructor: s.instructor,
+            date: s.date,
+            slotTime: s.suggestedStart,
+            holdStart: hold.startTime,
+            holdEnd: hold.endTime,
+            clinicName: hold.clinic.name,
+            distanceKm: Math.round(distanceKm * 10) / 10
+          });
+        }
+      }
+    }
+
     const slotDescriptions = selected.map((s, i) => {
       const tierLabels = {
         1: "Tier 1 — Ideal (in zone, nearby on day)",
@@ -1362,7 +1417,6 @@ Suggested actions for admin:
       };
       const instData = INSTRUCTORS.find(x => x.name === s.instructor);
 
-      // Build "coming from" description with context from appointment notes
       let comingFrom;
       if (s.prevClientName) {
         const contextNote = s.prevAppointmentNote && s.prevAppointmentNote !== s.prevClientName
@@ -1375,7 +1429,6 @@ Suggested actions for admin:
         comingFrom = `from base in ${s.base}`;
       }
 
-      // Build "next lesson" description
       let nextLesson;
       if (s.nextClientName) {
         nextLesson = `then lesson with ${s.nextClientName} at ${s.nextStartTime}`;
@@ -1386,10 +1439,6 @@ Suggested actions for admin:
       }
 
       const peakFlag = s.peakTrafficWarning ? `\n  ⚠️ ${s.peakPeriod} — travel may take longer than estimated` : "";
-
-      const softBlockNote = s.softBlocksOnDay && s.softBlocksOnDay.length > 0
-        ? `\n  Soft holds on this day: ${s.softBlocksOnDay.map(b => `${b.startTime}-${b.endTime} "${b.label || b.note}"`).join("; ")}`
-        : "";
 
       const bufferNote = s.bufferMinsApplied > 0
         ? `${s.bufferMinsApplied} min buffer applied`
@@ -1403,14 +1452,21 @@ Suggested actions for admin:
   Travel out: ${s.travelOut} min
   Base: ${s.base} → ${clientSuburb}: ${s.baseTravel} min
   Zone: ${instData?.preferredZone}
-  Lessons booked that day: ${s.totalApptsThatDay}${peakFlag}${softBlockNote}`;
+  Lessons booked that day: ${s.totalApptsThatDay}${peakFlag}`;
     }).join("\n\n");
 
-    // Build admin alerts section if any
-    const adminAlertsText = allAdminAlerts.length > 0
-      ? `\n\nADMIN ALERTS (unresolved data — admin may need to verify):\n` +
-        allAdminAlerts.map(a => `- ${a.instructor} ${formatDate(a.date)} ${a.time}: ${a.details}`).join("\n")
-      : "";
+    // Build admin alerts section (unresolved data + clinic partnership alerts)
+    let adminAlertsText = "";
+    if (clinicHoldAlerts.length > 0) {
+      adminAlertsText += `\n\nCLINIC PARTNERSHIP ALERTS (worth checking with clinic — slot may free up):\n`;
+      adminAlertsText += clinicHoldAlerts.map(a =>
+        `- ${a.instructor} has a potential slot on ${formatDate(a.date)} at ${a.slotTime} near ${clientSuburb}. ${a.clinicName} has a hold at ${a.holdStart}-${a.holdEnd} (${a.distanceKm}km away). Check with ${a.clinicName} if that hold is still needed.`
+      ).join("\n");
+    }
+    if (allAdminAlerts.length > 0) {
+      adminAlertsText += `\n\nDATA ALERTS (unresolved lookup issues):\n` +
+        allAdminAlerts.map(a => `- ${a.instructor} ${formatDate(a.date)} ${a.time}: ${a.details}`).join("\n");
+    }
 
     const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training. You help office staff choose the best 3 slots from a list of pre-verified options.
 
@@ -1429,14 +1485,13 @@ Rules:
 - Keep language practical — this is for office staff making booking decisions
 - No client-facing language (no "Hello [name]", no "would you like to book")
 
-AT THE END OF YOUR RESPONSE, add an "Admin Review" section ONLY if any of the selected slots have "Soft holds on this day" listed. In that section:
-- Mention each soft hold by date and what it says
-- Say "Admin: verify these holds before booking — they may be for this client or related clients, or they may need to remain reserved"
-- Do NOT add the Admin Review section for hard blocks — those slots will never be suggested anyway
+AT THE END OF YOUR RESPONSE, check the user message for these sections and add them to your response if present (copy them verbatim, don't summarize):
 
-IF the user message contains "ADMIN ALERTS" below the slots, add a separate "Unresolved Data Alerts" section at the very end listing each alert verbatim. These are cases where the system couldn't verify something (e.g. a hold's location). Do not filter these — list them all.
+1. If the user message contains "CLINIC PARTNERSHIP ALERTS", add a section titled "Clinic Partnership Check" listing each alert. Precede it with: "These clinics regularly reserve and usually fill their hold slots, but occasionally one frees up. Worth a quick call before confirming:"
 
-If no soft holds and no admin alerts exist, do not include any review sections at all.`;
+2. If the user message contains "DATA ALERTS", add a section titled "Data Alerts" listing each verbatim. Precede it with: "The system couldn't verify some information — admin should confirm these before booking:"
+
+If neither section exists in the user message, do NOT add any alert sections at all.`;
 
     const userMessage = `CLIENT: ${booking.clientName || "(not specified)"}
 SUBURB: ${clientSuburb}
@@ -1647,44 +1702,15 @@ app.get("/debug-slot", async (req, res) => {
           entry.locationSource = "lesson-unresolved";
           entry.clientHomeSuburb = loc?.clientHomeSuburb || null;
         }
-      } else if (cls.kind === "soft-block") {
-        const held = extractHoldClientName(a.summary);
-        entry.extractedHoldClient = held;
-        if (held.kind === "client") {
-          const loc = await resolveAppointmentLocation({
-            clientName: held.name,
-            notes: a.description || a.notes
-          });
-          if (loc && !loc.unresolved) {
-            entry.locationForStart = loc.pickup || inst.base;
-            entry.locationForEnd = loc.dropoff || loc.pickup || inst.base;
-            entry.locationSource = `soft-block-client: ${loc.source}`;
-            entry.clientHomeSuburb = loc.clientHomeSuburb;
-          } else {
-            entry.locationSource = "soft-block-client-lookup-failed";
-            entry.locationForStart = null;
-            entry.locationForEnd = null;
-          }
-        } else if (held.kind === "venue") {
-          const loc = await resolveAppointmentLocation({
-            clientName: null,
-            notes: a.description || a.summary || ""
-          });
-          if (loc && !loc.unresolved) {
-            entry.locationForStart = loc.pickup || inst.base;
-            entry.locationForEnd = loc.dropoff || loc.pickup || inst.base;
-            entry.locationSource = `soft-block-venue: ${loc.source}`;
-          } else {
-            entry.locationSource = "soft-block-venue-unresolved";
-          }
-        } else {
-          const loc = await resolveAppointmentLocation({ clientName: null, notes: a.description || a.notes });
-          if (loc && !loc.unresolved) {
-            entry.locationForStart = loc.pickup || inst.base;
-            entry.locationForEnd = loc.dropoff || loc.pickup || inst.base;
-            entry.locationSource = `soft-block-fallback: ${loc.source}`;
-          }
-        }
+      } else if (cls.kind === "clinic-hold") {
+        entry.locationForStart = cls.clinic.address;
+        entry.locationForEnd = cls.clinic.address;
+        entry.locationSource = `clinic-hold: ${cls.clinic.name}`;
+        entry.clinic = cls.clinic;
+      } else if (cls.kind === "private-hold") {
+        entry.locationForStart = inst.base;
+        entry.locationForEnd = inst.base;
+        entry.locationSource = "private-hold (base assumed)";
       }
 
       const notesLocPreview = extractNotesLocation(a.description || a.notes);
@@ -1754,7 +1780,7 @@ app.get("/debug-slot", async (req, res) => {
 
       if (gap.prevLoc === null || gap.prevLoc === undefined) {
         g.skipped = true;
-        g.skipReason = "prev location unresolved (soft-block hold client lookup failed)";
+        g.skipReason = "prev location unresolved";
         gapAnalysis.push(g);
         continue;
       }
@@ -1847,10 +1873,10 @@ app.get("/debug-day", async (req, res) => {
         classification: cls.kind,
         label: cls.label,
         reason: cls.reason,
-        blocksTime: cls.kind === "lesson" || cls.kind === "hard-block" || cls.kind === "soft-block"
+        blocksTime: cls.kind === "lesson" || cls.kind === "hard-block" || cls.kind === "clinic-hold" || cls.kind === "private-hold"
       };
 
-      // For lessons and soft-block holds, also show the resolved location
+      // For lessons, resolve the real location
       if (cls.kind === "lesson") {
         const loc = await resolveAppointmentLocation({
           clientName: cls.clientName || a.summary,
@@ -1863,28 +1889,21 @@ app.get("/debug-day", async (req, res) => {
           clientHomeSuburb: loc.clientHomeSuburb,
           unresolved: loc.unresolved || false
         } : null;
-      } else if (cls.kind === "soft-block") {
-        const held = extractHoldClientName(a.summary);
-        entry.holdClient = held;
-        let loc = null;
-        if (held.kind === "client") {
-          loc = await resolveAppointmentLocation({
-            clientName: held.name,
-            notes: a.description || a.notes
-          });
-        } else if (held.kind === "venue") {
-          loc = await resolveAppointmentLocation({
-            clientName: null,
-            notes: a.description || a.summary || ""
-          });
-        }
-        entry.resolvedLocation = loc ? {
-          pickup: loc.pickup,
-          dropoff: loc.dropoff,
-          source: loc.source,
-          clientHomeSuburb: loc.clientHomeSuburb,
-          unresolved: loc.unresolved || false
-        } : { unresolved: true };
+      } else if (cls.kind === "clinic-hold") {
+        entry.clinic = cls.clinic;
+        entry.resolvedLocation = {
+          pickup: cls.clinic.address,
+          dropoff: cls.clinic.address,
+          source: `clinic-hold: ${cls.clinic.name}`,
+          unresolved: false
+        };
+      } else if (cls.kind === "private-hold") {
+        entry.resolvedLocation = {
+          pickup: inst.base,
+          dropoff: inst.base,
+          source: "private-hold (base assumed)",
+          unresolved: false
+        };
       }
 
       classified.push(entry);
@@ -1915,7 +1934,8 @@ app.get("/debug-day", async (req, res) => {
       summary: {
         lessons: classified.filter(c => c.classification === "lesson").length,
         hardBlocks: classified.filter(c => c.classification === "hard-block").length,
-        softBlocks: classified.filter(c => c.classification === "soft-block").length,
+        clinicHolds: classified.filter(c => c.classification === "clinic-hold").length,
+        privateHolds: classified.filter(c => c.classification === "private-hold").length,
         skipped: classified.filter(c => c.classification === "skip").length
       },
       availableGaps: gaps
