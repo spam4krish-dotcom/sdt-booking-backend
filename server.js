@@ -1321,6 +1321,7 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
         nextLocation: gap.nextLoc,
         prevClientName: gap.prevAppt?.clientName || null,
         prevEndTime: gap.prevAppt?.endTime || null,
+        prevAppointmentKind: gap.prevAppt?.kind || null,  // "lesson" | "clinic-hold" | "private-hold" | "hard-block" | null
         prevAppointmentNote: gap.prevAppt?.note?.split("\n")[0]?.slice(0, 80) || null,
         prevAppointmentLabel: gap.prevAppt?.label?.slice(0, 80) || null,
         nextClientName: gap.nextAppt?.clientName || null,
@@ -1573,11 +1574,17 @@ Suggested actions for admin:
       const instData = INSTRUCTORS.find(x => x.name === s.instructor);
 
       let comingFrom;
-      if (s.prevClientName) {
+      if (s.prevAppointmentKind === "lesson" && s.prevClientName) {
         const contextNote = s.prevAppointmentNote && s.prevAppointmentNote !== s.prevClientName
           ? ` — ${s.prevAppointmentNote}`
           : "";
         comingFrom = `from lesson with ${s.prevClientName}${contextNote} (finishes ${s.prevEndTime})`;
+      } else if (s.prevAppointmentKind === "clinic-hold") {
+        // Clinic-partner hold just ended (e Active One Frankston)
+        comingFrom = `from a ${s.prevAppointmentLabel} hold (ends ${s.prevEndTime}) — instructor was at the clinic`;
+      } else if (s.prevAppointmentKind === "private-hold") {
+        // Private hold just ended. We don't know exact location (admin can verify).
+        comingFrom = `from a "${s.prevAppointmentLabel}" hold ending ${s.prevEndTime} — exact location not confirmed, admin should verify`;
       } else if (s.priorHardBlock) {
         comingFrom = `from base in ${s.base} (first availability after "${s.priorHardBlock}")`;
       } else {
@@ -1590,7 +1597,7 @@ Suggested actions for admin:
       } else if (s.nextLocation && s.nextStartTime) {
         nextLesson = `then on to ${s.nextLocation} at ${s.nextStartTime}`;
       } else {
-        nextLesson = "no further appointments scheduled (instructor is free after this lesson)";
+        nextLesson = "no further appointments scheduled — do not invent a next appointment or time";
       }
 
       const peakFlag = s.peakTrafficWarning ? `\n  ⚠️ ${s.peakPeriod} — travel may take longer than estimated` : "";
@@ -1689,29 +1696,46 @@ Suggested actions for admin:
 
     const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training. You help office staff choose the best 3 slots from a list of pre-verified options.
 
-Pick the 3 best slots from the provided list. Present each with:
-- Option number, instructor name, date/time
+═══ CRITICAL ANTI-FABRICATION RULES ═══
+
+The list of VERIFIED SLOTS below is the ONLY source of truth. Every slot you suggest MUST exist verbatim in that list.
+
+DO NOT:
+- Invent a new date or time
+- Round, adjust, or alter any time value shown
+- Suggest a slot at a different time than listed
+- Invent client names for the previous/next appointment
+- Invent a "next appointment at X time" when the slot says "no further appointments scheduled"
+- Describe travel destinations not in the slot data
+
+If the VERIFIED SLOTS list is empty OR has fewer than 3 entries, return the ones that exist and explicitly say "Only N valid slot(s) available — no other options passed verification. Admin should check client availability or consider alternate arrangements."
+
+Every slot you name must match exactly: instructor, date, time (copy the digits exactly as shown in "Slot N: INSTRUCTOR — DATE at TIME").
+
+═══ PRESENTATION ═══
+
+Pick up to 3 best slots from the provided list. For each:
+- Option number, instructor name, date/time (exact match from list)
 - Tier label
-- 2-3 sentences on: day/time fit, where instructor is coming from (use the "Coming from" line - mention the previous client's name AND any additional context from the appointment notes if present), what's happening after the lesson
+- 2-3 sentences on: day/time fit, "Coming from" (use the exact line — if it mentions a hold, describe the hold not a lesson; if it says "exact location not confirmed, admin should verify", include that warning), and what happens after the lesson
 
-Rules:
-- Use ONLY the slots provided — do not invent any dates, times, client names, or next-appointment details
-- If "After the lesson:" shows "no further appointments scheduled", DO NOT invent a next lesson or travel destination. Just say this is the last slot of the day with no onward pressure.
-- When describing travel, use the exact "Coming from" line provided. If it mentions additional context (e.g. "— Ax with OT Jo Coleman"), include that context in your written response
-- If "first availability after X" is mentioned, include that context so admin knows instructor is returning from a break
-- If the slot shows a ⚠️ peak traffic warning, include it in your response as a note under that option
-- Tier 1 = ideal, Tier 2 = good, Tier 3 = workable (mention the instructor will already be in the area), Tier 4 = stretch (add a ⚠️ note)
-- If all slots are from one instructor because they're the only eligible one, say so
-- Keep language practical — this is for office staff making booking decisions
-- No client-facing language (no "Hello [name]", no "would you like to book")
+Style rules:
+- Use the exact "Coming from" line provided. If it says "from a private hold" or "from a clinic hold", describe that accurately — don't say "from lesson with X".
+- If "After the lesson:" says "no further appointments scheduled — do not invent a next appointment", obey that literally. Say the instructor is free after, full stop.
+- If the slot shows a ⚠️ peak traffic warning, mention it
+- Tier 1 = ideal, Tier 2 = good, Tier 3 = workable (already in area), Tier 4 = stretch (add ⚠️)
+- If only one instructor had eligible slots, explain why others weren't viable
+- Practical tone for office staff, not client-facing
 
-AT THE END OF YOUR RESPONSE, check the user message for these sections and add them to your response if present (copy them verbatim, don't summarize):
+═══ APPENDING ALERTS ═══
 
-1. If the user message contains "CLINIC PARTNERSHIP ALERTS", add a section titled "Clinic Partnership Check" listing each alert. Precede it with: "These clinics regularly reserve and usually fill their hold slots, but occasionally one frees up. Worth a quick call before confirming:"
+AT THE END OF YOUR RESPONSE, check the user message for these sections and add them if present (copy verbatim):
 
-2. If the user message contains "DATA ALERTS", add a section titled "Data Alerts" listing each verbatim. Precede it with: "The system couldn't verify some information — admin should confirm these before booking:"
+1. If the user message contains "CLINIC PARTNERSHIP ALERTS", add a section titled "Clinic Partnership Check" listing each alert. Precede with: "These clinics regularly reserve and usually fill their hold slots, but occasionally one frees up. Worth a quick call before confirming:"
 
-If neither section exists in the user message, do NOT add any alert sections at all.`;
+2. If the user message contains "DATA ALERTS", add a section titled "Data Alerts" listing each verbatim. Precede with: "The system couldn't verify some information — admin should confirm these before booking:"
+
+If neither section exists, do NOT add any alert sections.`;
 
     const userMessage = `CLIENT: ${booking.clientName || "(not specified)"}
 SUBURB: ${clientSuburb}
@@ -1772,9 +1796,133 @@ ${slotDescriptions}${adminAlertsText}`;
   }
 });
 
+// ─── Debug: run the booking pipeline without Claude, return raw slot data ───
+// Usage: POST /debug-selected with the same body as /analyse
+// Returns: the exact list of verified slots the system would give to Claude,
+// plus any clinic alerts and data alerts. Use this to confirm whether a slot
+// Claude suggested was actually approved by the system (or fabricated by Claude).
+app.post("/debug-selected", async (req, res) => {
+  try {
+    const booking = req.body;
+    const clientSuburb = booking.clientSuburb || booking.suburb;
+    let requiredMods = booking.modifications || booking.requiredMods || [];
+    if (typeof requiredMods === "string") {
+      requiredMods = requiredMods.split(",").map(s => s.trim()).filter(Boolean);
+    }
+    if (!Array.isArray(requiredMods)) requiredMods = [];
+    const durationMins = parseInt(booking.lessonDuration || booking.duration || 60);
+    const availString = booking.availability || "";
+
+    if (!clientSuburb) return res.status(400).json({ error: "Client suburb required" });
+
+    // Use the same mod normalisation as /analyse
+    const MOD_MAP = {
+      "left foot accelerator": "LFA", "lfa": "LFA",
+      "electronic spinner": "Electronic Spinner",
+      "spinner knob": "Spinner", "spinner": "Spinner",
+      "hand controls": "Hand Controls", "hand control": "Hand Controls",
+      "satellite": "Satellite",
+      "o-ring": "O-Ring", "oval ring": "O-Ring", "o ring": "O-Ring",
+      "monarchs": "Monarchs", "monarch": "Monarchs",
+      "extension pedals": "Extension Pedals", "extension pedal": "Extension Pedals",
+      "indicator extension": "Indicator Extension"
+    };
+    const normalisedMods = requiredMods.map(m => {
+      const lower = m.toLowerCase().trim();
+      for (const [kw, canonical] of Object.entries(MOD_MAP)) {
+        if (lower === kw) return canonical;
+        if (kw.includes(" ") && lower.includes(kw)) return canonical;
+        if (!kw.includes(" ") && new RegExp(`\\b${kw}\\b`).test(lower)) return canonical;
+      }
+      return m;
+    });
+
+    const eligibleInstructors = INSTRUCTORS.filter(inst =>
+      normalisedMods.every(needed =>
+        inst.mods.some(m => m.toLowerCase() === needed.toLowerCase())
+      )
+    );
+
+    const availPref = parseAvailability(availString);
+
+    const allSlots = [];
+    const allAdminAlerts = [];
+    const allInstructorClinicHolds = [];
+    for (const inst of eligibleInstructors) {
+      try {
+        const result = await findAvailableSlots(inst, clientSuburb, durationMins, availPref);
+        allSlots.push(...result.slots);
+        if (result.adminAlerts?.length) {
+          for (const alert of result.adminAlerts) allAdminAlerts.push({ instructor: inst.name, ...alert });
+        }
+        if (result.allClinicHolds?.length) {
+          for (const ch of result.allClinicHolds) allInstructorClinicHolds.push({ instructor: inst.name, ...ch });
+        }
+      } catch (err) {
+        // ignore per-instructor errors for diagnostic purposes
+      }
+    }
+
+    allSlots.sort((a, b) => scoreSlot(b) - scoreSlot(a));
+
+    // Apply the same selection logic as /analyse: top 10, max 3 per instructor, unique instructor+date
+    const selected = [];
+    const usedInstructors = {};
+    const usedDates = new Set();
+    for (const s of allSlots) {
+      if (selected.length >= 10) break;
+      const instCount = usedInstructors[s.instructor] || 0;
+      if (instCount >= 3) continue;
+      if (usedDates.has(`${s.instructor}|${s.date}`)) continue;
+      selected.push(s);
+      usedInstructors[s.instructor] = instCount + 1;
+      usedDates.add(`${s.instructor}|${s.date}`);
+    }
+
+    // Return a compact view of what Claude would see
+    res.json({
+      clientSuburb,
+      durationMins,
+      requiredMods: normalisedMods,
+      eligibleInstructors: eligibleInstructors.map(i => i.name),
+      totalRawSlots: allSlots.length,
+      selectedCount: selected.length,
+      selectedSlots: selected.map(s => ({
+        instructor: s.instructor,
+        date: s.date,
+        dayName: s.dayName,
+        suggestedStart: s.suggestedStart,
+        tier: s.tier,
+        travelIn: s.travelIn,
+        baseTravel: s.baseTravel,
+        bufferApplied: s.bufferMinsApplied,
+        prevLocation: s.prevLocation,
+        nextLocation: s.nextLocation,
+        prevClientName: s.prevClientName,
+        prevEndTime: s.prevEndTime,
+        comingFromBase: s.comingFromBase,
+        priorHardBlock: s.priorHardBlock,
+        peakTrafficWarning: s.peakTrafficWarning,
+        clinicHoldsThisDay: s.clinicHoldsOnDay?.length || 0,
+        privateHoldsThisDay: s.privateHoldsOnDay?.length || 0
+      })),
+      clinicHoldsInAvailWindow: allInstructorClinicHolds.map(c => ({
+        instructor: c.instructor,
+        date: c.date,
+        dayName: c.dayName,
+        holdTime: `${c.startTime}-${c.endTime}`,
+        clinic: c.clinic.name
+      })),
+      dataAlerts: allAdminAlerts.slice(0, 50)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-24-data-alerts-top3-scoping";
+const BUILD_ID = "2026-04-24-anti-fabrication-hold-context";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
