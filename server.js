@@ -643,65 +643,87 @@ function isLikelySuburb(s) {
 }
 
 // Lookup client by name (since ICS doesn't give us clientID).
-// Caches by name to avoid repeat lookups. Returns null if not found or ambiguous.
+// Caches by name. Handles name variants like "Christine (prefers Chris) Dean"
+// or "Kade Syphers-Smith" by trying multiple parsing strategies.
 const clientByNameCache = {};
 async function getClientByName(fullName) {
   if (!fullName || fullName.length < 3) return null;
   const key = fullName.toLowerCase().trim();
   if (clientByNameCache[key] !== undefined) return clientByNameCache[key];
 
-  // Parse first + last name from "First Last" or "First Middle Last"
-  const parts = fullName.trim().split(/\s+/);
+  // Strip parenthetical aliases — e.g. "Christine (prefers Chris) Dean" → "Christine Dean"
+  // Also strip trailing alias notes like "Chris Wayman (Dad's home)"
+  const cleanedName = fullName
+    .replace(/\([^)]*\)/g, " ")  // remove everything in parens
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const parts = cleanedName.split(/\s+/);
   if (parts.length < 2) {
     clientByNameCache[key] = null;
     return null;
   }
-  const firstName = parts[0];
-  const lastName = parts[parts.length - 1];
 
-  const q = `
-    query {
-      clients(firstName: "${firstName.replace(/"/g, '\\"')}", lastName: "${lastName.replace(/"/g, '\\"')}", pageLength: 5) {
-        clientID
-        firstName
-        lastName
-        addresses {
-          addr1 city state postcode isDefault
+  // Try two strategies: (a) first word + last word, (b) first word + preferred name from parens
+  const tryPairs = [];
+  // Strategy a: standard first + last
+  tryPairs.push({ firstName: parts[0], lastName: parts[parts.length - 1] });
+
+  // Strategy b: if original had parens with a single word, try that as firstName
+  const parenMatch = fullName.match(/\(([^)]+)\)/);
+  if (parenMatch) {
+    const parenContent = parenMatch[1].trim();
+    // Parse "prefers Chris" or just "Chris"
+    const parenName = parenContent.replace(/^prefers\s+/i, "").trim();
+    if (parenName && !parenName.includes(" ")) {
+      tryPairs.push({ firstName: parenName, lastName: parts[parts.length - 1] });
+    }
+  }
+
+  for (const { firstName, lastName } of tryPairs) {
+    const q = `
+      query {
+        clients(firstName: "${firstName.replace(/"/g, '\\"')}", lastName: "${lastName.replace(/"/g, '\\"')}", pageLength: 5) {
+          clientID
+          firstName
+          lastName
+          addresses {
+            addr1 city state postcode isDefault
+          }
         }
       }
+    `;
+    try {
+      const d = await nookalQuery(q);
+      const matches = d.clients || [];
+      const exact = matches.find(c =>
+        c.firstName?.toLowerCase() === firstName.toLowerCase() &&
+        c.lastName?.toLowerCase() === lastName.toLowerCase()
+      );
+      const best = exact || matches[0];
+      if (best) {
+        const defaultAddr = (best.addresses || []).find(a => a.isDefault === 1 && a.city)
+                         || (best.addresses || []).find(a => a.city);
+        const result = defaultAddr ? {
+          clientID: best.clientID,
+          suburb: defaultAddr.city,
+          state: defaultAddr.state,
+          postcode: defaultAddr.postcode,
+          addr1: defaultAddr.addr1,
+          firstName: best.firstName,
+          lastName: best.lastName
+        } : { clientID: best.clientID };
+        clientByNameCache[key] = result;
+        return result;
+      }
+    } catch (err) {
+      console.error(`Client name lookup failed for ${firstName} ${lastName}:`, err.message);
     }
-  `;
-  try {
-    const d = await nookalQuery(q);
-    const matches = d.clients || [];
-    // Prefer exact match
-    const exact = matches.find(c =>
-      c.firstName?.toLowerCase() === firstName.toLowerCase() &&
-      c.lastName?.toLowerCase() === lastName.toLowerCase()
-    );
-    const best = exact || matches[0];
-    if (!best) {
-      clientByNameCache[key] = null;
-      return null;
-    }
-    const defaultAddr = (best.addresses || []).find(a => a.isDefault === 1 && a.city)
-                     || (best.addresses || []).find(a => a.city);
-    const result = defaultAddr ? {
-      clientID: best.clientID,
-      suburb: defaultAddr.city,
-      state: defaultAddr.state,
-      postcode: defaultAddr.postcode,
-      addr1: defaultAddr.addr1,
-      firstName: best.firstName,
-      lastName: best.lastName
-    } : { clientID: best.clientID };
-    clientByNameCache[key] = result;
-    return result;
-  } catch (err) {
-    console.error(`Client name lookup failed for ${fullName}:`, err.message);
-    clientByNameCache[key] = null;
-    return null;
   }
+
+  // All strategies failed
+  clientByNameCache[key] = null;
+  return null;
 }
 
 // Helper: extract "Hold for CLIENT NAME" from a hold summary.
@@ -1008,8 +1030,6 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
     let locationSource = "base";
 
     if (cls.kind === "lesson") {
-      // Set the summary as clientName so resolveAppointmentLocation can try to
-      // find this client in Nookal (by name) and pull their home address
       const apptForResolve = {
         ...a,
         clientName: cls.clientName || a.summary,
@@ -1022,13 +1042,18 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
         prevClientName = cls.clientName;
         locationSource = loc.source;
       } else {
+        // Couldn't resolve location — fall back to base so adjacent slots can
+        // still be computed conservatively. Track a candidate admin alert that
+        // we'll only surface if this date appears in the top-3 recommendations.
         prevClientName = cls.clientName;
-        // Couldn't resolve lesson location — alert admin
+        locStart = inst.base;
+        locEnd = inst.base;
+        locationSource = "lesson-unresolved-fallback-base";
         adminAlerts.push({
           date: a.appointmentDate,
           time: `${a.startTime.slice(0, 5)}-${a.endTime.slice(0, 5)}`,
           issue: "unresolved-lesson-location",
-          details: `Could not determine where ${cls.clientName}'s lesson is — no address on file and notes are ambiguous.`
+          details: `Could not determine where ${cls.clientName}'s lesson is — no address on file and notes are ambiguous. Travel estimates near this lesson may be inaccurate.`
         });
       }
     } else if (cls.kind === "clinic-hold") {
@@ -1481,10 +1506,22 @@ Suggested actions for admin:
         `- ${a.instructor} has a potential slot on ${formatDate(a.date)} at ${a.slotTime} near ${clientSuburb}. ${a.clinicName} has a hold at ${a.holdStart}-${a.holdEnd} (${a.distanceKm}km away). Check with ${a.clinicName} if that hold is still needed.`
       ).join("\n");
     }
-    if (allAdminAlerts.length > 0) {
-      adminAlertsText += `\n\nDATA ALERTS (unresolved lookup issues):\n` +
-        allAdminAlerts.map(a => `- ${a.instructor} ${formatDate(a.date)} ${a.time}: ${a.details}`).join("\n");
+
+    // Filter data alerts: only show alerts that affect the dates of our top-3
+    // recommended slots. An unresolved lesson on an unrelated date doesn't need
+    // admin attention — it doesn't affect this booking.
+    const selectedInstructorDates = new Set(
+      selected.map(s => `${s.instructor}|${s.date}`)
+    );
+    const relevantDataAlerts = allAdminAlerts.filter(a =>
+      selectedInstructorDates.has(`${a.instructor}|${a.date}`)
+    );
+
+    if (relevantDataAlerts.length > 0) {
+      adminAlertsText += `\n\nDATA ALERTS (unresolved lookup issues affecting recommended slots):\n` +
+        relevantDataAlerts.map(a => `- ${a.instructor} ${formatDate(a.date)} ${a.time}: ${a.details}`).join("\n");
     }
+    debugLog.push(`Data alerts: ${allAdminAlerts.length} total, ${relevantDataAlerts.length} relevant to selected slots`);
 
     const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training. You help office staff choose the best 3 slots from a list of pre-verified options.
 
