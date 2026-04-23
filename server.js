@@ -119,6 +119,16 @@ function formatDate(dateStr) {
   return `${d}/${m}/${y}`;
 }
 
+function dayCount(n) {
+  if (n === 1) return "1 time";
+  return `${n} times`;
+}
+
+function fullDayName(shortName) {
+  const map = { Mon: "Monday", Tue: "Tuesday", Wed: "Wednesday", Thu: "Thursday", Fri: "Friday", Sat: "Saturday", Sun: "Sunday" };
+  return map[shortName] || shortName;
+}
+
 // ─── Nookal API Helpers ──────────────────────────────────────────────────────
 async function getNookalToken() {
   if (cachedToken && Date.now() < cachedTokenExpiry - 60000) return cachedToken;
@@ -1572,15 +1582,62 @@ Suggested actions for admin:
 
     // Build admin alerts section (unresolved data + clinic partnership alerts)
     let adminAlertsText = "";
+
     if (clinicHoldAlerts.length > 0) {
-      adminAlertsText += `\n\nCLINIC PARTNERSHIP ALERTS (worth checking with clinic — slot may free up):\n`;
-      adminAlertsText += clinicHoldAlerts.map(a => {
-        if (a.type === "blocking-unselected") {
-          return `- ${a.instructor} could be a great match for this client on ${formatDate(a.date)} (${a.dayName}), but ${a.clinicName} has a hold at ${a.holdStart}-${a.holdEnd} (${a.distanceKm}km from client). Check with ${a.clinicName} — if they've confirmed no booking for that slot, ${a.instructor} could take this client instead.`;
+      // Group alerts by instructor + clinic + type to avoid dumping every
+      // individual Wednesday. "Christian has Active One holds on 18 Wednesdays"
+      // is more useful than 18 separate lines.
+      const groups = {};
+      for (const a of clinicHoldAlerts) {
+        const key = `${a.instructor}|${a.clinicName}|${a.type}`;
+        if (!groups[key]) {
+          groups[key] = {
+            instructor: a.instructor,
+            clinicName: a.clinicName,
+            type: a.type,
+            distanceKm: a.distanceKm,
+            dates: new Set(),
+            dayNames: new Set(),
+            holdTimes: new Set()
+          };
         }
-        // adjacent-to-selected
-        return `- ${a.instructor} has a recommended slot on ${formatDate(a.date)} at ${a.slotTime}. ${a.clinicName} also has a hold at ${a.holdStart}-${a.holdEnd} (${a.distanceKm}km from client). Check with ${a.clinicName} if that hold is still needed — might be a better fit.`;
-      }).join("\n");
+        groups[key].dates.add(a.date);
+        if (a.dayName) groups[key].dayNames.add(a.dayName);
+        groups[key].holdTimes.add(`${a.holdStart}-${a.holdEnd}`);
+      }
+
+      const alertLines = [];
+      for (const g of Object.values(groups)) {
+        const dateCount = g.dates.size;
+        const dayList = [...g.dayNames];
+        const timeList = [...g.holdTimes].sort();
+
+        let dayPhrase;
+        if (dayList.length === 1 && dateCount > 1) {
+          dayPhrase = `${dayCount(dateCount)} on ${fullDayName(dayList[0])}s`;
+        } else if (dateCount === 1) {
+          dayPhrase = `on ${formatDate([...g.dates][0])}`;
+        } else {
+          dayPhrase = `on ${dateCount} dates`;
+        }
+
+        const timePhrase = timeList.length === 1
+          ? `at ${timeList[0]}`
+          : `in slots ${timeList.slice(0, 3).join(", ")}${timeList.length > 3 ? " and others" : ""}`;
+
+        if (g.type === "blocking-unselected") {
+          alertLines.push(
+            `- ${g.instructor} could be a great match for this client ${dayPhrase}, but ${g.clinicName} has holds ${timePhrase} (${g.distanceKm}km from client). Check with ${g.clinicName} — if any of those holds are free, ${g.instructor} could take this client.`
+          );
+        } else {
+          alertLines.push(
+            `- ${g.instructor} has recommended slot(s) near ${g.clinicName}'s holds ${dayPhrase} ${timePhrase} (${g.distanceKm}km from client). Worth asking ${g.clinicName} if any are free — might be better fits.`
+          );
+        }
+      }
+
+      adminAlertsText += `\n\nCLINIC PARTNERSHIP ALERTS (worth checking with clinic — slot may free up):\n`;
+      adminAlertsText += alertLines.join("\n");
     }
 
     // Filter data alerts: only show alerts that affect the dates of our top-3
