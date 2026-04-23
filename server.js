@@ -1772,13 +1772,29 @@ ${slotDescriptions}${adminAlertsText}`;
 });
 
 // ─── Health check ────────────────────────────────────────────────────────────
+// BUILD_ID changes whenever significant updates ship so we can verify deploys
+const BUILD_ID = "2026-04-24-abbreviations-prompt-cleanup";
+const BUILD_STARTED = new Date().toISOString();
+
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     version: "v2-nookal-api",
+    buildId: BUILD_ID,
+    serverStarted: BUILD_STARTED,
+    features: [
+      "street-abbreviation-expansion",
+      "next-lesson-prompt-hardening",
+      "data-alerts-scoped-to-selected-dates",
+      "clinic-alerts-for-blocked-instructors",
+      "private-hold-classification",
+      "yves-ics-url-fixed"
+    ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
-      travelRoutes: Object.keys(travelCache).length
+      clientNames: Object.keys(clientByNameCache).length,
+      travelRoutes: Object.keys(travelCache).length,
+      icsFeeds: Object.keys(icsCache).length
     },
     tokenValid: cachedToken && Date.now() < cachedTokenExpiry
   });
