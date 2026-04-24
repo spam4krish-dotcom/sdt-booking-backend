@@ -2277,17 +2277,22 @@ If fewer than 5 slots exist, show only what exists. Say in ONE line: "Only N slo
 
 ═══ BELOW THE SLOTS ═══
 
-If the user message has a "NOT OFFERED" section, copy it verbatim under a heading "Not offered".
+Headings should be plain text — NOT markdown bold (no **) and NOT all-caps. Write them exactly like this:
+  Not offered
+  Clinic check
+  Data alerts
 
-If the user message has a "CLINIC PARTNERSHIP ALERTS" section, render under heading "Clinic check" with a one-line intro: "These clinics regularly reserve and usually fill their hold slots, but occasionally one frees up — worth a call before confirming:"
+If the user message has a "NOT OFFERED" section, copy it verbatim under the heading "Not offered".
 
-If the user message has a "DATA ALERTS" section, render under heading "Data alerts" with intro: "Admin should confirm these before booking:"
+If the user message has a "CLINIC PARTNERSHIP ALERTS" section, render under the heading "Clinic check" with a one-line intro: "These clinics regularly reserve and usually fill their hold slots, but occasionally one frees up — worth a call before confirming:"
+
+If the user message has a "DATA ALERTS" section, render under the heading "Data alerts" with intro: "Admin should confirm these before booking:"
 
 If the user message has a "Note: Private-hold entries above..." footer, copy it verbatim at the very bottom.
 
 ═══ TONE ═══
 
-Admin-facing. Fast to scan. No filler. No client-facing language. Use headings and the exact line format from VERIFIED SLOTS. Your goal is to RENDER, not to WRITE.`;
+Admin-facing. Fast to scan. No filler. No client-facing language. No markdown formatting anywhere — no **bold**, no _italics_, no # headings. Use plain text with the exact line format from VERIFIED SLOTS. Your goal is to RENDER, not to WRITE.`;
 
     const userMessage = `${clientSummary}
 AVAILABILITY: ${availString || "not specified"}
@@ -2472,7 +2477,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-24-output-polish-v4.1-test-endpoint";
+const BUILD_ID = "2026-04-24-output-polish-v4.2-no-markdown";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2508,7 +2513,8 @@ app.get("/health", (req, res) => {
       "tier-note-deduplication",
       "not-offered-collapsed-mod-lines",
       "top-pick-tag-on-slot-1",
-      "browser-friendly-test-endpoint"
+      "browser-friendly-test-endpoint",
+      "plain-text-section-headings"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
