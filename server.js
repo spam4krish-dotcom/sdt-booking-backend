@@ -1278,6 +1278,14 @@ function timeRangeOverlapsBlocks(startTime, endTime, blockNames) {
   return false;
 }
 
+// Strip the noisy "Event - " prefix that Nookal prepends to every non-lesson
+// calendar entry ("Event - HOLD for Kaine McNeil" → "HOLD for Kaine McNeil").
+// Also tidy leading/trailing whitespace.
+function stripEventPrefix(label) {
+  if (!label) return label;
+  return label.replace(/^\s*Event\s*[-–]\s*/i, "").trim();
+}
+
 // ─── Core matcher ────────────────────────────────────────────────────────────
 async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, weeksToScan = 17) {
   const slots = [];
@@ -1292,7 +1300,7 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
 
   // Yves: hard zone — if client is outside Peninsula, skip entirely
   if (inst.hardZone && zoneFit === "outside") {
-    return { slots: [], adminAlerts: [], allClinicHolds: [] };
+    return { slots: [], adminAlerts: [], allClinicHolds: [], dropReason: `${clientSuburbName} is outside ${inst.name}'s hard zone (${inst.base} only)` };
   }
 
   const baseTravel = await getTravelTime(inst.base, clientSuburb);
@@ -1301,7 +1309,7 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
 
   // Hard-zone fallback via distance if zone list doesn't have the suburb
   if (inst.hardZone && baseDistanceKm !== null && baseDistanceKm > inst.maxRadiusKm) {
-    return { slots: [], adminAlerts: [], allClinicHolds: [] };
+    return { slots: [], adminAlerts: [], allClinicHolds: [], dropReason: `client ${Math.round(baseDistanceKm)}km from ${inst.name}'s base — outside ${inst.maxRadiusKm}km hard zone` };
   }
 
   let appointments;
@@ -1543,6 +1551,11 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
 
       const rawTravelIn = await getTravelTime(gap.prevLoc, clientSuburb);
       const rawTravelOut = gap.nextLoc ? await getTravelTime(clientSuburb, gap.nextLoc) : 0;
+      // Companion distance lookups — already cached from the travel-time calls
+      // above via getDistanceKm (which pulls from distanceCache). Admin gets
+      // "38 min / 42 km" format so they can smell-check the Google Maps call.
+      const rawDistanceInKm = await getDistanceKm(gap.prevLoc, clientSuburb);
+      const rawDistanceOutKm = gap.nextLoc ? await getDistanceKm(clientSuburb, gap.nextLoc) : null;
 
       // Buffer rule: 10-min buffer only applies when coming FROM a previous appointment
       // (lesson or hold). No buffer when starting fresh from base (instructor hasn't
@@ -1622,6 +1635,8 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
         period: matchedBlock.block,
         travelIn: rawTravelIn,
         travelOut: rawTravelOut,
+        travelInKm: rawDistanceInKm !== null ? Math.round(rawDistanceInKm * 10) / 10 : null,
+        travelOutKm: rawDistanceOutKm !== null ? Math.round(rawDistanceOutKm * 10) / 10 : null,
         bufferMinsApplied: bufferInApplied,
         baseTravel,
         baseDistanceKm,
@@ -1739,10 +1754,22 @@ app.post("/analyse", async (req, res) => {
       return m;
     });
 
+    // Track reasons instructors are dropped so admin can see "Not offered" explanation.
+    // excludedInstructors collects { name, reason } for display at bottom of output.
+    const excludedInstructors = [];
+
     const eligibleInstructors = INSTRUCTORS.filter(inst => {
-      return normalisedMods.every(needed =>
-        inst.mods.some(m => m.toLowerCase() === needed.toLowerCase())
+      const missingMods = normalisedMods.filter(needed =>
+        !inst.mods.some(m => m.toLowerCase() === needed.toLowerCase())
       );
+      if (missingMods.length > 0) {
+        excludedInstructors.push({
+          name: inst.name,
+          reason: `missing mod${missingMods.length > 1 ? "s" : ""}: ${missingMods.join(", ")}`
+        });
+        return false;
+      }
+      return true;
     });
 
     debugLog.push(`Eligible instructors: ${eligibleInstructors.map(i => i.name).join(", ") || "none"}`);
@@ -1775,10 +1802,20 @@ app.post("/analyse", async (req, res) => {
             allInstructorClinicHolds.push({ instructor: inst.name, ...ch });
           }
         }
+        // Track why an eligible instructor didn't contribute any slots, so the
+        // "Not offered" footer can explain it to admin.
+        if (result.slots.length === 0) {
+          if (result.dropReason) {
+            excludedInstructors.push({ name: inst.name, reason: result.dropReason });
+          } else {
+            excludedInstructors.push({ name: inst.name, reason: "no gaps fit client's availability + duration" });
+          }
+        }
         debugLog.push(`${inst.name}: ${result.slots.length} valid slots, ${result.adminAlerts?.length || 0} alerts, ${result.allClinicHolds?.length || 0} clinic holds in avail window`);
       } catch (err) {
         debugLog.push(`ERROR fetching ${inst.name}: ${err.message}`);
         fetchErrors.push({ instructor: inst.name, error: err.message });
+        excludedInstructors.push({ name: inst.name, reason: `diary fetch error (retry later)` });
       }
     }
 
@@ -1805,21 +1842,66 @@ Suggested actions for admin:
       });
     }
 
+    // Sort by base score first. Then walk down the list applying a diversity
+    // penalty so the final selection spreads across instructors, days of week,
+    // and time blocks — rather than returning three identical Tuesdays at 10am
+    // with the same instructor.
+    //
+    // Strategy: score each candidate relative to what we've ALREADY picked.
+    // Same instructor as a higher-ranked pick → -40 score; same day-of-week → -20;
+    // same time block → -10. Small enough that a genuinely best-slot can still win
+    // over a "different for the sake of it" slot, but large enough to break ties
+    // in favour of variety.
     allSlots.sort((a, b) => scoreSlot(b) - scoreSlot(a));
+
     const selected = [];
     const usedInstructors = {};
-    const usedDates = new Set();
-    for (const s of allSlots) {
-      if (selected.length >= 10) break;
-      const instCount = usedInstructors[s.instructor] || 0;
-      if (instCount >= 3) continue;
-      if (usedDates.has(`${s.instructor}|${s.date}`)) continue;
-      selected.push(s);
-      usedInstructors[s.instructor] = instCount + 1;
-      usedDates.add(`${s.instructor}|${s.date}`);
+    const usedInstructorDates = new Set();
+    const TARGET_SLOTS = 5;         // present up to 5 to admin
+    const INTERNAL_POOL = 10;       // still collect up to 10 internally for alerts
+
+    while (selected.length < INTERNAL_POOL && allSlots.length > 0) {
+      // Score each remaining slot against what's already been picked
+      let bestIdx = -1;
+      let bestAdjustedScore = -Infinity;
+
+      for (let i = 0; i < allSlots.length; i++) {
+        const s = allSlots[i];
+        const instCount = usedInstructors[s.instructor] || 0;
+        if (instCount >= 3) continue;                           // cap per instructor
+        if (usedInstructorDates.has(`${s.instructor}|${s.date}`)) continue; // one per inst+day
+
+        let adjusted = scoreSlot(s);
+        // Diversity penalty — only applied when filling the first TARGET_SLOTS (the ones shown to admin)
+        if (selected.length < TARGET_SLOTS) {
+          for (const alreadyPicked of selected) {
+            if (alreadyPicked.instructor === s.instructor) adjusted -= 40;
+            if (alreadyPicked.dayName === s.dayName) adjusted -= 20;
+            if (alreadyPicked.period === s.period) adjusted -= 10;
+          }
+        }
+        if (adjusted > bestAdjustedScore) {
+          bestAdjustedScore = adjusted;
+          bestIdx = i;
+        }
+      }
+
+      if (bestIdx === -1) break;
+      const picked = allSlots.splice(bestIdx, 1)[0];
+      selected.push(picked);
+      usedInstructors[picked.instructor] = (usedInstructors[picked.instructor] || 0) + 1;
+      usedInstructorDates.add(`${picked.instructor}|${picked.date}`);
     }
 
-    debugLog.push(`Selected top ${selected.length} slots for Claude`);
+    // Log Claude's view: top 5 that will actually be rendered.
+    // Also log what the pure score order would have been (without diversity) so we
+    // can spot cases where diversity is hurting rather than helping.
+    const diversityPickOrder = selected.slice(0, TARGET_SLOTS).map(
+      s => `${s.instructor} ${s.date} ${s.suggestedStart} T${s.tier}`
+    );
+    console.log(`[pickOrder] ${booking.clientName || '(no name)'} in ${clientSuburb}: ${diversityPickOrder.join(' | ')}`);
+
+    debugLog.push(`Selected top ${selected.length} slots for Claude (presenting first ${Math.min(TARGET_SLOTS, selected.length)})`);
 
     // ─── Check clinic-partnership holds for admin alerts ───
     // Two cases:
@@ -1888,80 +1970,87 @@ Suggested actions for admin:
       });
     }
 
-    const slotDescriptions = selected.map((s, i) => {
-      // Tier labels. Tier 3 is special: it covers two different real-world
-      // situations and needs different language for each, or admin gets
-      // misleading "already in area" text when it's really a dedicated trip.
-      //   3a: outside all zones + has nearby lesson → genuinely an area visit
-      //   3b: stretch zone + no nearby lesson → dedicated trip to occasional area
-      let tierLabel;
-      if (s.tier === 1) tierLabel = "Tier 1 — Ideal (in core zone, short travel)";
-      else if (s.tier === 2) tierLabel = "Tier 2 — Good (in core zone with longer travel, or stretch zone while already in area)";
-      else if (s.tier === 3 && s.nearbyOnDay) tierLabel = "Tier 3 — Area visit (outside usual zone but instructor is already nearby that day)";
-      else if (s.tier === 3) tierLabel = "Tier 3 — Stretch zone (instructor serves this area occasionally; no nearby lessons this day — dedicated trip)";
-      else tierLabel = "Tier 4 — Stretch ⚠️ (outside zones and instructor not in the area — use for edge cases only)";
-      const instData = INSTRUCTORS.find(x => x.name === s.instructor);
+    // ─── Slot descriptions (compact, labeled format for admin) ───
+    // Each slot is 5-6 short lines: ID header, From, After, any Note lines.
+    // Shown to Claude as-is; Claude's job is to RENDER the 5, not rewrite them.
+    // Only the top TARGET_SLOTS (5) are rendered to admin; the remaining pool
+    // contributes to clinic/data alerts but isn't presented.
+    const PRESENT_COUNT = 5;
+    const toPresent = selected.slice(0, PRESENT_COUNT);
 
-      let comingFrom;
+    // Gather which private-hold references will appear in the rendered slots —
+    // so we can add a single footer line about unknown hold locations instead
+    // of repeating "exact location not confirmed" per slot.
+    let hasAnyPrivateHoldMention = false;
+
+    const slotDescriptions = toPresent.map((s, i) => {
+      // Short tier tag — shown on the same line as the slot header for quick scan.
+      let tierTag;
+      if (s.tier === 1) tierTag = "Tier 1 — Ideal";
+      else if (s.tier === 2) tierTag = "Tier 2 — Good";
+      else if (s.tier === 3 && s.nearbyOnDay) tierTag = "Tier 3 — Area visit";
+      else if (s.tier === 3) tierTag = "Tier 3 — Stretch ⚠️";
+      else tierTag = "Tier 4 — Stretch ⚠️";
+
+      // "From:" line describes where the instructor is just before this slot.
+      const inKm = s.travelInKm !== null ? ` / ${s.travelInKm} km` : "";
+      let fromLine;
       if (s.prevAppointmentKind === "lesson" && s.prevClientName) {
-        const contextNote = s.prevAppointmentNote && s.prevAppointmentNote !== s.prevClientName
-          ? ` — ${s.prevAppointmentNote}`
-          : "";
-        comingFrom = `from lesson with ${s.prevClientName}${contextNote} (finishes ${s.prevEndTime})`;
+        const ctx = s.prevAppointmentNote && s.prevAppointmentNote !== s.prevClientName
+          ? ` (${s.prevAppointmentNote})` : "";
+        fromLine = `From: ${s.prevClientName} lesson${ctx} finishes ${s.prevEndTime} → client (${s.travelIn} min${inKm})`;
       } else if (s.prevAppointmentKind === "clinic-hold") {
-        comingFrom = `from a ${s.prevAppointmentLabel} hold (ends ${s.prevEndTime}) — instructor was at the clinic`;
+        fromLine = `From: ${stripEventPrefix(s.prevAppointmentLabel)} ends ${s.prevEndTime} → client (${s.travelIn} min${inKm})`;
       } else if (s.prevAppointmentKind === "private-hold") {
-        comingFrom = `from a "${s.prevAppointmentLabel}" hold ending ${s.prevEndTime} — exact location not confirmed, admin should verify`;
+        hasAnyPrivateHoldMention = true;
+        fromLine = `From: ${stripEventPrefix(s.prevAppointmentLabel)} ends ${s.prevEndTime} (location unknown) → client (${s.travelIn} min${inKm} est. from base)`;
       } else if (s.priorHardBlock) {
-        comingFrom = `from base in ${s.base} (first availability after "${s.priorHardBlock}")`;
+        fromLine = `From: ${s.base} base (first slot after "${stripEventPrefix(s.priorHardBlock)}") → client (${s.travelIn} min${inKm})`;
       } else {
-        comingFrom = `from base in ${s.base}`;
+        fromLine = `From: ${s.base} base → client (${s.travelIn} min${inKm})`;
       }
 
-      // The "After the lesson" text. Route each next-appointment kind through a
-      // phrase that matches what actually happens — the previous logic used
-      // `nextLocation` for every case, but the server sets nextLocation = base
-      // for private-holds and hard-blocks, causing Claude to say "heads back to
-      // Montmorency at 18:15" when Christian is actually going to Soccer Training
-      // Blackburn (hard-block), or "heads back to Rye at 10:00" when Yves is
-      // actually in a 2-hour private-hold (location unknown).
-      let nextLesson;
+      // "After:" line — what the instructor does next.
+      const outKm = s.travelOutKm !== null ? ` / ${s.travelOutKm} km` : "";
+      let afterLine;
       if (s.nextAppointmentKind === "lesson" && s.nextClientName) {
-        nextLesson = `then lesson with ${s.nextClientName} at ${s.nextStartTime}`;
+        afterLine = `After: client → ${s.nextClientName} lesson at ${s.nextStartTime} (${s.travelOut} min${outKm})`;
       } else if (s.nextAppointmentKind === "clinic-hold") {
-        nextLesson = `then a clinic hold (${s.nextAppointmentLabel}) starting ${s.nextStartTime} — the instructor is at the clinic`;
+        afterLine = `After: ${stripEventPrefix(s.nextAppointmentLabel)} at ${s.nextStartTime} — at the clinic`;
       } else if (s.nextAppointmentKind === "private-hold") {
-        nextLesson = `then a private-hold period starting ${s.nextStartTime} (${s.nextAppointmentLabel}) — exact location not confirmed, instructor has this time reserved`;
+        hasAnyPrivateHoldMention = true;
+        afterLine = `After: ${stripEventPrefix(s.nextAppointmentLabel)} at ${s.nextStartTime} (location unknown)`;
       } else if (s.nextAppointmentKind === "hard-block") {
-        nextLesson = `then "${s.nextAppointmentLabel}" starting ${s.nextStartTime} — instructor is off-duty after this slot (do NOT describe as "heading to base" or similar — it's a personal commitment)`;
-      } else if (s.nextClientName) {
-        // Defensive fallback — old shape
-        nextLesson = `then lesson with ${s.nextClientName} at ${s.nextStartTime}`;
+        afterLine = `After: ${stripEventPrefix(s.nextAppointmentLabel)} at ${s.nextStartTime} — off-duty (personal commitment, NOT returning to base)`;
       } else {
-        nextLesson = "no further appointments scheduled — do not invent a next appointment or time";
+        afterLine = `After: Free rest of day`;
       }
 
-      const peakFlag = s.peakTrafficWarning ? `\n  ⚠️ ${s.peakPeriod} — travel may take longer than estimated` : "";
+      // Optional "Note:" line — only when there's something admin genuinely
+      // benefits from seeing. Don't include boilerplate like "Tier 1 core zone"
+      // — that's already implicit in the tag.
+      const notes = [];
+      if (s.tier === 3 && s.nearbyOnDay && s.nearbyClient) {
+        notes.push(`Already in area — ${s.nearbyClient} lesson ${s.nearbyTime} nearby`);
+      } else if (s.tier === 3 && !s.nearbyOnDay) {
+        notes.push(`Instructor covers this area occasionally — dedicated trip`);
+      } else if (s.tier === 4) {
+        notes.push(`Outside ${s.instructor}'s usual area AND not nearby today — use only if no better option`);
+      }
+      if (s.peakTrafficWarning) {
+        notes.push(`⚠️ ${s.peakPeriod} — travel may take longer than estimated`);
+      }
+      const notesLines = notes.map(n => `Note: ${n}`).join("\n  ");
 
-      const bufferNote = s.bufferMinsApplied > 0
-        ? `${s.bufferMinsApplied} min buffer applied`
-        : "no buffer (coming from base)";
-
-      // Add in-area context line for Tier 2/3 "already in area" slots
-      const inAreaNote = s.nearbyOnDay && s.tier >= 2
-        ? `\n  In area: ${s.instructor} is already near ${clientSuburb} that day (nearby lesson with ${s.nearbyClient} at ${s.nearbyTime})`
-        : "";
-
-      return `Slot ${i + 1}: ${s.instructor} — ${formatDate(s.date)} (${s.dayName}) at ${s.suggestedStart}
-  ${tierLabel}
-  Zone fit: ${s.zoneFit} (${s.tierReason})
-  Coming ${comingFrom}
-  Travel in: ${s.travelIn} min (${bufferNote})
-  After the lesson: ${nextLesson}
-  Travel out: ${s.travelOut} min
-  Base: ${s.base} → ${clientSuburb}: ${s.baseTravel} min${inAreaNote}
-  Lessons booked that day: ${s.totalApptsThatDay}${peakFlag}`;
+      return `Slot ${i + 1}: ${s.instructor} — ${formatDate(s.date)} (${s.dayName}) at ${s.suggestedStart}   [${tierTag}]
+  ${fromLine}
+  ${afterLine}${notesLines ? "\n  " + notesLines : ""}`;
     }).join("\n\n");
+
+    // Footer note — one mention of the private-hold caveat, not per-slot.
+    const privateHoldFooter = hasAnyPrivateHoldMention
+      ? "\n\nNote: Private-hold entries above (e.g. Sherri's and Jason's private clients) have unknown locations — instructor has the time reserved but the destination isn't in Nookal. Confirm with the instructor if timing is tight."
+      : "";
 
     // Build admin alerts section (unresolved data + clinic partnership alerts)
     let adminAlertsText = "";
@@ -2023,15 +2112,14 @@ Suggested actions for admin:
       adminAlertsText += alertLines.join("\n");
     }
 
-    // Filter data alerts: only show alerts relevant to the top 3 scored slots
-    // (what Claude is most likely to present). Scoping to the full top-10 candidates
-    // lets Gabriel/other low-ranked slots' alerts leak into Yves-only responses.
-    const topThreeSlots = selected.slice(0, 3);
-    const topThreeInstructorDates = new Set(
-      topThreeSlots.map(s => `${s.instructor}|${s.date}`)
+    // Filter data alerts: only show alerts relevant to the slots we're actually
+    // presenting (the ones Claude will render). Previously we scoped to top-3
+    // and the full selected-10 pool leaked alerts from unpresented slots.
+    const presentedInstructorDates = new Set(
+      toPresent.map(s => `${s.instructor}|${s.date}`)
     );
     const relevantDataAlerts = allAdminAlerts.filter(a =>
-      topThreeInstructorDates.has(`${a.instructor}|${a.date}`)
+      presentedInstructorDates.has(`${a.instructor}|${a.date}`)
     );
 
     if (relevantDataAlerts.length > 0) {
@@ -2040,66 +2128,90 @@ Suggested actions for admin:
     }
     debugLog.push(`Data alerts: ${allAdminAlerts.length} total, ${relevantDataAlerts.length} relevant to selected slots`);
 
-    const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training. You help office staff choose the best 3 slots from a list of pre-verified options.
+    // "Not offered" footer — list eligible-but-filtered instructors with why.
+    // De-dupe by name in case an instructor was added for multiple reasons.
+    const seenExcluded = new Set();
+    const dedupedExcluded = [];
+    for (const ex of excludedInstructors) {
+      if (!seenExcluded.has(ex.name)) {
+        seenExcluded.add(ex.name);
+        dedupedExcluded.push(ex);
+      }
+    }
+    // Only include instructors NOT already in the selected list (an instructor
+    // with one good slot and 12 filtered gaps shouldn't appear as "not offered")
+    const selectedNames = new Set(toPresent.map(s => s.instructor));
+    const notOfferedList = dedupedExcluded.filter(ex => !selectedNames.has(ex.name));
+    let notOfferedText = "";
+    if (notOfferedList.length > 0) {
+      notOfferedText = "\n\nNOT OFFERED (eligible instructors who didn't make the list):\n" +
+        notOfferedList.map(ex => `- ${ex.name}: ${ex.reason}`).join("\n");
+    }
+
+    // Address-not-found detection: if NO slot in the selected list has a resolved
+    // distance from base, Google probably couldn't geocode the client address.
+    // Travel times will still be returned (30-min fallback) but admin should
+    // know before they trust the numbers.
+    const anyBaseDistanceResolved = toPresent.some(s => s.baseDistanceKm !== null && s.baseDistanceKm !== undefined);
+    const addressWarning = (toPresent.length > 0 && !anyBaseDistanceResolved)
+      ? "⚠️ Client address couldn't be found on the map — travel times below are approximate. Please double-check before booking.\n\n"
+      : "";
+
+    // Compose top-of-output client summary — sits above options so admin confirms
+    // no data entry mix-up before copying anything into Nookal.
+    const clientName = booking.clientName || "(not specified)";
+    const sessionType = booking.sessionType || booking.serviceType || "";
+    const modsText = normalisedMods.length > 0 ? normalisedMods.join(", ") : "no mods required";
+    const clientSummary =
+      `CLIENT: ${clientName} • ${clientSuburb} • ${durationMins}min • ${modsText}\n` +
+      (sessionType ? `Session type: ${sessionType}\n` : "");
+
+    const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training. You prepare a compact scannable summary for office staff to act on — NOT a narrative.
 
 ═══ CRITICAL ANTI-FABRICATION RULES ═══
 
-The list of VERIFIED SLOTS below is the ONLY source of truth. Every slot you suggest MUST exist verbatim in that list.
+The list of VERIFIED SLOTS below is the ONLY source of truth. Every slot you present MUST exist verbatim in that list.
 
 DO NOT:
-- Invent a new date or time
-- Round, adjust, or alter any time value shown
-- Suggest a slot at a different time than listed
-- Invent client names for the previous/next appointment
-- Invent a "next appointment at X time" when the slot says "no further appointments scheduled"
-- Describe travel destinations not in the slot data
+- Invent a new date, time, or slot
+- Round, adjust, or alter any time shown
+- Invent previous/next appointment client names or locations
+- Rewrite From: or After: lines — copy them as-is (you may shorten slightly but preserve all facts)
+- Add a tier number or change a tier number
+- Claim "already in area" unless the slot explicitly says so in its Note
+- Invent distances (km) or travel times — only use the numbers in the From/After lines
 
-If the VERIFIED SLOTS list is empty OR has fewer than 3 entries, return the ones that exist and explicitly say "Only N valid slot(s) available — no other options passed verification. Admin should check client availability or consider alternate arrangements."
+═══ OUTPUT FORMAT — FOLLOW EXACTLY ═══
 
-Every slot you name must match exactly: instructor, date, time (copy the digits exactly as shown in "Slot N: INSTRUCTOR — DATE at TIME").
+Start with the CLIENT line copied verbatim from the user message.
 
-═══ PRESENTATION ═══
+If there is an "⚠️ Client address couldn't be found on the map..." warning, include it immediately after.
 
-Pick up to 3 best slots from the provided list. For each:
-- Option number, instructor name, date/time (exact match from list)
-- Tier label
-- 2-3 sentences on: day/time fit, "Coming from" (use the exact line — if it mentions a hold, describe the hold not a lesson; if it says "exact location not confirmed, admin should verify", include that warning), and what happens after the lesson
+Then list each slot EXACTLY as shown in VERIFIED SLOTS — keep the "Slot N: ..." header with the tier tag in brackets, keep the From: and After: lines verbatim, keep any Note: lines.
 
-Style rules:
-- Use the exact "Coming from" line provided. If it says "from a private hold" or "from a clinic hold", describe that accurately — don't say "from lesson with X".
-- Use the exact "After the lesson:" line provided. Never rewrite it into "heads back to [base city]" or "returns to base" — those phrases are almost always wrong because:
-  - private-holds have an unknown location (the line will say "exact location not confirmed")
-  - hard-blocks are personal commitments like soccer training or school pickup in a specific suburb (the line will explicitly tell you not to describe it as heading to base)
-  - If the line says "no further appointments scheduled", say the instructor is free after, full stop.
-  When the line mentions a clinic hold, a private-hold period, or a named hard-block ("Soccer Training Blackburn", "School pick up"), paraphrase what the line actually says — don't substitute your own ending.
-- If the slot shows a ⚠️ peak traffic warning, mention it
-- If a slot has an "In area:" line, mention this context in your write-up — it's WHY the slot works despite the instructor being outside their usual zone (e.g. "Christian is already in Frankston for his 2pm lesson, so the earlier slot fits nicely")
-- Tier 1 = ideal (core zone, short travel) — strong recommendation
-- Tier 2 = good (longer travel in zone, or stretch zone with nearby lesson) — solid choice, mention any in-area context
-- Tier 3 has two flavours — read the tier label carefully:
-    • "Tier 3 — Area visit" = instructor is genuinely nearby that day (a real lesson sits within 15km) → explain the "already in area" reasoning
-    • "Tier 3 — Stretch zone" = instructor serves this area occasionally but is NOT nearby today → this is a dedicated trip. Do NOT claim they're already in the area. Note it's outside their usual territory but they're willing to travel.
-- Tier 4 ⚠️ stretch — the instructor doesn't usually work in this area AND isn't in the area that day. Add an explicit ⚠️ warning. Only use if nothing better is available.
-- If only one instructor had eligible slots, explain why others weren't viable
-- Practical tone for office staff, not client-facing
+Do NOT add narrative sentences around the slots. No "Perfect timing", no "Another excellent option", no introductions like "Here are the best slots". The slots speak for themselves.
 
-═══ APPENDING ALERTS ═══
+If fewer than 5 slots exist, show only what exists. Say in ONE line: "Only N slot(s) found — no other options fit the client's availability and requirements."
 
-AT THE END OF YOUR RESPONSE, check the user message for these sections and add them if present (copy verbatim):
+═══ BELOW THE SLOTS ═══
 
-1. If the user message contains "CLINIC PARTNERSHIP ALERTS", add a section titled "Clinic Partnership Check" listing each alert. Precede with: "These clinics regularly reserve and usually fill their hold slots, but occasionally one frees up. Worth a quick call before confirming:"
+If the user message has a "NOT OFFERED" section, copy it verbatim under a heading "Not offered".
 
-2. If the user message contains "DATA ALERTS", add a section titled "Data Alerts" listing each verbatim. Precede with: "The system couldn't verify some information — admin should confirm these before booking:"
+If the user message has a "CLINIC PARTNERSHIP ALERTS" section, render under heading "Clinic check" with a one-line intro: "These clinics regularly reserve and usually fill their hold slots, but occasionally one frees up — worth a call before confirming:"
 
-If neither section exists, do NOT add any alert sections.`;
+If the user message has a "DATA ALERTS" section, render under heading "Data alerts" with intro: "Admin should confirm these before booking:"
 
-    const userMessage = `CLIENT: ${booking.clientName || "(not specified)"}
-SUBURB: ${clientSuburb}
-MODS: ${normalisedMods.join(", ") || "none"}
+If the user message has a "Note: Private-hold entries above..." footer, copy it verbatim at the very bottom.
+
+═══ TONE ═══
+
+Admin-facing. Fast to scan. No filler. No client-facing language. Use headings and the exact line format from VERIFIED SLOTS. Your goal is to RENDER, not to WRITE.`;
+
+    const userMessage = `${clientSummary}
 AVAILABILITY: ${availString || "not specified"}
 
-VERIFIED SLOTS:
-${slotDescriptions}${adminAlertsText}`;
+${addressWarning}VERIFIED SLOTS:
+${slotDescriptions}${privateHoldFooter}${notOfferedText}${adminAlertsText}`;
 
     const aiRes = await axios.post("https://api.anthropic.com/v1/messages", {
       model: "claude-sonnet-4-20250514",
@@ -2278,7 +2390,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-24-tier-labels-next-appt-phrasing-v2";
+const BUILD_ID = "2026-04-24-compact-output-diversity-v3";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2298,7 +2410,16 @@ app.get("/health", (req, res) => {
       "next-appointment-kind-aware-phrasing",
       "clinic-alert-time-block-overlap-filter",
       "jason-daily-cutoff-hard-block",
-      "getDistanceKm-cache-key-fix"
+      "getDistanceKm-cache-key-fix",
+      "compact-labeled-slot-output",
+      "bidirectional-travel-min-and-km",
+      "diversity-penalty-in-slot-selection",
+      "present-up-to-5-slots",
+      "not-offered-explanation",
+      "strip-event-prefix",
+      "address-not-found-warning",
+      "client-summary-at-top",
+      "claude-pick-order-logging"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
