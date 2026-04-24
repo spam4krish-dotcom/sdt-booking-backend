@@ -1050,6 +1050,20 @@ async function resolveAppointmentLocation(appt) {
 // Also caches the distance in metres so we can check radii without re-querying.
 const distanceCache = {}; // { "origin|destination": metres }
 
+// ─── Admin audit log ─────────────────────────────────────────────────────────
+// In-memory ring buffer of the last N analyses, so admin can look back at
+// recent bookings during the shadow-testing phase without having to dig
+// through Railway logs. Resets when the server restarts — this is intended
+// as a lightweight audit view, not persistent storage.
+const ADMIN_LOG_MAX_ENTRIES = 100;
+const adminAuditLog = [];
+function appendAuditLog(entry) {
+  adminAuditLog.push(entry);
+  if (adminAuditLog.length > ADMIN_LOG_MAX_ENTRIES) {
+    adminAuditLog.shift();
+  }
+}
+
 // Expand common street-type abbreviations so Google Maps geocoding is unambiguous.
 // Examples: "251 Mountain Hwy" → "251 Mountain Highway"
 // This matters because Google can fuzzy-match common abbreviations to the wrong street.
@@ -2398,6 +2412,35 @@ ${slotDescriptions}${privateHoldFooter}${notOfferedText}${adminAlertsText}`;
     });
 
     debugLog.push("Claude analysis complete");
+
+    // Append to admin audit log (ring buffer of last 100 bookings).
+    // Captures enough detail that admin can later review what was suggested
+    // for a given client without needing the full Railway log stream.
+    appendAuditLog({
+      timestamp: new Date().toISOString(),
+      clientName: booking.clientName || "(not specified)",
+      suburb: clientSuburb,
+      mods: normalisedMods,
+      duration: durationMins,
+      availability: availString || "(none specified)",
+      presentedSlots: toPresent.map(s => ({
+        instructor: s.instructor,
+        date: s.date,
+        dayName: s.dayName,
+        start: s.suggestedStart,
+        tier: s.tier,
+        nearbyOnDay: s.nearbyOnDay || false,
+        travelInMin: s.travelIn,
+        travelInKm: s.travelInKm
+      })),
+      notOfferedCount: notOfferedList.length,
+      clinicAlertCount: clinicHoldAlerts.length,
+      warnings: {
+        addressLikelyInvalid: addressWarning !== "",
+        hasPrivateHolds: hasAnyPrivateHoldMention
+      }
+    });
+
     res.json({ ...aiRes.data, _debug: debugLog });
 
   } catch (err) {
@@ -2560,7 +2603,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-24-geocode-fuzzy-detect-v5.2";
+const BUILD_ID = "2026-04-24-admin-audit-log-v5.3";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2603,7 +2646,8 @@ app.get("/health", (req, res) => {
       "nearby-appointment-kind-aware-wording",
       "geocode-failure-detection",
       "clinic-regex-handles-parens-and-clinic-word",
-      "geocode-fuzzy-match-detection-150km-threshold"
+      "geocode-fuzzy-match-detection-150km-threshold",
+      "admin-audit-log-ring-buffer"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
@@ -3126,6 +3170,103 @@ app.get("/test", async (req, res) => {
     const detail = err.response?.data?.error || err.message;
     res.status(500).type("text/plain").send(`Test endpoint error:\n${detail}`);
   }
+});
+
+// ─── Admin audit log endpoint ──────────────────────────────────────────────
+// Browser-friendly view of the last N analyses. Designed to be read on a phone
+// during the shadow-testing phase so admin can review what the tool suggested
+// for recent bookings without needing Railway access.
+//
+// Default: plain-text formatted. Add ?format=json for raw JSON.
+// Add ?n=<count> to limit to the most recent N (default 20, max 100).
+// Add ?client=<substring> to filter by client name.
+app.get("/admin-log", (req, res) => {
+  const format = req.query.format || "text";
+  const requestedN = parseInt(req.query.n) || 20;
+  const n = Math.max(1, Math.min(requestedN, ADMIN_LOG_MAX_ENTRIES));
+  const clientFilter = (req.query.client || "").toLowerCase();
+
+  // Newest first
+  let entries = [...adminAuditLog].reverse();
+  if (clientFilter) {
+    entries = entries.filter(e => e.clientName.toLowerCase().includes(clientFilter));
+  }
+  entries = entries.slice(0, n);
+
+  if (format === "json") {
+    return res.json({
+      total: adminAuditLog.length,
+      shown: entries.length,
+      entries
+    });
+  }
+
+  // Plain-text format — easy to read on a phone
+  if (entries.length === 0) {
+    const hint = clientFilter
+      ? `No bookings match "${clientFilter}".`
+      : "No bookings analysed yet since last server restart.";
+    return res.type("text/plain").send(hint);
+  }
+
+  const lines = [];
+  lines.push(`Admin audit log — ${adminAuditLog.length} total in memory, showing ${entries.length} most recent${clientFilter ? ` matching "${clientFilter}"` : ""}`);
+  lines.push("(ring buffer of last 100, resets on server restart)");
+  lines.push("");
+
+  // Melbourne-local time formatter
+  const toMelbTime = (iso) => {
+    try {
+      const d = new Date(iso);
+      const formatter = new Intl.DateTimeFormat("en-AU", {
+        timeZone: "Australia/Melbourne",
+        year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", hour12: false
+      });
+      return formatter.format(d);
+    } catch { return iso; }
+  };
+
+  for (const e of entries) {
+    lines.push("─".repeat(60));
+    lines.push(`${toMelbTime(e.timestamp)} — ${e.clientName}`);
+    lines.push(`  ${e.suburb}  •  ${e.duration}min  •  ${e.mods.length ? e.mods.join(", ") : "no mods"}`);
+    lines.push(`  Availability: ${e.availability}`);
+
+    if (e.warnings && e.warnings.addressLikelyInvalid) {
+      lines.push(`  ⚠️ Address could not be found on the map`);
+    }
+
+    if (e.presentedSlots.length === 0) {
+      lines.push("  → No slots offered");
+    } else {
+      lines.push(`  → ${e.presentedSlots.length} slot(s) offered:`);
+      for (let i = 0; i < e.presentedSlots.length; i++) {
+        const s = e.presentedSlots[i];
+        const tierTag = s.tier === 1 ? "T1"
+          : s.tier === 2 ? "T2"
+          : s.tier === 3 ? (s.nearbyOnDay ? "T3 area" : "T3 stretch")
+          : "T4 ⚠️";
+        const km = s.travelInKm !== null && s.travelInKm !== undefined ? `${s.travelInKm}km` : "?km";
+        lines.push(`     ${i + 1}. ${s.instructor} ${s.date} (${s.dayName}) ${s.start}  [${tierTag}]  (${s.travelInMin}min / ${km})`);
+      }
+    }
+    if (e.notOfferedCount > 0) {
+      lines.push(`  ${e.notOfferedCount} instructor(s) not offered`);
+    }
+    if (e.clinicAlertCount > 0) {
+      lines.push(`  ${e.clinicAlertCount} clinic alert(s) fired`);
+    }
+    lines.push("");
+  }
+
+  lines.push("");
+  lines.push("Query options:");
+  lines.push("  ?n=50               — show more entries");
+  lines.push("  ?client=smith       — filter by client name");
+  lines.push("  ?format=json        — raw JSON output");
+
+  res.type("text/plain").send(lines.join("\n"));
 });
 
 app.listen(PORT, () => console.log(`SDT Booking Assistant v2 running on ${PORT}`));
