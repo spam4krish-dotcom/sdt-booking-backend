@@ -646,15 +646,41 @@ function extractNotesLocation(rawNotes) {
   const streetAddressMatch = notes.match(/(\d{1,5}\s+[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*\s+(?:Street|St|Road|Rd|Avenue|Ave|Drive|Dr|Court|Ct|Crescent|Cres|Place|Pl|Parade|Pde|Way|Highway|Hwy|Boulevard|Blvd|Lane|Ln|Close|Cl|Terrace|Tce))\b/i);
   if (streetAddressMatch) {
     const streetPart = streetAddressMatch[1].trim();
-    // Search the WHOLE notes string for a suburb-like ALL CAPS word.
-    // Street addresses often have the suburb elsewhere in the description.
-    // e.g. "WANTIRNA Ax with OT ... Eastern Health Wantirna 251 Mountain Hwy"
-    // — suburb "WANTIRNA" is at start, address is later.
-    const allCaps = notes.match(/\b([A-Z]{3,}(?:\s+[A-Z]{2,})*)\b/g) || [];
     let suburbPart = null;
-    for (const caps of allCaps) {
-      if (isLikelySuburb(caps)) { suburbPart = cleanSuburb(caps); break; }
+
+    // Step 1: Check the text IMMEDIATELY AFTER the street-address match.
+    // Lesson notes commonly read "2 Ranch Court Narre Warren" — suburb right after.
+    // Without this step, a title-case suburb like "Narre Warren" was invisible to
+    // the old all-caps-only fallback, leaving the address to be geocoded with
+    // no suburb context (Google then picked the wrong geographic match).
+    //
+    // Match 1-4 TitleCase words OR an ALLCAPS suburb, explicitly refusing to
+    // swallow "VIC" or a 4-digit postcode into the suburb. Also stops at line
+    // ends, punctuation, or opening parens.
+    const afterMatch = notes.slice(streetAddressMatch.index + streetAddressMatch[0].length);
+    // Title-case attempt: word is TitleCase but not "VIC" — 1 to 4 words long.
+    // Reject the capture if it ends at or includes VIC/postcode.
+    const titleCaseSuburb = afterMatch.match(/^[\s,\-–]*((?:(?!VIC\b)[A-Z][A-Za-z]+)(?:\s+(?!VIC\b)[A-Z][A-Za-z]+){0,3})(?=[\s,.|\n\r;(]|$)/);
+    // All-caps attempt as backup (e.g. "BERWICK")
+    const allCapsSuburb = !titleCaseSuburb
+      ? afterMatch.match(/^[\s,\-–]*([A-Z]{3,}(?:\s+[A-Z]{2,})*)(?=[\s,.|\n\r;(]|$)/)
+      : null;
+    const matchedSuburb = titleCaseSuburb || allCapsSuburb;
+    if (matchedSuburb) {
+      const candidate = cleanSuburb(matchedSuburb[1]);
+      if (isLikelySuburb(candidate)) suburbPart = candidate;
     }
+
+    // Step 2 (fallback): Search the WHOLE notes string for an all-caps suburb
+    // elsewhere. This catches the old pattern like "WANTIRNA Ax with OT ... 251
+    // Mountain Hwy" where the suburb leads the notes rather than follows the address.
+    if (!suburbPart) {
+      const allCaps = notes.match(/\b([A-Z]{3,}(?:\s+[A-Z]{2,})*)\b/g) || [];
+      for (const caps of allCaps) {
+        if (isLikelySuburb(caps)) { suburbPart = cleanSuburb(caps); break; }
+      }
+    }
+
     const fullAddress = suburbPart ? `${streetPart}, ${suburbPart}` : streetPart;
     return {
       kind: "address",
@@ -1234,6 +1260,7 @@ async function hasNearbyAppointmentSameDay(appointmentsForDay, clientAddress) {
         found: true,
         distanceKm: Math.round(dist * 10) / 10,
         nearbyClient: a.clientName || a.label,
+        nearbyKind: a.kind, // "lesson" or "clinic-hold" — used to pick correct wording downstream
         nearbyLocation: a.locationForStart,
         nearbyTime: a.startTime
       };
@@ -1663,6 +1690,7 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
         tierReason,
         nearbyOnDay: nearbyInfo.found,
         nearbyClient: nearbyInfo.nearbyClient || null,
+        nearbyKind: nearbyInfo.nearbyKind || null,
         nearbyTime: nearbyInfo.nearbyTime || null,
         prevLocation: gap.prevLoc,
         nextLocation: gap.nextLoc,
@@ -1843,17 +1871,38 @@ app.post("/analyse", async (req, res) => {
       const errorInfo = fetchErrors.length > 0
         ? `\n\n⚠️ Some instructor diaries could not be fetched: ${fetchErrors.map(e => `${e.instructor} (${e.error})`).join(", ")}`
         : "";
+
+      // Detect whether the client address itself is the problem. If Google
+      // Maps can't geocode it, every travel lookup falls back to a 30-min
+      // stub with no distance cached. When that happens we shouldn't send
+      // admin on a wild goose chase through instructor schedules — the real
+      // issue is the address typo. Probe by asking Google for Christian's
+      // base → client travel; if distance comes back null, we know the
+      // address is the culprit.
+      let addressLikelyInvalid = false;
+      try {
+        const probeBase = INSTRUCTORS.find(i => i.name === "Christian")?.base || "Melbourne";
+        const probeDistance = await getDistanceKm(probeBase, clientSuburb);
+        addressLikelyInvalid = (probeDistance === null);
+      } catch (e) {
+        addressLikelyInvalid = true;
+      }
+
+      const addressWarningText = addressLikelyInvalid
+        ? `\n\n⚠️ Could not find "${clientSuburb}" on the map. Please double-check the address — the suburb or street name may be misspelled, or the postcode may be wrong. No further instructor lookup is possible until the address is corrected.`
+        : "";
+
       return res.json({
         content: [{
           type: "text",
-          text: `No available slots found for ${booking.clientName || "this client"} in ${clientSuburb}.
+          text: `No available slots found for ${booking.clientName || "this client"} in ${clientSuburb}.${addressWarningText}
 
 Eligible instructors (with required modifications): ${eligibleNames}
 
 All eligible instructors are either fully booked during the client's preferred time windows or the client's suburb is outside their usual operating area.
 
 Suggested actions for admin:
-1. Ask the client about additional availability (different days or time blocks)
+1. ${addressLikelyInvalid ? "Fix the address spelling / postcode and retry" : "Ask the client about additional availability (different days or time blocks)"}
 2. Check if the closest instructor has upcoming days near ${clientSuburb}
 3. Contact an instructor directly about a special arrangement${errorInfo}`
         }],
@@ -2067,8 +2116,16 @@ Suggested actions for admin:
       const notes = [];
       if (s.tier === 3 && s.nearbyOnDay && s.nearbyClient) {
         // "Already in area" is slot-specific (different nearbyClient each time)
-        // so we show it every time, not deduped.
-        notes.push(`Already in area — ${s.nearbyClient} lesson ${s.nearbyTime} nearby`);
+        // so we show it every time, not deduped. Word the note differently for
+        // a nearby lesson vs a nearby clinic hold, and strip the "Event - " prefix
+        // when the nearby entry is a clinic hold (labels otherwise render like
+        // "Event - Hold for Active One Frankston lesson" which is both noisy and
+        // technically wrong — a clinic hold isn't a "lesson").
+        if (s.nearbyKind === "clinic-hold") {
+          notes.push(`Already in area — ${stripEventPrefix(s.nearbyClient)} clinic hold ${s.nearbyTime} nearby`);
+        } else {
+          notes.push(`Already in area — ${s.nearbyClient} lesson ${s.nearbyTime} nearby`);
+        }
       } else if (s.tier === 3 && !s.nearbyOnDay) {
         if (!shownTier3Stretch.shown) {
           notes.push(`Instructor covers this area occasionally — dedicated trip`);
@@ -2086,9 +2143,13 @@ Suggested actions for admin:
       const notesLines = notes.map(n => `Note: ${n}`).join("\n  ");
 
       // Top pick tag on Slot 1 — makes the hierarchy of the list explicit so
-      // admin doesn't have to infer. Only add when there's more than one slot
-      // (labelling a solo slot as "top pick" is meaningless).
-      const topPickTag = (i === 0 && toPresent.length > 1) ? " ★ TOP PICK" : "";
+      // admin doesn't have to infer. Only add when:
+      //   (a) there's more than one slot (labelling a solo slot is meaningless), and
+      //   (b) Slot 1 is genuinely a good slot (Tier 1 or 2).
+      // Tier 3/4 slots — stretch zones, dedicated trips, or "no nearby" — aren't
+      // deserving of a gold-star label even when they're the best available. Admin
+      // could misread "TOP PICK" as "this is a good slot" and skip the ⚠️ warnings.
+      const topPickTag = (i === 0 && toPresent.length > 1 && s.tier <= 2) ? " ★ TOP PICK" : "";
 
       return `Slot ${i + 1}: ${s.instructor} — ${formatDate(s.date)} (${s.dayName}) at ${s.suggestedStart}   [${tierTag}]${topPickTag}
   ${fromLine}
@@ -2477,7 +2538,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-24-output-polish-v4.2-no-markdown";
+const BUILD_ID = "2026-04-24-distance-suburb-fix-v5";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2514,7 +2575,11 @@ app.get("/health", (req, res) => {
       "not-offered-collapsed-mod-lines",
       "top-pick-tag-on-slot-1",
       "browser-friendly-test-endpoint",
-      "plain-text-section-headings"
+      "plain-text-section-headings",
+      "title-case-suburb-extraction-after-street",
+      "top-pick-restricted-to-tier-1-and-2",
+      "nearby-appointment-kind-aware-wording",
+      "geocode-failure-detection"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
