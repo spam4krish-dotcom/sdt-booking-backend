@@ -2472,7 +2472,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-24-output-polish-v4";
+const BUILD_ID = "2026-04-24-output-polish-v4.1-test-endpoint";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2507,7 +2507,8 @@ app.get("/health", (req, res) => {
       "clinic-hold-travel-burden-surfaced",
       "tier-note-deduplication",
       "not-offered-collapsed-mod-lines",
-      "top-pick-tag-on-slot-1"
+      "top-pick-tag-on-slot-1",
+      "browser-friendly-test-endpoint"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
@@ -2964,6 +2965,71 @@ app.get("/test-ics", async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Browser-friendly test endpoint ─────────────────────────────────────────
+// Lets you test a booking from a URL bar (no form, no curl needed).
+// Takes query-string parameters and internally runs the same pipeline as /analyse,
+// then returns Claude's rendered output as plain text so it's readable in any browser.
+//
+// Example:
+//   /test?name=Jenna+Frost&suburb=14+Davey+Street,+Frankston+VIC+3199
+//        &mods=LFA&duration=60&availability=Wed:mid-morning
+//
+// Multiple availability windows: comma-separated
+//   availability=Mon:mid-morning,Wed:afternoon
+// Multiple mods: comma-separated
+//   mods=LFA,Electronic+Spinner
+app.get("/test", async (req, res) => {
+  try {
+    const { name, suburb, mods, duration, availability } = req.query;
+
+    if (!suburb) {
+      res.type("text/plain").send(
+        "Usage: /test?name=<client>&suburb=<address>&mods=<mod1,mod2>&duration=<60|90>&availability=<Day:block,Day:block>\n\n" +
+        "Example: /test?name=Jenna+Frost&suburb=14+Davey+Street,+Frankston+VIC+3199&mods=LFA&duration=60&availability=Wed:mid-morning\n\n" +
+        "Day codes: Mon Tue Wed Thu Fri\n" +
+        "Block codes: early-morning mid-morning afternoon late-afternoon all-day"
+      );
+      return;
+    }
+
+    // Build the same body shape the form sends to /analyse, then forward.
+    const body = {
+      clientName: name || "(test client)",
+      suburb: suburb,
+      modifications: mods || "",
+      duration: duration || "60",
+      availability: availability || ""
+    };
+
+    // Self-call /analyse via HTTP so we reuse its exact pipeline (no duplication).
+    // We go localhost because we're on the same Railway instance.
+    const port = PORT || 3000;
+    const analyseRes = await axios.post(`http://localhost:${port}/analyse`, body, {
+      headers: { "Content-Type": "application/json" },
+      timeout: 90000
+    });
+
+    // /analyse returns a Claude-API-shaped response. Pull out the text.
+    const data = analyseRes.data;
+    let rendered = "";
+    if (data?.content?.length) {
+      rendered = data.content
+        .filter(c => c.type === "text")
+        .map(c => c.text)
+        .join("\n\n");
+    } else if (data?.error) {
+      rendered = `Error: ${data.error}`;
+    } else {
+      rendered = "(No content returned)";
+    }
+
+    res.type("text/plain").send(rendered);
+  } catch (err) {
+    const detail = err.response?.data?.error || err.message;
+    res.status(500).type("text/plain").send(`Test endpoint error:\n${detail}`);
   }
 });
 
