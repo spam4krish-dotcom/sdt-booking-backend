@@ -489,6 +489,9 @@ function classifyAppointment(a) {
     // Hard block keywords (with word-boundary matching to avoid substring traps)
     const hardBlockSignals = [
       "day off", "dayoff", "no lessons", "no lesson",
+      // Jason's recurring daily cutoff: "No more SDT bookings after 2:30pm" / "No more SDT clients after 2:30pm"
+      // (46 recurring entries in diary; Event Category = Holidays in Nookal but keywords weren't in the regex)
+      "no more sdt", "no more bookings", "no more clients",
       "private stuff", "private work", "non-sdt", "non sdt",
       "school pick up", "school pickup", "school run",
       "holiday", "holidays", "leave on", "sick",
@@ -1081,13 +1084,20 @@ async function getTravelTime(origin, destination) {
   return 30;
 }
 
-// Get distance in km between two locations (uses cache if populated by getTravelTime)
+// Get distance in km between two locations (uses cache if populated by getTravelTime).
+// CRITICAL: must use the same cache key shape as getTravelTime, which applies
+// expandStreetAbbreviations to both inputs before keying. Previously this function
+// used the raw inputs, so origins containing "Hwy", "St", "Rd" etc. always missed
+// the cache → returned null → hasNearbyAppointmentSameDay silently treated every
+// such lesson as "not nearby" → tier calc went wrong for Wantirna/Highett-type notes.
 async function getDistanceKm(origin, destination) {
   if (!origin || !destination) return null;
-  const key = `${origin.toUpperCase()}|${destination.toUpperCase()}`;
+  const originClean = expandStreetAbbreviations(origin);
+  const destClean = expandStreetAbbreviations(destination);
+  const key = `${originClean.toUpperCase()}|${destClean.toUpperCase()}`;
   if (distanceCache[key] !== undefined) return distanceCache[key] / 1000;
 
-  // Trigger a query to populate the cache
+  // Trigger a query to populate the cache (getTravelTime uses the same key shape)
   await getTravelTime(origin, destination);
   if (distanceCache[key] !== undefined) return distanceCache[key] / 1000;
   return null;
@@ -1247,6 +1257,25 @@ function parseAvailability(availString) {
     result[dayKey].push(blockKey);
   });
   return result;
+}
+
+// Does a time range [startTime, endTime] (HH:MM strings) overlap any of the
+// given block names (e.g. ["mid-morning", "late-afternoon"])? Used to filter
+// clinic-hold alerts so we only surface holds that actually conflict with the
+// client's requested time windows — not noon holds when the client asked for
+// late afternoon only.
+function timeRangeOverlapsBlocks(startTime, endTime, blockNames) {
+  if (!blockNames || blockNames.length === 0) return true; // no preference = any time ok
+  const startM = timeToMins(startTime.slice(0, 5));
+  const endM = timeToMins(endTime.slice(0, 5));
+  for (const blockName of blockNames) {
+    const range = TIME_BLOCKS[blockName];
+    if (!range) continue;
+    const [bStart, bEnd] = range;
+    // overlap test: ranges [a,b] and [c,d] overlap iff a < d AND c < b
+    if (startM < bEnd && bStart < endM) return true;
+  }
+  return false;
 }
 
 // ─── Core matcher ────────────────────────────────────────────────────────────
@@ -1472,16 +1501,24 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
       const clientInterestedInThisDay = !prefForThisDay && Object.keys(availPref).length === 0
         ? true
         : !!prefForThisDay;
-      if (clientInterestedInThisDay) {
-        allClinicHolds.push({
-          date: dateStr,
-          dayName,
-          startTime: ch.startTime,
-          endTime: ch.endTime,
-          label: ch.label,
-          clinic: ch.clinic
-        });
-      }
+      if (!clientInterestedInThisDay) continue;
+
+      // AND the hold's time window must actually overlap the client's requested
+      // time blocks. Otherwise the alert is misleading — e.g. client asks Monday
+      // Late Afternoon, clinic hold is at noon → even if the hold frees up, it
+      // still wouldn't fit the client's window, so admin shouldn't be prompted
+      // to call the clinic about it.
+      const timeFits = timeRangeOverlapsBlocks(ch.startTime, ch.endTime, prefForThisDay);
+      if (!timeFits) continue;
+
+      allClinicHolds.push({
+        date: dateStr,
+        dayName,
+        startTime: ch.startTime,
+        endTime: ch.endTime,
+        label: ch.label,
+        clinic: ch.clinic
+      });
     }
 
     // Private client holds on this day — block time, no alert
@@ -1605,6 +1642,7 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
         nextClientName: gap.nextAppt?.clientName || null,
         nextStartTime: gap.nextAppt?.startTime || null,
         nextAppointmentLabel: gap.nextAppt?.label?.slice(0, 80) || null,
+        nextAppointmentKind: gap.nextAppt?.kind || null,
         comingFromBase: !comingFromAppointment,
         priorHardBlock: priorHardBlock ? priorHardBlock.label : null,
         tier,
@@ -1851,12 +1889,17 @@ Suggested actions for admin:
     }
 
     const slotDescriptions = selected.map((s, i) => {
-      const tierLabels = {
-        1: "Tier 1 — Ideal (in core zone, short travel)",
-        2: "Tier 2 — Good (in core zone with longer travel, or stretch zone while already in area)",
-        3: "Tier 3 — Area visit (outside usual zone but instructor is already nearby that day)",
-        4: "Tier 4 — Stretch ⚠️ (outside zones and instructor not in the area — uses for edge cases only)"
-      };
+      // Tier labels. Tier 3 is special: it covers two different real-world
+      // situations and needs different language for each, or admin gets
+      // misleading "already in area" text when it's really a dedicated trip.
+      //   3a: outside all zones + has nearby lesson → genuinely an area visit
+      //   3b: stretch zone + no nearby lesson → dedicated trip to occasional area
+      let tierLabel;
+      if (s.tier === 1) tierLabel = "Tier 1 — Ideal (in core zone, short travel)";
+      else if (s.tier === 2) tierLabel = "Tier 2 — Good (in core zone with longer travel, or stretch zone while already in area)";
+      else if (s.tier === 3 && s.nearbyOnDay) tierLabel = "Tier 3 — Area visit (outside usual zone but instructor is already nearby that day)";
+      else if (s.tier === 3) tierLabel = "Tier 3 — Stretch zone (instructor serves this area occasionally; no nearby lessons this day — dedicated trip)";
+      else tierLabel = "Tier 4 — Stretch ⚠️ (outside zones and instructor not in the area — use for edge cases only)";
       const instData = INSTRUCTORS.find(x => x.name === s.instructor);
 
       let comingFrom;
@@ -1875,11 +1918,25 @@ Suggested actions for admin:
         comingFrom = `from base in ${s.base}`;
       }
 
+      // The "After the lesson" text. Route each next-appointment kind through a
+      // phrase that matches what actually happens — the previous logic used
+      // `nextLocation` for every case, but the server sets nextLocation = base
+      // for private-holds and hard-blocks, causing Claude to say "heads back to
+      // Montmorency at 18:15" when Christian is actually going to Soccer Training
+      // Blackburn (hard-block), or "heads back to Rye at 10:00" when Yves is
+      // actually in a 2-hour private-hold (location unknown).
       let nextLesson;
-      if (s.nextClientName) {
+      if (s.nextAppointmentKind === "lesson" && s.nextClientName) {
         nextLesson = `then lesson with ${s.nextClientName} at ${s.nextStartTime}`;
-      } else if (s.nextLocation && s.nextStartTime) {
-        nextLesson = `then on to ${s.nextLocation} at ${s.nextStartTime}`;
+      } else if (s.nextAppointmentKind === "clinic-hold") {
+        nextLesson = `then a clinic hold (${s.nextAppointmentLabel}) starting ${s.nextStartTime} — the instructor is at the clinic`;
+      } else if (s.nextAppointmentKind === "private-hold") {
+        nextLesson = `then a private-hold period starting ${s.nextStartTime} (${s.nextAppointmentLabel}) — exact location not confirmed, instructor has this time reserved`;
+      } else if (s.nextAppointmentKind === "hard-block") {
+        nextLesson = `then "${s.nextAppointmentLabel}" starting ${s.nextStartTime} — instructor is off-duty after this slot (do NOT describe as "heading to base" or similar — it's a personal commitment)`;
+      } else if (s.nextClientName) {
+        // Defensive fallback — old shape
+        nextLesson = `then lesson with ${s.nextClientName} at ${s.nextStartTime}`;
       } else {
         nextLesson = "no further appointments scheduled — do not invent a next appointment or time";
       }
@@ -1896,7 +1953,7 @@ Suggested actions for admin:
         : "";
 
       return `Slot ${i + 1}: ${s.instructor} — ${formatDate(s.date)} (${s.dayName}) at ${s.suggestedStart}
-  ${tierLabels[s.tier]}
+  ${tierLabel}
   Zone fit: ${s.zoneFit} (${s.tierReason})
   Coming ${comingFrom}
   Travel in: ${s.travelIn} min (${bufferNote})
@@ -2010,12 +2067,18 @@ Pick up to 3 best slots from the provided list. For each:
 
 Style rules:
 - Use the exact "Coming from" line provided. If it says "from a private hold" or "from a clinic hold", describe that accurately — don't say "from lesson with X".
-- If "After the lesson:" says "no further appointments scheduled — do not invent a next appointment", obey that literally. Say the instructor is free after, full stop.
+- Use the exact "After the lesson:" line provided. Never rewrite it into "heads back to [base city]" or "returns to base" — those phrases are almost always wrong because:
+  - private-holds have an unknown location (the line will say "exact location not confirmed")
+  - hard-blocks are personal commitments like soccer training or school pickup in a specific suburb (the line will explicitly tell you not to describe it as heading to base)
+  - If the line says "no further appointments scheduled", say the instructor is free after, full stop.
+  When the line mentions a clinic hold, a private-hold period, or a named hard-block ("Soccer Training Blackburn", "School pick up"), paraphrase what the line actually says — don't substitute your own ending.
 - If the slot shows a ⚠️ peak traffic warning, mention it
 - If a slot has an "In area:" line, mention this context in your write-up — it's WHY the slot works despite the instructor being outside their usual zone (e.g. "Christian is already in Frankston for his 2pm lesson, so the earlier slot fits nicely")
 - Tier 1 = ideal (core zone, short travel) — strong recommendation
 - Tier 2 = good (longer travel in zone, or stretch zone with nearby lesson) — solid choice, mention any in-area context
-- Tier 3 = area visit (outside usual zone but instructor's diary puts them nearby that day) — explain the "already in area" reasoning
+- Tier 3 has two flavours — read the tier label carefully:
+    • "Tier 3 — Area visit" = instructor is genuinely nearby that day (a real lesson sits within 15km) → explain the "already in area" reasoning
+    • "Tier 3 — Stretch zone" = instructor serves this area occasionally but is NOT nearby today → this is a dedicated trip. Do NOT claim they're already in the area. Note it's outside their usual territory but they're willing to travel.
 - Tier 4 ⚠️ stretch — the instructor doesn't usually work in this area AND isn't in the area that day. Add an explicit ⚠️ warning. Only use if nothing better is available.
 - If only one instructor had eligible slots, explain why others weren't viable
 - Practical tone for office staff, not client-facing
@@ -2215,7 +2278,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-24-smart-zones-v1";
+const BUILD_ID = "2026-04-24-tier-labels-next-appt-phrasing-v2";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2230,7 +2293,12 @@ app.get("/health", (req, res) => {
       "data-alerts-scoped-to-selected-dates",
       "clinic-alerts-for-blocked-instructors",
       "private-hold-classification",
-      "yves-ics-url-fixed"
+      "yves-ics-url-fixed",
+      "tier-3-label-split-area-vs-stretch",
+      "next-appointment-kind-aware-phrasing",
+      "clinic-alert-time-block-overlap-filter",
+      "jason-daily-cutoff-hard-block",
+      "getDistanceKm-cache-key-fix"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
