@@ -1144,7 +1144,20 @@ const CLINIC_PARTNERS = [
     name: "Active One Frankston",
     address: "25 Yuille Street, Frankston, Victoria, Australia",
     radiusKm: 15,
+    // Real diary writes this multiple ways:
+    //   "Hold for Active One Frankston"              — 52 entries (original regex)
+    //   "HOLD FOR 3 Ax's WITH ACTIVE ONE (FRANKSTON)" — 24 entries (Greg's pattern, parens)
+    //   "ActiveOne clinic Frankston Marion McNeil"   — 4 entries (compound with "clinic")
+    // Before this fix, the 28 non-matching variants fell through to private-hold,
+    // so travel calcs used the instructor's BASE as the origin instead of the
+    // clinic, producing wildly wrong "coming from" numbers for adjacent slots
+    // (e.g. Greg "at Kilsyth" when really at Frankston — a 50-min difference).
     matchPatterns: [
+      // Parenthesised Frankston — handled first to avoid greedy matches
+      /active\s*one\s*\(\s*frankston\s*\)/i,
+      // "ActiveOne clinic Frankston" or "Active One clinic Frankston"
+      /active\s*one\s*clinic\s+frankston/i,
+      // Plain patterns (still needed for the majority)
       /active\s*one\s+frankston/i,
       /activeone\s+frankston/i
     ]
@@ -2538,7 +2551,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-24-distance-suburb-fix-v5";
+const BUILD_ID = "2026-04-24-clinic-regex-expanded-v5.1";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2579,7 +2592,8 @@ app.get("/health", (req, res) => {
       "title-case-suburb-extraction-after-street",
       "top-pick-restricted-to-tier-1-and-2",
       "nearby-appointment-kind-aware-wording",
-      "geocode-failure-detection"
+      "geocode-failure-detection",
+      "clinic-regex-handles-parens-and-clinic-word"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
