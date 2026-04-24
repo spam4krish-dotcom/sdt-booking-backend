@@ -1887,16 +1887,19 @@ app.post("/analyse", async (req, res) => {
 
       // Detect whether the client address itself is the problem. If Google
       // Maps can't geocode it, every travel lookup falls back to a 30-min
-      // stub with no distance cached. When that happens we shouldn't send
-      // admin on a wild goose chase through instructor schedules — the real
-      // issue is the address typo. Probe by asking Google for Christian's
-      // base → client travel; if distance comes back null, we know the
-      // address is the culprit.
+      // stub with no distance cached. But Google also sometimes "helpfully"
+      // fuzzy-matches a garbage address to some distant Victorian location
+      // (e.g. "Nonexistent Street, Whatever VIC 9999" might match to somewhere
+      // 400 km away). Flag BOTH cases: null distance (clean failure) OR
+      // implausibly large distance (>150 km from Christian's base is far
+      // further than any real Melbourne suburb — Rye is ~90 km, Melton is ~40).
       let addressLikelyInvalid = false;
       try {
         const probeBase = INSTRUCTORS.find(i => i.name === "Christian")?.base || "Melbourne";
         const probeDistance = await getDistanceKm(probeBase, clientSuburb);
-        addressLikelyInvalid = (probeDistance === null);
+        if (probeDistance === null || probeDistance > 150) {
+          addressLikelyInvalid = true;
+        }
       } catch (e) {
         addressLikelyInvalid = true;
       }
@@ -2306,10 +2309,16 @@ Suggested actions for admin:
     // Address-not-found detection: if NO slot in the selected list has a resolved
     // distance from base, Google probably couldn't geocode the client address.
     // Travel times will still be returned (30-min fallback) but admin should
-    // know before they trust the numbers.
-    const anyBaseDistanceResolved = toPresent.some(s => s.baseDistanceKm !== null && s.baseDistanceKm !== undefined);
-    const addressWarning = (toPresent.length > 0 && !anyBaseDistanceResolved)
-      ? "⚠️ Client address couldn't be found on the map — travel times below are approximate. Please double-check before booking.\n\n"
+    // know before they trust the numbers. Also flag when all base distances
+    // come back implausibly large (>150 km) — Google fuzzy-matched the address
+    // to somewhere obviously wrong rather than returning null.
+    const anyBaseDistanceReasonable = toPresent.some(s =>
+      s.baseDistanceKm !== null &&
+      s.baseDistanceKm !== undefined &&
+      s.baseDistanceKm <= 150
+    );
+    const addressWarning = (toPresent.length > 0 && !anyBaseDistanceReasonable)
+      ? "⚠️ Client address couldn't be found reliably on the map — travel times below may be inaccurate. Please double-check the address before booking.\n\n"
       : "";
 
     // Compose top-of-output client summary — sits above options so admin confirms
@@ -2551,7 +2560,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-24-clinic-regex-expanded-v5.1";
+const BUILD_ID = "2026-04-24-geocode-fuzzy-detect-v5.2";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2593,7 +2602,8 @@ app.get("/health", (req, res) => {
       "top-pick-restricted-to-tier-1-and-2",
       "nearby-appointment-kind-aware-wording",
       "geocode-failure-detection",
-      "clinic-regex-handles-parens-and-clinic-word"
+      "clinic-regex-handles-parens-and-clinic-word",
+      "geocode-fuzzy-match-detection-150km-threshold"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
