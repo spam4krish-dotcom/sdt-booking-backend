@@ -1447,12 +1447,29 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
       locationSource = `clinic-hold: ${cls.clinic.name}`;
     } else if (cls.kind === "private-hold") {
       // Private client hold (e.g. "Hold for Jessica Mills", "Event - Luca Silvan").
-      // Instructor has this time reserved; we don't know exactly where they'll be.
-      // Fall back to base as a neutral assumption — it'll make adjacent slots
-      // look conservative (slightly more travel time required), which is safe.
-      locStart = inst.base;
-      locEnd = inst.base;
-      locationSource = "private-hold (base assumed)";
+      // Try to extract a location from the hold's notes — often the admin has
+      // written the suburb inline, e.g. "HOLD JACK RICHARDSON / MENTONE" or
+      // "Event details: COCKATOO". If we can find it, use it; this gives much
+      // more accurate travel calcs for adjacent slots than always assuming
+      // the instructor will be at base. Fall back to base only when no usable
+      // location is parseable from the notes.
+      const parsedLoc = extractNotesLocation(a.description || a.notes || "");
+      if (parsedLoc && parsedLoc.kind === "suburb" && parsedLoc.suburb) {
+        locStart = parsedLoc.suburb;
+        locEnd = parsedLoc.suburb;
+        locationSource = `private-hold (suburb '${parsedLoc.suburb}' from notes)`;
+      } else if (parsedLoc && parsedLoc.kind === "address" && parsedLoc.address) {
+        locStart = parsedLoc.address;
+        locEnd = parsedLoc.address;
+        locationSource = `private-hold (address from notes)`;
+      } else {
+        // No parseable location — safe fallback is to assume the instructor is
+        // at base. This slightly inflates travel estimates for adjacent slots
+        // (conservative), which is better than confidently using a wrong loc.
+        locStart = inst.base;
+        locEnd = inst.base;
+        locationSource = "private-hold (base assumed, no location in notes)";
+      }
     }
     // hard-blocks keep locStart/locEnd as inst.base (instructor is effectively "off")
 
@@ -1728,10 +1745,12 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
           ? smartTruncate(stripIcsDescriptionPrefix(gap.prevAppt.note).split("\n")[0], 60) || null
           : null,
         prevAppointmentLabel: gap.prevAppt?.label ? smartTruncate(gap.prevAppt.label, 80) : null,
+        prevLocationSource: gap.prevAppt?.locationSource || null,
         nextClientName: gap.nextAppt?.clientName || null,
         nextStartTime: gap.nextAppt?.startTime || null,
         nextAppointmentLabel: gap.nextAppt?.label ? smartTruncate(gap.nextAppt.label, 80) : null,
         nextAppointmentKind: gap.nextAppt?.kind || null,
+        nextLocationSource: gap.nextAppt?.locationSource || null,
         comingFromBase: !comingFromAppointment,
         priorHardBlock: priorHardBlock ? priorHardBlock.label : null,
         tier,
@@ -1770,11 +1789,20 @@ function scoreSlot(slot) {
   else if (slot.baseTravel <= 30) score += 20;
   else if (slot.baseTravel > 55) score -= 30;
 
-  // Bonus if instructor is already in the area that day
-  if (slot.nearbyOnDay) score += 80;
+  // Bonus if instructor is already in the area that day.
+  // Only apply this for OUTSIDE or STRETCH zone clients — when the client is in
+  // the instructor's CORE zone, "already in area" is noise (they'd be there
+  // anyway). Previously applying it universally was tipping core-zone picks to
+  // sit a month out because a "nearby lesson" boost won over an empty earlier day.
+  if (slot.nearbyOnDay && slot.zoneFit !== "core") score += 80;
 
-  // Earlier dates preferred (slight bias so admin gets earliest-available first)
-  score -= (new Date(slot.date) - new Date()) / (1000 * 60 * 60 * 24) * 0.3;
+  // Earlier dates strongly preferred. 4 points per day is enough to overcome
+  // most quality tie-breaks for typical 2–4 week differences (a slot 2 weeks
+  // earlier gets ~56 points of advantage) but doesn't trample clear tier
+  // improvements. Was 0.3 per day which was too weak — bookings were being
+  // recommended 4+ weeks out when earlier empty-day options existed.
+  const daysOut = (new Date(slot.date) - new Date()) / (1000 * 60 * 60 * 24);
+  score -= daysOut * 4;
   return score;
 }
 
@@ -2109,7 +2137,14 @@ Suggested actions for admin:
         fromLine = `From: ${stripEventPrefix(s.prevAppointmentLabel)} ends ${s.prevEndTime} → client (${s.travelIn} min${inKm})`;
       } else if (s.prevAppointmentKind === "private-hold") {
         hasAnyPrivateHoldMention = true;
-        fromLine = `From: ${stripEventPrefix(s.prevAppointmentLabel)} ends ${s.prevEndTime} (location unknown) → client (${s.travelIn} min${inKm} est. from base)`;
+        // If the server extracted a suburb from the hold's notes, travel is a real
+        // calculation (not a base fallback). Otherwise it's truly unknown.
+        const hasResolvedLoc = s.prevLocationSource && s.prevLocationSource.startsWith("private-hold (suburb") || (s.prevLocationSource && s.prevLocationSource.startsWith("private-hold (address"));
+        if (hasResolvedLoc) {
+          fromLine = `From: ${stripEventPrefix(s.prevAppointmentLabel)} ends ${s.prevEndTime} → client (${s.travelIn} min${inKm})`;
+        } else {
+          fromLine = `From: ${stripEventPrefix(s.prevAppointmentLabel)} ends ${s.prevEndTime} (location unknown) → client (${s.travelIn} min${inKm} est. from base)`;
+        }
       } else if (s.priorHardBlock) {
         fromLine = `From: ${s.base} base (first slot after "${stripEventPrefix(s.priorHardBlock)}") → client (${s.travelIn} min${inKm})`;
       } else {
@@ -2132,7 +2167,15 @@ Suggested actions for admin:
         afterLine = `After: ${stripEventPrefix(s.nextAppointmentLabel)} at ${s.nextStartTime} — at the clinic${travelBurden}`;
       } else if (s.nextAppointmentKind === "private-hold") {
         hasAnyPrivateHoldMention = true;
-        afterLine = `After: ${stripEventPrefix(s.nextAppointmentLabel)} at ${s.nextStartTime} (location unknown)`;
+        const hasResolvedLoc = s.nextLocationSource && (s.nextLocationSource.startsWith("private-hold (suburb") || s.nextLocationSource.startsWith("private-hold (address"));
+        if (hasResolvedLoc) {
+          const travelBurden = s.travelOut >= 15
+            ? ` (~${s.travelOut} min${outKm} to get there)`
+            : "";
+          afterLine = `After: ${stripEventPrefix(s.nextAppointmentLabel)} at ${s.nextStartTime}${travelBurden}`;
+        } else {
+          afterLine = `After: ${stripEventPrefix(s.nextAppointmentLabel)} at ${s.nextStartTime} (location unknown)`;
+        }
       } else if (s.nextAppointmentKind === "hard-block") {
         afterLine = `After: ${stripEventPrefix(s.nextAppointmentLabel)} at ${s.nextStartTime} — instructor off-duty (personal commitment)`;
       } else {
@@ -2603,7 +2646,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-24-admin-audit-log-v5.3";
+const BUILD_ID = "2026-04-24-scoring-and-hold-location-v5.4";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2647,7 +2690,9 @@ app.get("/health", (req, res) => {
       "geocode-failure-detection",
       "clinic-regex-handles-parens-and-clinic-word",
       "geocode-fuzzy-match-detection-150km-threshold",
-      "admin-audit-log-ring-buffer"
+      "admin-audit-log-ring-buffer",
+      "private-hold-location-from-notes",
+      "stronger-date-penalty-and-core-zone-nearby-ignored"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
