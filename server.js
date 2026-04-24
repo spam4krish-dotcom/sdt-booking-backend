@@ -505,6 +505,12 @@ function classifyAppointment(a) {
       "soccer training", "sports training",
       // Non-SDT private work patterns (instructors doing test-prep for outside clients)
       "pre test lesson", "initial lesson test",
+      // Late-start / back-from-holidays markers. These are Gabriel's (and others')
+      // way of marking "can't start until later" when returning from leave, e.g.
+      // "LATE START AFTER HOLS" or "back from hols". Without these the entry falls
+      // through to private-hold and gets rendered as "location unknown" in admin
+      // output, when actually the instructor is just starting their day late.
+      "late start", "hols", "back from hols",
       // "X to Y" test-route pattern (e.g. "LILYDALE to HEALESVILLE")
       // harder to match via simple keywords — caught by pickup-dropoff detection below
     ];
@@ -1286,6 +1292,19 @@ function stripEventPrefix(label) {
   return label.replace(/^\s*Event\s*[-–]\s*/i, "").trim();
 }
 
+// Truncate a string on a word boundary, avoiding mid-word cutoffs like
+// "Eastern Health Wantirna 25" (which should be "Eastern Health Wantirna...").
+// If the cut point falls inside a word, back up to the last space; if the
+// resulting string is <80% of the limit (we'd lose too much), cut at the
+// original limit instead. Adds ellipsis only when truncation actually happened.
+function smartTruncate(str, limit) {
+  if (!str || str.length <= limit) return str;
+  const slice = str.slice(0, limit);
+  const lastSpace = slice.lastIndexOf(" ");
+  const cutPoint = lastSpace > limit * 0.8 ? lastSpace : limit;
+  return str.slice(0, cutPoint).replace(/[,\s]+$/, "") + "…";
+}
+
 // ─── Core matcher ────────────────────────────────────────────────────────────
 async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, weeksToScan = 17) {
   const slots = [];
@@ -1651,12 +1670,12 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
         prevEndTime: gap.prevAppt?.endTime || null,
         prevAppointmentKind: gap.prevAppt?.kind || null,
         prevAppointmentNote: gap.prevAppt?.note
-          ? stripIcsDescriptionPrefix(gap.prevAppt.note).split("\n")[0].slice(0, 60) || null
+          ? smartTruncate(stripIcsDescriptionPrefix(gap.prevAppt.note).split("\n")[0], 60) || null
           : null,
-        prevAppointmentLabel: gap.prevAppt?.label?.slice(0, 80) || null,
+        prevAppointmentLabel: gap.prevAppt?.label ? smartTruncate(gap.prevAppt.label, 80) : null,
         nextClientName: gap.nextAppt?.clientName || null,
         nextStartTime: gap.nextAppt?.startTime || null,
-        nextAppointmentLabel: gap.nextAppt?.label?.slice(0, 80) || null,
+        nextAppointmentLabel: gap.nextAppt?.label ? smartTruncate(gap.nextAppt.label, 80) : null,
         nextAppointmentKind: gap.nextAppt?.kind || null,
         comingFromBase: !comingFromAppointment,
         priorHardBlock: priorHardBlock ? priorHardBlock.label : null,
@@ -1983,6 +2002,14 @@ Suggested actions for admin:
     // of repeating "exact location not confirmed" per slot.
     let hasAnyPrivateHoldMention = false;
 
+    // Track which boilerplate notes have already been shown, so we don't repeat
+    // "Instructor covers this area occasionally — dedicated trip" on every
+    // Tier 3 Stretch slot. Admin reads it once and internalises it. The
+    // tier tag in the slot header already conveys the category; the Note text
+    // is the explanation, and the explanation only needs stating once.
+    const shownTier3Stretch = { shown: false };
+    const shownTier4Stretch = { shown: false };
+
     const slotDescriptions = toPresent.map((s, i) => {
       // Short tier tag — shown on the same line as the slot header for quick scan.
       let tierTag;
@@ -2016,33 +2043,54 @@ Suggested actions for admin:
       if (s.nextAppointmentKind === "lesson" && s.nextClientName) {
         afterLine = `After: client → ${s.nextClientName} lesson at ${s.nextStartTime} (${s.travelOut} min${outKm})`;
       } else if (s.nextAppointmentKind === "clinic-hold") {
-        afterLine = `After: ${stripEventPrefix(s.nextAppointmentLabel)} at ${s.nextStartTime} — at the clinic`;
+        // Only mention the travel burden if the clinic is non-trivially far from
+        // the client. Keeps short hops like Frankston→Frankston clean, but flags
+        // cross-town jumps like Carnegie→Frankston (55 min) so admin knows the
+        // instructor has a real drive after this lesson.
+        const travelBurden = s.travelOut >= 15
+          ? ` (~${s.travelOut} min${outKm} to get there)`
+          : "";
+        afterLine = `After: ${stripEventPrefix(s.nextAppointmentLabel)} at ${s.nextStartTime} — at the clinic${travelBurden}`;
       } else if (s.nextAppointmentKind === "private-hold") {
         hasAnyPrivateHoldMention = true;
         afterLine = `After: ${stripEventPrefix(s.nextAppointmentLabel)} at ${s.nextStartTime} (location unknown)`;
       } else if (s.nextAppointmentKind === "hard-block") {
-        afterLine = `After: ${stripEventPrefix(s.nextAppointmentLabel)} at ${s.nextStartTime} — off-duty (personal commitment, NOT returning to base)`;
+        afterLine = `After: ${stripEventPrefix(s.nextAppointmentLabel)} at ${s.nextStartTime} — instructor off-duty (personal commitment)`;
       } else {
         afterLine = `After: Free rest of day`;
       }
 
       // Optional "Note:" line — only when there's something admin genuinely
       // benefits from seeing. Don't include boilerplate like "Tier 1 core zone"
-      // — that's already implicit in the tag.
+      // — that's already implicit in the tag. Also suppress repeated tier-stretch
+      // explanations after the first appearance (admin reads once, not 5×).
       const notes = [];
       if (s.tier === 3 && s.nearbyOnDay && s.nearbyClient) {
+        // "Already in area" is slot-specific (different nearbyClient each time)
+        // so we show it every time, not deduped.
         notes.push(`Already in area — ${s.nearbyClient} lesson ${s.nearbyTime} nearby`);
       } else if (s.tier === 3 && !s.nearbyOnDay) {
-        notes.push(`Instructor covers this area occasionally — dedicated trip`);
+        if (!shownTier3Stretch.shown) {
+          notes.push(`Instructor covers this area occasionally — dedicated trip`);
+          shownTier3Stretch.shown = true;
+        }
       } else if (s.tier === 4) {
-        notes.push(`Outside ${s.instructor}'s usual area AND not nearby today — use only if no better option`);
+        if (!shownTier4Stretch.shown) {
+          notes.push(`Outside ${s.instructor}'s usual area AND not nearby today — use only if no better option`);
+          shownTier4Stretch.shown = true;
+        }
       }
       if (s.peakTrafficWarning) {
         notes.push(`⚠️ ${s.peakPeriod} — travel may take longer than estimated`);
       }
       const notesLines = notes.map(n => `Note: ${n}`).join("\n  ");
 
-      return `Slot ${i + 1}: ${s.instructor} — ${formatDate(s.date)} (${s.dayName}) at ${s.suggestedStart}   [${tierTag}]
+      // Top pick tag on Slot 1 — makes the hierarchy of the list explicit so
+      // admin doesn't have to infer. Only add when there's more than one slot
+      // (labelling a solo slot as "top pick" is meaningless).
+      const topPickTag = (i === 0 && toPresent.length > 1) ? " ★ TOP PICK" : "";
+
+      return `Slot ${i + 1}: ${s.instructor} — ${formatDate(s.date)} (${s.dayName}) at ${s.suggestedStart}   [${tierTag}]${topPickTag}
   ${fromLine}
   ${afterLine}${notesLines ? "\n  " + notesLines : ""}`;
     }).join("\n\n");
@@ -2142,10 +2190,43 @@ Suggested actions for admin:
     // with one good slot and 12 filtered gaps shouldn't appear as "not offered")
     const selectedNames = new Set(toPresent.map(s => s.instructor));
     const notOfferedList = dedupedExcluded.filter(ex => !selectedNames.has(ex.name));
+
+    // Collapse the common "missing mod: X" case into one line per mod, since
+    // the same mod often excludes 4-5 instructors and listing them each on
+    // their own line is needless repetition.
+    //   Before: - Greg: missing mod: Satellite
+    //           - Jason: missing mod: Satellite
+    //           - Marc: missing mod: Satellite
+    //           ...
+    //   After:  - Missing Satellite mod: Greg, Jason, Marc, Sherri, Yves
+    const modBuckets = {}; // mod name -> [instructor names]
+    const otherReasons = []; // [{name, reason}] for non-mod reasons
+    for (const ex of notOfferedList) {
+      const modMatch = ex.reason.match(/^missing mods?:\s*(.+)$/i);
+      if (modMatch) {
+        // Single mod OR comma-separated list ("LFA, Electronic Spinner")
+        const mods = modMatch[1].split(",").map(m => m.trim()).filter(Boolean);
+        for (const m of mods) {
+          if (!modBuckets[m]) modBuckets[m] = [];
+          modBuckets[m].push(ex.name);
+        }
+      } else {
+        otherReasons.push(ex);
+      }
+    }
+
     let notOfferedText = "";
     if (notOfferedList.length > 0) {
-      notOfferedText = "\n\nNOT OFFERED (eligible instructors who didn't make the list):\n" +
-        notOfferedList.map(ex => `- ${ex.name}: ${ex.reason}`).join("\n");
+      const lines = [];
+      // Mod-mismatch collapsed lines first
+      for (const [mod, names] of Object.entries(modBuckets)) {
+        lines.push(`- Missing ${mod} mod: ${names.join(", ")}`);
+      }
+      // Then per-instructor non-mod reasons
+      for (const ex of otherReasons) {
+        lines.push(`- ${ex.name}: ${ex.reason}`);
+      }
+      notOfferedText = "\n\nNOT OFFERED (eligible instructors who didn't make the list):\n" + lines.join("\n");
     }
 
     // Address-not-found detection: if NO slot in the selected list has a resolved
@@ -2180,6 +2261,7 @@ DO NOT:
 - Add a tier number or change a tier number
 - Claim "already in area" unless the slot explicitly says so in its Note
 - Invent distances (km) or travel times — only use the numbers in the From/After lines
+- Never write "heading back to base", "returns to [base city]", or similar for After: lines that show a hard-block (personal commitment) or private-hold (location unknown) — those phrasings are always wrong for those kinds of next appointment. Copy the After: line as-is.
 
 ═══ OUTPUT FORMAT — FOLLOW EXACTLY ═══
 
@@ -2187,7 +2269,7 @@ Start with the CLIENT line copied verbatim from the user message.
 
 If there is an "⚠️ Client address couldn't be found on the map..." warning, include it immediately after.
 
-Then list each slot EXACTLY as shown in VERIFIED SLOTS — keep the "Slot N: ..." header with the tier tag in brackets, keep the From: and After: lines verbatim, keep any Note: lines.
+Then list each slot EXACTLY as shown in VERIFIED SLOTS — keep the "Slot N: ..." header with the tier tag in brackets (and the "★ TOP PICK" tag on Slot 1 if present), keep the From: and After: lines verbatim (including all commas, parentheses, ellipses and punctuation), keep any Note: lines.
 
 Do NOT add narrative sentences around the slots. No "Perfect timing", no "Another excellent option", no introductions like "Here are the best slots". The slots speak for themselves.
 
@@ -2390,7 +2472,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-24-compact-output-diversity-v3";
+const BUILD_ID = "2026-04-24-output-polish-v4";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2419,7 +2501,13 @@ app.get("/health", (req, res) => {
       "strip-event-prefix",
       "address-not-found-warning",
       "client-summary-at-top",
-      "claude-pick-order-logging"
+      "claude-pick-order-logging",
+      "late-start-hols-as-hard-block",
+      "smart-truncate-word-boundary",
+      "clinic-hold-travel-burden-surfaced",
+      "tier-note-deduplication",
+      "not-offered-collapsed-mod-lines",
+      "top-pick-tag-on-slot-1"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
