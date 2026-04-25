@@ -751,6 +751,61 @@ function extractNotesLocation(rawNotes) {
   return null;
 }
 
+// Stricter location extractor used ONLY for private-hold notes. Designed to
+// avoid the false-positive case where a person's name like "Daniel Dodig" or
+// "Jaxon Harris" looks like an all-caps suburb after .toUpperCase() and gets
+// fuzzy-matched by Google to a random Victorian location.
+//
+// Accepts only:
+//   1. A full street address (number + street + recognised street type).
+//   2. A suburb candidate that is ALL CAPS in the ORIGINAL text (not just
+//      after upper-casing). Real Nookal admin entries use "MENTONE" or
+//      "WANTIRNA" as deliberate caps-locked location markers; person names
+//      are written in title case ("Jack Richardson") and won't match.
+function extractPrivateHoldLocation(rawNotes) {
+  if (!rawNotes) return null;
+  const notes = stripIcsDescriptionPrefix(rawNotes).trim();
+  if (!notes) return null;
+
+  // Priority 1: street address with full type (no change from
+  // extractNotesLocation — these are unambiguous and safe).
+  const streetAddressMatch = notes.match(/(\d{1,5}\s+[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*\s+(?:Street|St|Road|Rd|Avenue|Ave|Drive|Dr|Court|Ct|Crescent|Cres|Place|Pl|Parade|Pde|Way|Highway|Hwy|Boulevard|Blvd|Lane|Ln|Close|Cl|Terrace|Tce))\b/i);
+  if (streetAddressMatch) {
+    const streetPart = streetAddressMatch[1].trim();
+    // Try to grab a TitleCase or ALLCAPS suburb after the address (same as
+    // the main extractor)
+    const afterMatch = notes.slice(streetAddressMatch.index + streetAddressMatch[0].length);
+    const titleCaseSuburb = afterMatch.match(/^[\s,\-–]*((?:(?!VIC\b)[A-Z][A-Za-z]+)(?:\s+(?!VIC\b)[A-Z][A-Za-z]+){0,3})(?=[\s,.|\n\r;(]|$)/);
+    const allCapsSuburb = !titleCaseSuburb
+      ? afterMatch.match(/^[\s,\-–]*([A-Z]{3,}(?:\s+[A-Z]{2,})*)(?=[\s,.|\n\r;(]|$)/)
+      : null;
+    const matchedSuburb = titleCaseSuburb || allCapsSuburb;
+    let suburbPart = null;
+    if (matchedSuburb) {
+      const candidate = cleanSuburb(matchedSuburb[1]);
+      if (isLikelySuburb(candidate)) suburbPart = candidate;
+    }
+    return {
+      kind: "address",
+      address: suburbPart ? `${streetPart}, ${suburbPart}` : streetPart
+    };
+  }
+
+  // Priority 2: ALL-CAPS suburb in the original text. This is the key
+  // distinction from the generic extractor — we require the candidate to
+  // be all caps in the SOURCE, not just after .toUpperCase. So "Daniel
+  // Dodig" won't match (mixed case) but "MENTONE" will.
+  // Note: use [ \t]+ (not \s+) for the inter-word separator so that newlines
+  // act as token boundaries — otherwise "HOLD JACK RICHARDSON\nMENTONE" gets
+  // tokenised as one giant string and we miss MENTONE on its own line.
+  const allCapsTokens = notes.match(/\b[A-Z]{3,}(?:[ \t]+[A-Z]{2,})*\b/g) || [];
+  for (const token of allCapsTokens) {
+    if (isLikelySuburb(token)) return { kind: "suburb", suburb: cleanSuburb(token) };
+  }
+
+  return null;
+}
+
 function cleanSuburb(s) {
   return (s || "").replace(/\s+/g, " ").trim();
 }
@@ -1447,25 +1502,34 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
       locationSource = `clinic-hold: ${cls.clinic.name}`;
     } else if (cls.kind === "private-hold") {
       // Private client hold (e.g. "Hold for Jessica Mills", "Event - Luca Silvan").
-      // Try to extract a location from the hold's notes — often the admin has
-      // written the suburb inline, e.g. "HOLD JACK RICHARDSON / MENTONE" or
-      // "Event details: COCKATOO". If we can find it, use it; this gives much
-      // more accurate travel calcs for adjacent slots than always assuming
-      // the instructor will be at base. Fall back to base only when no usable
-      // location is parseable from the notes.
-      const parsedLoc = extractNotesLocation(a.description || a.notes || "");
-      if (parsedLoc && parsedLoc.kind === "suburb" && parsedLoc.suburb) {
-        locStart = parsedLoc.suburb;
-        locEnd = parsedLoc.suburb;
-        locationSource = `private-hold (suburb '${parsedLoc.suburb}' from notes)`;
-      } else if (parsedLoc && parsedLoc.kind === "address" && parsedLoc.address) {
-        locStart = parsedLoc.address;
-        locEnd = parsedLoc.address;
+      // Try to extract a location from the hold's notes. We need to be CAREFUL
+      // here: the hold's summary often contains a person's name like "Jaxon Harris"
+      // or "Daniel Dodig" which would falsely pass a generic suburb check
+      // (toUpperCase makes them look like all-caps suburbs). Google then fuzzy-
+      // matches the person name to some random Victorian street, producing
+      // wildly inaccurate travel times (36 km when actual is 5).
+      //
+      // To avoid that, only accept location candidates that are:
+      //   (a) a full street address with a recognised street type, OR
+      //   (b) explicitly written in ALL CAPS in the original text (a pattern
+      //       admin commonly uses to signal locations: "MENTONE", "WANTIRNA"),
+      //       AND not in a blocklist of common name-shaped false positives.
+      //
+      // If neither passes, fall back to instructor's base. The old behaviour was
+      // ALWAYS to fall back to base — slightly less accurate for genuine
+      // location-tagged holds (like Greg's MENTONE one) but never wildly wrong.
+      const holdLoc = extractPrivateHoldLocation(a.description || a.notes || "");
+      if (holdLoc && holdLoc.kind === "address") {
+        locStart = holdLoc.address;
+        locEnd = holdLoc.address;
         locationSource = `private-hold (address from notes)`;
+      } else if (holdLoc && holdLoc.kind === "suburb") {
+        locStart = holdLoc.suburb;
+        locEnd = holdLoc.suburb;
+        locationSource = `private-hold (suburb '${holdLoc.suburb}' from notes)`;
       } else {
         // No parseable location — safe fallback is to assume the instructor is
-        // at base. This slightly inflates travel estimates for adjacent slots
-        // (conservative), which is better than confidently using a wrong loc.
+        // at base. Conservative (slightly inflated travel) but never wrong.
         locStart = inst.base;
         locEnd = inst.base;
         locationSource = "private-hold (base assumed, no location in notes)";
@@ -2734,7 +2798,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-24-date-first-smart-ranking-v5.5";
+const BUILD_ID = "2026-04-25-stricter-private-hold-extraction-v5.6";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2784,7 +2848,8 @@ app.get("/health", (req, res) => {
       "date-first-scoring-smart-ranking",
       "tier-4-bucketed-to-also-worth-considering",
       "top-pick-tag-removed",
-      "squeeze-detection-for-tight-schedules"
+      "squeeze-detection-for-tight-schedules",
+      "stricter-private-hold-location-no-name-fuzzy-match"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
