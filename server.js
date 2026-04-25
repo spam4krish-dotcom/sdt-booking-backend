@@ -1769,40 +1769,51 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
 }
 
 // ─── Scoring ─────────────────────────────────────────────────────────────────
+// Philosophy: "smart like a senior admin" — the earliest SENSIBLE slot wins.
+// Not a points-optimised ranking that picks cross-town Tier 2 slots over nearby
+// Tier 1 slots a month out. Scoring logic:
+//   1. Tier 1/2/3 go into the main list. Tier 4 goes into a separate "Also
+//      worth considering" section at the very end, shown only if there aren't
+//      enough Tier 1-3 slots. (This split happens in the slot-selection loop,
+//      not here — this function still returns a score, but the main vs fallback
+//      split dominates the ordering.)
+//   2. Within the main list, sort primarily by DATE — earliest wins.
+//   3. Within the same date, earliest TIME of day wins.
+//   4. Travel time and tier are tiebreakers only when dates and times are close.
+// This matches what admin actually wants: "when's the earliest time this
+// client can get in with someone who can genuinely do the lesson?"
 function scoreSlot(slot) {
   let score = 0;
-  // Tier is the biggest factor — Tier 4 is a significant penalty so it only
-  // appears if nothing else is available.
-  if (slot.tier === 1) score += 500;
-  else if (slot.tier === 2) score += 300;
-  else if (slot.tier === 3) score += 100;
-  else score -= 500; // Tier 4 = aggressive de-rank
 
-  // Travel time penalty scales linearly with travel minutes
-  score -= slot.travelIn * 5;
-  if (slot.travelIn <= 5) score += 150;
-  else if (slot.travelIn <= 10) score += 100;
-  else if (slot.travelIn <= 20) score += 50;
-
-  // Base distance bonus (instructor lives close to client's suburb)
-  if (slot.baseTravel <= 15) score += 40;
-  else if (slot.baseTravel <= 30) score += 20;
-  else if (slot.baseTravel > 55) score -= 30;
-
-  // Bonus if instructor is already in the area that day.
-  // Only apply this for OUTSIDE or STRETCH zone clients — when the client is in
-  // the instructor's CORE zone, "already in area" is noise (they'd be there
-  // anyway). Previously applying it universally was tipping core-zone picks to
-  // sit a month out because a "nearby lesson" boost won over an empty earlier day.
-  if (slot.nearbyOnDay && slot.zoneFit !== "core") score += 80;
-
-  // Earlier dates strongly preferred. 4 points per day is enough to overcome
-  // most quality tie-breaks for typical 2–4 week differences (a slot 2 weeks
-  // earlier gets ~56 points of advantage) but doesn't trample clear tier
-  // improvements. Was 0.3 per day which was too weak — bookings were being
-  // recommended 4+ weeks out when earlier empty-day options existed.
+  // Date is the dominant factor. 10 points per day later. A 2-week-later slot
+  // is -140, enough to beat almost any quality difference within the main-list
+  // tiers. Tier 4 is handled by the bucket separation, not by the score.
   const daysOut = (new Date(slot.date) - new Date()) / (1000 * 60 * 60 * 24);
-  score -= daysOut * 4;
+  score -= daysOut * 10;
+
+  // Time of day is secondary. Earlier in the day wins within the same date.
+  // 08:00 → 480 min, 17:00 → 1020 min. 0.3 per min keeps this subtle (max ~160
+  // point spread across a full day) so it only moves things when the primary
+  // date signal is tied.
+  const startMins = timeToMins(slot.suggestedStart);
+  score -= startMins * 0.3;
+
+  // Tier still matters, but only as a tiebreaker within the same-date bucket.
+  // These values are small enough that they can't flip a 3-day-earlier Tier 3
+  // over a later Tier 1, but they can reorder slots booked on the same day.
+  if (slot.tier === 1) score += 30;
+  else if (slot.tier === 2) score += 20;
+  else if (slot.tier === 3) score += 10;
+  // Tier 4 gets 0 here — it's already excluded from the main list by bucketing.
+
+  // Light travel penalty as final tiebreaker. 0.5 per min — a 20-min travel
+  // difference is only 10 points, so it won't overturn date or time ordering.
+  score -= slot.travelIn * 0.5;
+
+  // Very mild bonus for "instructor already in area" on outside-zone clients.
+  // Still useful as a tiebreaker but can't tip the list further out.
+  if (slot.nearbyOnDay && slot.zoneFit !== "core") score += 5;
+
   return score;
 }
 
@@ -1968,64 +1979,94 @@ Suggested actions for admin:
       });
     }
 
-    // Sort by base score first. Then walk down the list applying a diversity
-    // penalty so the final selection spreads across instructors, days of week,
-    // and time blocks — rather than returning three identical Tuesdays at 10am
-    // with the same instructor.
-    //
-    // Strategy: score each candidate relative to what we've ALREADY picked.
-    // Same instructor as a higher-ranked pick → -40 score; same day-of-week → -20;
-    // same time block → -10. Small enough that a genuinely best-slot can still win
-    // over a "different for the sake of it" slot, but large enough to break ties
-    // in favour of variety.
-    allSlots.sort((a, b) => scoreSlot(b) - scoreSlot(a));
+    // Split slots into two buckets before scoring/selection:
+    //   Main: Tier 1, 2, 3 — these are the proper recommendations.
+    //   Fallback: Tier 4 — long drives / stretch — shown only in a separate
+    //             "Also worth considering" section and only when the main list
+    //             is thin.
+    // Admin expects Tier 4 to never jump ahead of a Tier 3, no matter how much
+    // earlier the date or how clever the travel math. This bucket separation
+    // guarantees that — neither the scorer nor the diversity penalty can mix
+    // them.
+    const mainSlots = allSlots.filter(s => s.tier <= 3);
+    const fallbackSlots = allSlots.filter(s => s.tier === 4);
 
-    const selected = [];
+    mainSlots.sort((a, b) => scoreSlot(b) - scoreSlot(a));
+    fallbackSlots.sort((a, b) => scoreSlot(b) - scoreSlot(a));
+
+    const selected = [];          // main Tier 1-3 picks shown to admin
+    const fallbackSelected = [];  // Tier 4 picks shown as "also worth considering"
     const usedInstructors = {};
     const usedInstructorDates = new Set();
-    const TARGET_SLOTS = 5;         // present up to 5 to admin
-    const INTERNAL_POOL = 10;       // still collect up to 10 internally for alerts
+    const TARGET_SLOTS = 5;         // aim for 5 main-list slots
+    const MAX_FALLBACK = 3;         // up to 3 Tier 4 fallbacks when main list thin
 
-    while (selected.length < INTERNAL_POOL && allSlots.length > 0) {
-      // Score each remaining slot against what's already been picked
+    // Fill main list with Tier 1-3 slots. Diversity penalty is now mild (-10 for
+    // same instructor, -5 for same day-of-week) — with date-first scoring it's
+    // mainly for tiebreaks, not a primary driver. Too much diversity pressure
+    // otherwise pushes later-but-different slots over genuinely-earliest ones.
+    while (selected.length < TARGET_SLOTS && mainSlots.length > 0) {
       let bestIdx = -1;
       let bestAdjustedScore = -Infinity;
-
-      for (let i = 0; i < allSlots.length; i++) {
-        const s = allSlots[i];
+      for (let i = 0; i < mainSlots.length; i++) {
+        const s = mainSlots[i];
         const instCount = usedInstructors[s.instructor] || 0;
-        if (instCount >= 3) continue;                           // cap per instructor
-        if (usedInstructorDates.has(`${s.instructor}|${s.date}`)) continue; // one per inst+day
-
+        if (instCount >= 3) continue;
+        if (usedInstructorDates.has(`${s.instructor}|${s.date}`)) continue;
         let adjusted = scoreSlot(s);
-        // Diversity penalty — only applied when filling the first TARGET_SLOTS (the ones shown to admin)
-        if (selected.length < TARGET_SLOTS) {
-          for (const alreadyPicked of selected) {
-            if (alreadyPicked.instructor === s.instructor) adjusted -= 40;
-            if (alreadyPicked.dayName === s.dayName) adjusted -= 20;
-            if (alreadyPicked.period === s.period) adjusted -= 10;
-          }
+        for (const alreadyPicked of selected) {
+          if (alreadyPicked.instructor === s.instructor) adjusted -= 10;
+          if (alreadyPicked.dayName === s.dayName) adjusted -= 5;
         }
         if (adjusted > bestAdjustedScore) {
           bestAdjustedScore = adjusted;
           bestIdx = i;
         }
       }
-
       if (bestIdx === -1) break;
-      const picked = allSlots.splice(bestIdx, 1)[0];
+      const picked = mainSlots.splice(bestIdx, 1)[0];
       selected.push(picked);
       usedInstructors[picked.instructor] = (usedInstructors[picked.instructor] || 0) + 1;
       usedInstructorDates.add(`${picked.instructor}|${picked.date}`);
     }
 
-    // Log Claude's view: top 5 that will actually be rendered.
-    // Also log what the pure score order would have been (without diversity) so we
-    // can spot cases where diversity is hurting rather than helping.
-    const diversityPickOrder = selected.slice(0, TARGET_SLOTS).map(
-      s => `${s.instructor} ${s.date} ${s.suggestedStart} T${s.tier}`
-    );
-    console.log(`[pickOrder] ${booking.clientName || '(no name)'} in ${clientSuburb}: ${diversityPickOrder.join(' | ')}`);
+    // Only dip into Tier 4 fallbacks if the main list is short. If we already
+    // have 5 decent Tier 1-3 options, admin doesn't need to see Tier 4 — that
+    // would just muddy the picture.
+    const mainListIsShort = selected.length < TARGET_SLOTS;
+    if (mainListIsShort && fallbackSlots.length > 0) {
+      const fallbackUsedInstructors = {};
+      const fallbackUsedInstructorDates = new Set();
+      while (fallbackSelected.length < MAX_FALLBACK && fallbackSlots.length > 0) {
+        let bestIdx = -1;
+        let bestAdjustedScore = -Infinity;
+        for (let i = 0; i < fallbackSlots.length; i++) {
+          const s = fallbackSlots[i];
+          const instCount = fallbackUsedInstructors[s.instructor] || 0;
+          if (instCount >= 2) continue;
+          if (fallbackUsedInstructorDates.has(`${s.instructor}|${s.date}`)) continue;
+          let adjusted = scoreSlot(s);
+          for (const alreadyPicked of fallbackSelected) {
+            if (alreadyPicked.instructor === s.instructor) adjusted -= 10;
+            if (alreadyPicked.dayName === s.dayName) adjusted -= 5;
+          }
+          if (adjusted > bestAdjustedScore) {
+            bestAdjustedScore = adjusted;
+            bestIdx = i;
+          }
+        }
+        if (bestIdx === -1) break;
+        const picked = fallbackSlots.splice(bestIdx, 1)[0];
+        fallbackSelected.push(picked);
+        fallbackUsedInstructors[picked.instructor] = (fallbackUsedInstructors[picked.instructor] || 0) + 1;
+        fallbackUsedInstructorDates.add(`${picked.instructor}|${picked.date}`);
+      }
+    }
+
+    // Log the final ordering so we can check pick quality from Railway logs later.
+    const mainOrder = selected.map(s => `${s.instructor} ${s.date} ${s.suggestedStart} T${s.tier}`);
+    const fbOrder = fallbackSelected.map(s => `${s.instructor} ${s.date} ${s.suggestedStart} T4`);
+    console.log(`[pickOrder] ${booking.clientName || '(no name)'} in ${clientSuburb}: main=[${mainOrder.join(' | ')}]${fbOrder.length ? ` fallback=[${fbOrder.join(' | ')}]` : ''}`);
 
     debugLog.push(`Selected top ${selected.length} slots for Claude (presenting first ${Math.min(TARGET_SLOTS, selected.length)})`);
 
@@ -2117,8 +2158,11 @@ Suggested actions for admin:
     const shownTier3Stretch = { shown: false };
     const shownTier4Stretch = { shown: false };
 
-    const slotDescriptions = toPresent.map((s, i) => {
-      // Short tier tag — shown on the same line as the slot header for quick scan.
+    // Helper: render a single slot into the compact labeled format.
+    // Reused for both the main list (Tier 1-3) and the "also worth considering"
+    // fallback list (Tier 4). The `slotNumber` is a 1-based display index —
+    // main list numbers its own slots 1..N; fallback starts its own numbering.
+    const renderSlot = (s, slotNumber) => {
       let tierTag;
       if (s.tier === 1) tierTag = "Tier 1 — Ideal";
       else if (s.tier === 2) tierTag = "Tier 2 — Good";
@@ -2213,21 +2257,54 @@ Suggested actions for admin:
       if (s.peakTrafficWarning) {
         notes.push(`⚠️ ${s.peakPeriod} — travel may take longer than estimated`);
       }
-      const notesLines = notes.map(n => `Note: ${n}`).join("\n  ");
 
-      // Top pick tag on Slot 1 — makes the hierarchy of the list explicit so
-      // admin doesn't have to infer. Only add when:
-      //   (a) there's more than one slot (labelling a solo slot is meaningless), and
-      //   (b) Slot 1 is genuinely a good slot (Tier 1 or 2).
-      // Tier 3/4 slots — stretch zones, dedicated trips, or "no nearby" — aren't
-      // deserving of a gold-star label even when they're the best available. Admin
-      // could misread "TOP PICK" as "this is a good slot" and skip the ⚠️ warnings.
-      const topPickTag = (i === 0 && toPresent.length > 1 && s.tier <= 2) ? " ★ TOP PICK" : "";
+      // Squeeze detection — warn admin when this slot has tight margins on either
+      // side. Instructor has <= 10 min buffer before lesson starts OR <= 10 min
+      // between lesson end and next commitment. Low buffer = high risk of running
+      // late. The gap-fit math already guarantees the slot is mathematically
+      // possible, but mathematically-possible and comfortable are different.
+      const bufferIn = timeToMins(s.suggestedStart) - (
+        s.prevAppointmentKind && s.prevEndTime
+          ? timeToMins(s.prevEndTime)
+          : 0
+      );
+      // Only meaningful when coming FROM a previous appointment
+      if (s.prevAppointmentKind && bufferIn > 0 && bufferIn - s.travelIn < 10) {
+        notes.push(`⚠️ Tight schedule — only ${Math.max(0, bufferIn - s.travelIn)} min spare after travel from previous appt`);
+      }
+      if (s.nextAppointmentKind && s.nextStartTime) {
+        // Lesson end = suggestedStart + durationMins. Then travel to next appt.
+        const lessonEnd = timeToMins(s.suggestedStart) + durationMins;
+        const nextStart = timeToMins(s.nextStartTime);
+        const afterBuffer = nextStart - lessonEnd - s.travelOut;
+        if (afterBuffer < 10) {
+          notes.push(`⚠️ Tight schedule — only ${Math.max(0, afterBuffer)} min spare before next appt`);
+        }
+      }
+      const notesLinesBlock = notes.map(n => `Note: ${n}`).join("\n  ");
 
-      return `Slot ${i + 1}: ${s.instructor} — ${formatDate(s.date)} (${s.dayName}) at ${s.suggestedStart}   [${tierTag}]${topPickTag}
+      // Slot header. List is ordered best-to-worst — no need for a "top pick"
+      // tag; Slot 1 is always the best pick. Tier tag already communicates quality.
+      return `Slot ${slotNumber}: ${s.instructor} — ${formatDate(s.date)} (${s.dayName}) at ${s.suggestedStart}   [${tierTag}]
   ${fromLine}
-  ${afterLine}${notesLines ? "\n  " + notesLines : ""}`;
-    }).join("\n\n");
+  ${afterLine}${notesLinesBlock ? "\n  " + notesLinesBlock : ""}`;
+    };
+
+    // Main list: Tier 1-3 slots, rendered in score order.
+    const mainRendered = toPresent.map((s, i) => renderSlot(s, i + 1)).join("\n\n");
+
+    // Fallback list: Tier 4 slots, shown under a separate heading only when
+    // the main list had fewer than 5 slots (we need filler) AND we have Tier 4
+    // candidates. Numbered continuing from where the main list left off so
+    // admin sees a coherent index.
+    let fallbackRendered = "";
+    if (fallbackSelected.length > 0) {
+      const startNum = toPresent.length + 1;
+      const fallbackSlotTexts = fallbackSelected.map((s, i) => renderSlot(s, startNum + i));
+      fallbackRendered = `\n\nAlso worth considering (longer drives / outside usual areas — use only if nothing above works for the client):\n\n${fallbackSlotTexts.join("\n\n")}`;
+    }
+
+    const slotDescriptions = mainRendered + fallbackRendered;
 
     // Footer note — one mention of the private-hold caveat, not per-slot.
     const privateHoldFooter = hasAnyPrivateHoldMention
@@ -2409,11 +2486,13 @@ Start with the CLIENT line copied verbatim from the user message.
 
 If there is an "⚠️ Client address couldn't be found on the map..." warning, include it immediately after.
 
-Then list each slot EXACTLY as shown in VERIFIED SLOTS — keep the "Slot N: ..." header with the tier tag in brackets (and the "★ TOP PICK" tag on Slot 1 if present), keep the From: and After: lines verbatim (including all commas, parentheses, ellipses and punctuation), keep any Note: lines.
+Then list each slot EXACTLY as shown in VERIFIED SLOTS — keep the "Slot N: ..." header with the tier tag in brackets, keep the From: and After: lines verbatim (including all commas, parentheses, ellipses and punctuation), keep any Note: lines.
+
+If there is an "Also worth considering" section in the VERIFIED SLOTS text, copy it verbatim AFTER the main slots — keep its heading line intact. Those are longer-drive fallback options; admin should see them but they're clearly secondary.
 
 Do NOT add narrative sentences around the slots. No "Perfect timing", no "Another excellent option", no introductions like "Here are the best slots". The slots speak for themselves.
 
-If fewer than 5 slots exist, show only what exists. Say in ONE line: "Only N slot(s) found — no other options fit the client's availability and requirements."
+If the main list has fewer than 5 slots, show only what exists. Say in ONE short line: "Only N slot(s) available in usual zones." If there's also an "Also worth considering" section below, that one still appears as normal — admin might prefer a longer-drive option over waiting.
 
 ═══ BELOW THE SLOTS ═══
 
@@ -2473,6 +2552,15 @@ ${slotDescriptions}${privateHoldFooter}${notOfferedText}${adminAlertsText}`;
         start: s.suggestedStart,
         tier: s.tier,
         nearbyOnDay: s.nearbyOnDay || false,
+        travelInMin: s.travelIn,
+        travelInKm: s.travelInKm
+      })),
+      fallbackSlots: fallbackSelected.map(s => ({
+        instructor: s.instructor,
+        date: s.date,
+        dayName: s.dayName,
+        start: s.suggestedStart,
+        tier: s.tier,
         travelInMin: s.travelIn,
         travelInKm: s.travelInKm
       })),
@@ -2646,7 +2734,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-24-scoring-and-hold-location-v5.4";
+const BUILD_ID = "2026-04-24-date-first-smart-ranking-v5.5";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2692,7 +2780,11 @@ app.get("/health", (req, res) => {
       "geocode-fuzzy-match-detection-150km-threshold",
       "admin-audit-log-ring-buffer",
       "private-hold-location-from-notes",
-      "stronger-date-penalty-and-core-zone-nearby-ignored"
+      "stronger-date-penalty-and-core-zone-nearby-ignored",
+      "date-first-scoring-smart-ranking",
+      "tier-4-bucketed-to-also-worth-considering",
+      "top-pick-tag-removed",
+      "squeeze-detection-for-tight-schedules"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
@@ -3294,6 +3386,15 @@ app.get("/admin-log", (req, res) => {
           : "T4 ⚠️";
         const km = s.travelInKm !== null && s.travelInKm !== undefined ? `${s.travelInKm}km` : "?km";
         lines.push(`     ${i + 1}. ${s.instructor} ${s.date} (${s.dayName}) ${s.start}  [${tierTag}]  (${s.travelInMin}min / ${km})`);
+      }
+    }
+    // Also show Tier 4 fallback slots if any were presented as "Also worth considering"
+    if (e.fallbackSlots && e.fallbackSlots.length > 0) {
+      lines.push(`  + ${e.fallbackSlots.length} fallback slot(s) (longer drives):`);
+      for (let i = 0; i < e.fallbackSlots.length; i++) {
+        const s = e.fallbackSlots[i];
+        const km = s.travelInKm !== null && s.travelInKm !== undefined ? `${s.travelInKm}km` : "?km";
+        lines.push(`     F${i + 1}. ${s.instructor} ${s.date} (${s.dayName}) ${s.start}  [T4 ⚠️]  (${s.travelInMin}min / ${km})`);
       }
     }
     if (e.notOfferedCount > 0) {
