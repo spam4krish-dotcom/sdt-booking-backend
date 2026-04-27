@@ -2071,7 +2071,15 @@ Suggested actions for admin:
         if (usedInstructorDates.has(`${s.instructor}|${s.date}`)) continue;
         let adjusted = scoreSlot(s);
         for (const alreadyPicked of selected) {
-          if (alreadyPicked.instructor === s.instructor) adjusted -= 10;
+          // Same-instructor penalty: bumped from -10 to -30 so the result list
+          // genuinely spreads across instructors. The same-instructor cap of 3
+          // already exists, but with only -10 penalty, Gabriel was winning
+          // 3 slots in a row when other instructors were close in quality.
+          // -30 means another instructor needs to be only ~1 week earlier OR
+          // marginally better-fit to pull a slot away from a repeat. Doesn't
+          // affect cases where one instructor is uniquely qualified (rare
+          // mods) — they still win because no alternatives exist.
+          if (alreadyPicked.instructor === s.instructor) adjusted -= 30;
           if (alreadyPicked.dayName === s.dayName) adjusted -= 5;
         }
         if (adjusted > bestAdjustedScore) {
@@ -2103,7 +2111,7 @@ Suggested actions for admin:
           if (fallbackUsedInstructorDates.has(`${s.instructor}|${s.date}`)) continue;
           let adjusted = scoreSlot(s);
           for (const alreadyPicked of fallbackSelected) {
-            if (alreadyPicked.instructor === s.instructor) adjusted -= 10;
+            if (alreadyPicked.instructor === s.instructor) adjusted -= 30;
             if (alreadyPicked.dayName === s.dayName) adjusted -= 5;
           }
           if (adjusted > bestAdjustedScore) {
@@ -2790,7 +2798,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-25-revert-private-hold-extraction-v5.7";
+const BUILD_ID = "2026-04-27-stronger-instructor-diversity-v5.8";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2840,7 +2848,8 @@ app.get("/health", (req, res) => {
       "date-first-scoring-smart-ranking",
       "tier-4-bucketed-to-also-worth-considering",
       "top-pick-tag-removed",
-      "squeeze-detection-for-tight-schedules"
+      "squeeze-detection-for-tight-schedules",
+      "stronger-same-instructor-diversity-penalty"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
