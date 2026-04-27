@@ -2151,6 +2151,32 @@ Suggested actions for admin:
     const fbOrder = fallbackSelected.map(s => `${s.instructor} ${s.date} ${s.suggestedStart} T4`);
     console.log(`[pickOrder] ${booking.clientName || '(no name)'} in ${clientSuburb}: main=[${mainOrder.join(' | ')}]${fbOrder.length ? ` fallback=[${fbOrder.join(' | ')}]` : ''}`);
 
+    // Identify instructors who HAD slots but didn't make either selection (main or
+    // fallback). Without this, admin sees no mention of an eligible instructor in
+    // the output and might wonder if they were considered. The all-day Charlotte
+    // Pham case revealed this: Sherri (Croydon core, no mods needed) had multiple
+    // potential slots but lost diversity tiebreaks, and she silently vanished
+    // from the output. Adding them to excludedInstructors with a clear reason
+    // surfaces the situation to admin.
+    const selectedInstructorNames = new Set([
+      ...selected.map(s => s.instructor),
+      ...fallbackSelected.map(s => s.instructor)
+    ]);
+    const allInstructorsWithSlots = new Set(allSlots.map(s => s.instructor));
+    for (const instName of allInstructorsWithSlots) {
+      if (!selectedInstructorNames.has(instName)) {
+        // They had slots but lost out on selection (capped per-instructor or
+        // pushed off the list by higher-scoring candidates).
+        const alreadyExcluded = excludedInstructors.some(ex => ex.name === instName);
+        if (!alreadyExcluded) {
+          excludedInstructors.push({
+            name: instName,
+            reason: "had availability but other instructors scored higher — diary may have fits if top picks don't suit"
+          });
+        }
+      }
+    }
+
     debugLog.push(`Selected top ${selected.length} slots for Claude (presenting first ${Math.min(TARGET_SLOTS, selected.length)})`);
 
     // ─── Check clinic-partnership holds for admin alerts ───
@@ -2191,7 +2217,7 @@ Suggested actions for admin:
     // weren't selected. If the client is within the clinic's radius, this is
     // exactly the kind of scenario admin wants to know about — the clinic hold
     // is blocking what could be a great match.
-    const selectedInstructorNames = new Set(selected.map(s => s.instructor));
+    const clinicAlertSelectedNames = new Set(selected.map(s => s.instructor));
     for (const ch of allInstructorClinicHolds) {
       // Skip if this instructor already contributed selected slots AND was already alerted
       // (we've already handled their adjacent-to-selected case above)
@@ -2817,7 +2843,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-27-all-areas-instructors-v5.9";
+const BUILD_ID = "2026-04-27-show-unselected-instructors-v6.0";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2869,7 +2895,8 @@ app.get("/health", (req, res) => {
       "top-pick-tag-removed",
       "squeeze-detection-for-tight-schedules",
       "stronger-same-instructor-diversity-penalty",
-      "all-areas-flag-active-for-christian-greg"
+      "all-areas-flag-active-for-christian-greg",
+      "show-unselected-eligible-instructors-in-not-offered"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
