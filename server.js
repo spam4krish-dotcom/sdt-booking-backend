@@ -73,8 +73,9 @@ const INSTRUCTORS = [
   {
     name: "Greg", base: "Kilsyth", locationID: 41, providerID: 77,
     mods: ["LFA", "Spinner", "Electronic Spinner", "Monarchs", "Indicator Extension"],
+    allAreas: true,
     maxTravelFromBase: 55,
-    maxRadiusKm: 45,
+    maxRadiusKm: 60, // Greg services widely; allAreas with a generous distance ceiling
     coreZone: [
       "Kilsyth", "Mooroolbark", "Croydon", "Croydon North", "Croydon South",
       "Ringwood", "Ringwood North", "Blackburn", "Blackburn South",
@@ -1324,6 +1325,14 @@ function getZoneFit(instructor, clientSuburb) {
   });
   if (stretchLoose) return "stretch";
 
+  // "All areas" instructors (Christian, Greg) — they go everywhere within
+  // reason. Their explicit zone lists are partial; suburbs not on the list
+  // shouldn't drop them to Tier 4. Treat as stretch by default. The
+  // maxRadiusKm ceiling still applies (handled at the call site via
+  // baseDistanceKm check) so we don't recommend them for a 90 km dedicated
+  // trip — but for normal Melbourne metro suburbs, they qualify.
+  if (instructor.allAreas) return "stretch";
+
   return "outside";
 }
 
@@ -1424,7 +1433,7 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
 
   // Extract client's suburb from the address for zone checks
   const clientSuburbName = extractSuburbFromLocation(clientSuburb) || clientSuburb;
-  const zoneFit = getZoneFit(inst, clientSuburbName);
+  let zoneFit = getZoneFit(inst, clientSuburbName);
 
   // Yves: hard zone — if client is outside Peninsula, skip entirely
   if (inst.hardZone && zoneFit === "outside") {
@@ -1438,6 +1447,16 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
   // Hard-zone fallback via distance if zone list doesn't have the suburb
   if (inst.hardZone && baseDistanceKm !== null && baseDistanceKm > inst.maxRadiusKm) {
     return { slots: [], adminAlerts: [], allClinicHolds: [], dropReason: `client ${Math.round(baseDistanceKm)}km from ${inst.name}'s base — outside ${inst.maxRadiusKm}km hard zone` };
+  }
+
+  // All-areas instructors get a generous default zone fit (stretch) for any
+  // suburb in their broader region — Christian and Greg genuinely cover most
+  // of Melbourne. But if the client is beyond their maxRadiusKm ceiling, drop
+  // them to "outside" so they end up in the Tier 4 fallback bucket rather
+  // than competing on the main list. This stops the rare case where they'd
+  // be recommended for a 90 km dedicated trip on a busy day.
+  if (inst.allAreas && baseDistanceKm !== null && baseDistanceKm > inst.maxRadiusKm) {
+    zoneFit = "outside";
   }
 
   let appointments;
@@ -2798,7 +2817,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-27-stronger-instructor-diversity-v5.8";
+const BUILD_ID = "2026-04-27-all-areas-instructors-v5.9";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2849,7 +2868,8 @@ app.get("/health", (req, res) => {
       "tier-4-bucketed-to-also-worth-considering",
       "top-pick-tag-removed",
       "squeeze-detection-for-tight-schedules",
-      "stronger-same-instructor-diversity-penalty"
+      "stronger-same-instructor-diversity-penalty",
+      "all-areas-flag-active-for-christian-greg"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
