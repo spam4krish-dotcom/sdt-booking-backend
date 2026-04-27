@@ -1502,38 +1502,30 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
       locationSource = `clinic-hold: ${cls.clinic.name}`;
     } else if (cls.kind === "private-hold") {
       // Private client hold (e.g. "Hold for Jessica Mills", "Event - Luca Silvan").
-      // Try to extract a location from the hold's notes. We need to be CAREFUL
-      // here: the hold's summary often contains a person's name like "Jaxon Harris"
-      // or "Daniel Dodig" which would falsely pass a generic suburb check
-      // (toUpperCase makes them look like all-caps suburbs). Google then fuzzy-
-      // matches the person name to some random Victorian street, producing
-      // wildly inaccurate travel times (36 km when actual is 5).
+      // Always use the instructor's base as the location.
       //
-      // To avoid that, only accept location candidates that are:
-      //   (a) a full street address with a recognised street type, OR
-      //   (b) explicitly written in ALL CAPS in the original text (a pattern
-      //       admin commonly uses to signal locations: "MENTONE", "WANTIRNA"),
-      //       AND not in a blocklist of common name-shaped false positives.
+      // History: v5.4 tried to extract a suburb from the hold's notes (the
+      // ICS description). v5.6 tightened the extraction to avoid person-name
+      // false matches. But pressure-testing v5.6 revealed the deeper issue:
+      // Nookal's ICS description for a hold typically echoes the CLIENT'S
+      // home suburb, not where the instructor will be during the hold. So
+      // when the system "successfully" extracted a suburb, it was usually
+      // computing travel from the client's home — somewhere the instructor
+      // probably isn't — producing confidently wrong numbers (e.g. Jaxon
+      // Harris's home suburb gave Yves a 36.7km travel calc to Rosebud,
+      // when Yves was almost certainly at his Rye base ~10km away).
       //
-      // If neither passes, fall back to instructor's base. The old behaviour was
-      // ALWAYS to fall back to base — slightly less accurate for genuine
-      // location-tagged holds (like Greg's MENTONE one) but never wildly wrong.
-      const holdLoc = extractPrivateHoldLocation(a.description || a.notes || "");
-      if (holdLoc && holdLoc.kind === "address") {
-        locStart = holdLoc.address;
-        locEnd = holdLoc.address;
-        locationSource = `private-hold (address from notes)`;
-      } else if (holdLoc && holdLoc.kind === "suburb") {
-        locStart = holdLoc.suburb;
-        locEnd = holdLoc.suburb;
-        locationSource = `private-hold (suburb '${holdLoc.suburb}' from notes)`;
-      } else {
-        // No parseable location — safe fallback is to assume the instructor is
-        // at base. Conservative (slightly inflated travel) but never wrong.
-        locStart = inst.base;
-        locEnd = inst.base;
-        locationSource = "private-hold (base assumed, no location in notes)";
-      }
+      // The conservative base fallback is correct: it errs slightly long for
+      // hold-anchored slots but is never wildly wrong. Admin sees the explicit
+      // "(location unknown) — est. from base" caveat and can verify.
+      //
+      // Trade-off: we lose the rare case where admin types a deliberate
+      // suburb annotation in notes (like Greg's "HOLD JACK RICHARDSON /
+      // MENTONE"). The Mentone case will now use Greg's Kilsyth base instead
+      // — slightly inaccurate but at least flagged as approximate.
+      locStart = inst.base;
+      locEnd = inst.base;
+      locationSource = "private-hold (base assumed)";
     }
     // hard-blocks keep locStart/locEnd as inst.base (instructor is effectively "off")
 
@@ -2798,7 +2790,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-25-stricter-private-hold-extraction-v5.6";
+const BUILD_ID = "2026-04-25-revert-private-hold-extraction-v5.7";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2843,13 +2835,12 @@ app.get("/health", (req, res) => {
       "clinic-regex-handles-parens-and-clinic-word",
       "geocode-fuzzy-match-detection-150km-threshold",
       "admin-audit-log-ring-buffer",
-      "private-hold-location-from-notes",
+      "private-hold-uses-base-fallback-always",
       "stronger-date-penalty-and-core-zone-nearby-ignored",
       "date-first-scoring-smart-ranking",
       "tier-4-bucketed-to-also-worth-considering",
       "top-pick-tag-removed",
-      "squeeze-detection-for-tight-schedules",
-      "stricter-private-hold-location-no-name-fuzzy-match"
+      "squeeze-detection-for-tight-schedules"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
