@@ -3326,7 +3326,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-29-course-plan-fixes-v6.4";
+const BUILD_ID = "2026-04-29-batch-test-endpoint-v6.5";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -3391,7 +3391,8 @@ app.get("/health", (req, res) => {
       "far-out-start-date-warning",
       "sherri-all-areas-flag",
       "course-run-breaks-on-2week-gap",
-      "course-lesson-tagging-by-group-membership"
+      "course-lesson-tagging-by-group-membership",
+      "batch-test-endpoint"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
@@ -3920,6 +3921,171 @@ app.get("/test", async (req, res) => {
     const detail = err.response?.data?.error || err.message;
     res.status(500).type("text/plain").send(`Test endpoint error:\n${detail}`);
   }
+});
+
+// ─── Batch test endpoint ───────────────────────────────────────────────────
+// Runs a default suite of 15 test cases sequentially and returns one big plain
+// text dump. Designed for one-tap mobile testing — admin (or developer) hits
+// one URL, gets all 15 results separated by clear dividers.
+//
+// Default suite covers: easy / medium / hard / edge cases / course plans /
+// stress tests across all instructors and zone types. Specifically exercises
+// every recent feature (custom windows, course plans, deadlines, allAreas,
+// far-out warnings, Tier 4 fallback bucketing).
+//
+// Optional query: ?include=2,5,9 to run only a subset of tests by index.
+//
+// Each test runs against /analyse via internal HTTP self-call so behaviour is
+// identical to a real form submission. Tests are sequential (not parallel) to
+// avoid hammering the upstream Anthropic / Google Maps APIs.
+app.get("/test-batch", async (req, res) => {
+  // The default suite — 15 tests covering the full feature surface.
+  const SUITE = [
+    {
+      name: "1 — Easy single, Werribee",
+      desc: "Marc's heartland, basic LFA",
+      body: { clientName: "Batch Test 1", suburb: "12 Watton Street, Werribee VIC 3030", modifications: "LFA", duration: "60", availability: "Tue:10:00-12:00,Thu:10:00-12:00" }
+    },
+    {
+      name: "2 — Standard lesson, no mods",
+      desc: "Sherri eligible territory (Lilydale)",
+      body: { clientName: "Batch Test 2", suburb: "3 Melbourne Street, Lilydale VIC 3140", modifications: "", duration: "60", availability: "Mon:09:00-12:00,Wed:09:00-12:00" }
+    },
+    {
+      name: "3 — Custom narrow window",
+      desc: "Lunch hour only Box Hill",
+      body: { clientName: "Batch Test 3", suburb: "22 Whitehorse Road, Box Hill VIC 3128", modifications: "LFA", duration: "60", availability: "Mon:12:00-13:30,Wed:12:00-13:30" }
+    },
+    {
+      name: "4 — Hard zone (Yves territory)",
+      desc: "Rye, Peninsula client",
+      body: { clientName: "Batch Test 4", suburb: "21 Dundas Street, Rye VIC 3941", modifications: "LFA", duration: "60", availability: "Wed:11:00-13:00,Fri:11:00-13:00" }
+    },
+    {
+      name: "5 — Triple mod, Mentone",
+      desc: "Rare combination, Bayside",
+      body: { clientName: "Batch Test 5", suburb: "21 Mentone Parade, Mentone VIC 3194", modifications: "LFA,Electronic Spinner,Indicator Extension", duration: "60", availability: "Wed:13:00-16:00,Fri:13:00-16:00" }
+    },
+    {
+      name: "6 — 90-min lesson",
+      desc: "Boronia, longer duration",
+      body: { clientName: "Batch Test 6", suburb: "15 Dorset Road, Boronia VIC 3155", modifications: "LFA", duration: "90", availability: "Tue:10:00-13:00,Thu:10:00-13:00" }
+    },
+    {
+      name: "7 — Hand Controls",
+      desc: "Essendon, only Christian/Gabriel",
+      body: { clientName: "Batch Test 7", suburb: "45 Keilor Road, Essendon VIC 3040", modifications: "Hand Controls", duration: "60", availability: "Mon:14:00-17:00,Thu:10:00-13:00" }
+    },
+    {
+      name: "8 — Course plan, basic 6",
+      desc: "Croydon, 6-lesson continuous course",
+      body: { clientName: "Batch Test 8", suburb: "8 Hewish Road, Croydon VIC 3136", modifications: "LFA,Spinner", duration: "60", availability: "Wed:10:00-13:00,Fri:10:00-13:00", lessonCount: 6, continuousLessons: true }
+    },
+    {
+      name: "9 — Course plan with deadline",
+      desc: "Brighton, 8 lessons by 30/09",
+      body: { clientName: "Batch Test 9", suburb: "55 Bay Street, Brighton VIC 3186", modifications: "LFA,Electronic Spinner", duration: "60", availability: "Wed:13:00-16:00,Fri:13:00-16:00", lessonCount: 8, continuousLessons: true, fundingDeadline: "2026-09-30" }
+    },
+    {
+      name: "10 — Course plan, big (12 lessons)",
+      desc: "Mornington, 12 lessons (Yves territory)",
+      body: { clientName: "Batch Test 10", suburb: "12 Main Street, Mornington VIC 3931", modifications: "LFA", duration: "60", availability: "Wed:11:00-13:00,Fri:11:00-13:00", lessonCount: 12, continuousLessons: true }
+    },
+    {
+      name: "11 — Far-out warning trigger",
+      desc: "Single slot, narrow availability — should be 6+ weeks out",
+      body: { clientName: "Batch Test 11", suburb: "44 Beach Road, Mentone VIC 3194", modifications: "LFA,Electronic Spinner", duration: "60", availability: "Thu:14:00-16:00" }
+    },
+    {
+      name: "12 — Address typo",
+      desc: "Geocode failure detection",
+      body: { clientName: "Batch Test 12", suburb: "47 Wararnydte Road, Ringwod VIC 9999", modifications: "LFA", duration: "60", availability: "Wed:13:00-16:00" }
+    },
+    {
+      name: "13 — Today/tomorrow only",
+      desc: "Same-week urgency, broad availability across 2 days",
+      body: { clientName: "Batch Test 13", suburb: "22 Mt Dandenong Road, Croydon VIC 3136", modifications: "LFA", duration: "60", availability: "Wed:13:00-17:00,Thu:09:00-12:00,Fri:09:00-12:00" }
+    },
+    {
+      name: "14 — O-Ring (only Gabriel)",
+      desc: "Niche mod, only one instructor eligible",
+      body: { clientName: "Batch Test 14", suburb: "12 Maroondah Highway, Ringwood VIC 3134", modifications: "O-Ring", duration: "60", availability: "Mon:13:00-17:00,Tue:13:00-17:00,Wed:13:00-17:00,Thu:13:00-17:00,Fri:13:00-17:00" }
+    },
+    {
+      name: "15 — Impossible course (HC + far west + tight deadline)",
+      desc: "Should return 'no plans possible'",
+      body: { clientName: "Batch Test 15", suburb: "8 Plumpton Road, Plumpton VIC 3335", modifications: "Hand Controls", duration: "60", availability: "Tue:10:00-13:00,Fri:10:00-13:00", lessonCount: 6, continuousLessons: true, fundingDeadline: "2026-06-15" }
+    }
+  ];
+
+  // Optional ?include=2,5,9 query — run only those test indices (1-based)
+  let suite = SUITE;
+  if (req.query.include) {
+    const wanted = String(req.query.include).split(",").map(s => parseInt(s.trim())).filter(n => n > 0);
+    if (wanted.length > 0) {
+      suite = wanted.map(i => SUITE[i - 1]).filter(Boolean);
+    }
+  }
+
+  if (suite.length === 0) {
+    return res.type("text/plain").send("No tests selected. Default: hit /test-batch with no query for all 15. Use ?include=2,5,9 to run a subset.");
+  }
+
+  res.type("text/plain");
+  const port = PORT || 3000;
+  const lines = [];
+  lines.push(`SDT Booking Assistant — Batch Test Run`);
+  lines.push(`Build: ${BUILD_ID}`);
+  lines.push(`Tests: ${suite.length} of ${SUITE.length}`);
+  lines.push(`Started: ${new Date().toISOString()}`);
+  lines.push("");
+
+  let testNum = 0;
+  let failureCount = 0;
+  const startTotal = Date.now();
+
+  for (const t of suite) {
+    testNum += 1;
+    const startT = Date.now();
+    lines.push("█".repeat(72));
+    lines.push(`TEST ${t.name}`);
+    lines.push(`Purpose: ${t.desc}`);
+    lines.push(`Inputs: ${JSON.stringify({ suburb: t.body.suburb, mods: t.body.modifications, duration: t.body.duration, availability: t.body.availability, lessons: t.body.lessonCount || 1, continuous: !!t.body.continuousLessons, deadline: t.body.fundingDeadline || "—" })}`);
+    lines.push("█".repeat(72));
+    try {
+      const analyseRes = await axios.post(`http://localhost:${port}/analyse`, t.body, {
+        headers: { "Content-Type": "application/json" },
+        timeout: 90000
+      });
+      const data = analyseRes.data;
+      let rendered = "";
+      if (data?.content?.length) {
+        rendered = data.content.filter(c => c.type === "text").map(c => c.text).join("\n\n");
+      } else if (data?.error) {
+        rendered = `Error: ${data.error}`;
+        failureCount += 1;
+      } else {
+        rendered = "(No content returned)";
+        failureCount += 1;
+      }
+      lines.push(rendered);
+    } catch (err) {
+      failureCount += 1;
+      const detail = err.response?.data?.error || err.message;
+      lines.push(`⚠️ Test errored: ${detail}`);
+    }
+    lines.push("");
+    lines.push(`(test ${testNum} took ${Math.round((Date.now() - startT) / 1000)}s)`);
+    lines.push("");
+  }
+
+  const totalSecs = Math.round((Date.now() - startTotal) / 1000);
+  lines.push("█".repeat(72));
+  lines.push(`BATCH COMPLETE`);
+  lines.push(`Ran ${suite.length} tests in ${totalSecs}s${failureCount > 0 ? ` (${failureCount} failed)` : ""}`);
+  lines.push("█".repeat(72));
+
+  res.send(lines.join("\n"));
 });
 
 // ─── Admin audit log endpoint ──────────────────────────────────────────────
