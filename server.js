@@ -2235,19 +2235,38 @@ app.post("/analyse", async (req, res) => {
         ? `\n\n⚠️ Could not find "${clientSuburb}" on the map. Please double-check the address — the suburb or street name may be misspelled, or the postcode may be wrong. No further instructor lookup is possible until the address is corrected.`
         : "";
 
+      // If a funding deadline was set, mention it explicitly — it's often the
+      // real cause when "no slots available" comes back. Without this, admin
+      // might assume the client's availability is wrong when really the deadline
+      // window was too short to find a fit.
+      let deadlineNote = "";
+      if (deadlineDate && !addressLikelyInvalid) {
+        const today = new Date();
+        const deadline = new Date(deadlineDate);
+        const daysRemaining = Math.round((deadline - today) / (1000 * 60 * 60 * 24));
+        const weeksRemaining = Math.max(0, Math.round(daysRemaining / 7));
+        deadlineNote = `\n\n⚠️ Note: scan was capped by funding deadline ${formatDate(deadlineDate)} — only ${weeksRemaining} week${weeksRemaining === 1 ? "" : "s"} of availability searched. Removing or extending the deadline may surface more options.`;
+      }
+
+      // Suggest /debug-day URL for the most-promising instructor + first matching day
+      // so admin can investigate why no slot fit (gap math, hold blockers, etc).
+      const debugHint = eligibleInstructors.length > 0
+        ? `\n\nDebug a specific day: /debug-day?instructor=${eligibleInstructors[0].name}&date=YYYY-MM-DD`
+        : "";
+
       return res.json({
         content: [{
           type: "text",
-          text: `No available slots found for ${booking.clientName || "this client"} in ${clientSuburb}.${addressWarningText}
+          text: `No available slots found for ${booking.clientName || "this client"} in ${clientSuburb}.${addressWarningText}${deadlineNote}
 
 Eligible instructors (with required modifications): ${eligibleNames}
 
 All eligible instructors are either fully booked during the client's preferred time windows or the client's suburb is outside their usual operating area.
 
 Suggested actions for admin:
-1. ${addressLikelyInvalid ? "Fix the address spelling / postcode and retry" : "Ask the client about additional availability (different days or time blocks)"}
-2. Check if the closest instructor has upcoming days near ${clientSuburb}
-3. Contact an instructor directly about a special arrangement${errorInfo}`
+1. ${addressLikelyInvalid ? "Fix the address spelling / postcode and retry" : (deadlineDate ? "Extend the funding deadline to widen the search window" : "Ask the client about additional availability (different days or time blocks)")}
+2. ${deadlineDate ? "Ask the client about additional availability (different days or time blocks)" : "Check if the closest instructor has upcoming days near " + clientSuburb}
+3. Contact an instructor directly about a special arrangement${errorInfo}${debugHint}`
         }],
         _debug: debugLog
       });
@@ -2313,14 +2332,57 @@ Continuous lessons requested — same instructor across all bookings`;
           : daysFromNow < 14 ? `in ${daysFromNow} days`
           : `in ${Math.round(daysFromNow / 7)} weeks`;
 
+        // Course duration summary — date range of the full plan, in weeks.
+        // Useful for admin to scan ("this is a 12-week course") at a glance.
+        let durationSummary = "";
+        if (plan.lessonsPlanned.length >= 2) {
+          const first = new Date(plan.lessonsPlanned[0].date);
+          const last = new Date(plan.lessonsPlanned[plan.lessonsPlanned.length - 1].date);
+          const totalDays = Math.round((last - first) / (1000 * 60 * 60 * 24));
+          const totalWeeks = Math.round(totalDays / 7);
+          durationSummary = ` • ${totalWeeks}-week course (${formatDate(plan.lessonsPlanned[0].date)} to ${formatDate(plan.lessonsPlanned[plan.lessonsPlanned.length - 1].date)})`;
+        }
+
+        // Detect "true continuity" — every consecutive run lesson should be exactly
+        // 7 days after the previous. If any pair is more than 7 days apart, the run
+        // skipped a week (e.g. instructor had a clash on that date). Admin needs to
+        // know — saying "fully continuous ✓" while the dates jump 14 days is
+        // misleading and could lead to bookings on wrong dates.
+        let runHasGap = false;
+        let gapWeekDates = [];
+        if (plan.runLength >= 2) {
+          for (let i = 1; i < plan.runLength; i++) {
+            const prev = new Date(plan.lessonsPlanned[i - 1].date);
+            const curr = new Date(plan.lessonsPlanned[i].date);
+            const daysBetween = Math.round((curr - prev) / (1000 * 60 * 60 * 24));
+            if (daysBetween > 7) {
+              runHasGap = true;
+              // Compute the skipped date(s) for transparency
+              for (let d = 7; d < daysBetween; d += 7) {
+                const skipped = new Date(prev);
+                skipped.setDate(skipped.getDate() + d);
+                gapWeekDates.push(formatDate(skipped.toISOString().slice(0, 10)));
+              }
+            }
+          }
+        }
+
         const fitText = plan.fitsAll
           ? `All ${lessonCount} lessons fit ✓`
           : `⚠️ Only ${plan.lessonsPlanned.length} of ${lessonCount} lessons fit`;
-        const runText = plan.runLength === lessonCount
-          ? `Run: fully continuous (${plan.runLength} of ${lessonCount} same ${plan.runDayName} ${plan.runStart}) ✓`
-          : plan.runLength > 1
-            ? `Run: ${plan.runLength} of ${lessonCount} same ${plan.runDayName} ${plan.runStart} • ${plan.lessonsPlanned.length - plan.runLength} sporadic`
-            : `Run: no continuous block possible — ${plan.lessonsPlanned.length} sporadic lessons`;
+
+        let runText;
+        if (plan.runLength === lessonCount && !runHasGap) {
+          runText = `Run: fully continuous (${plan.runLength} of ${lessonCount} same ${plan.runDayName} ${plan.runStart}, every week) ✓`;
+        } else if (plan.runLength === lessonCount && runHasGap) {
+          runText = `Run: ${plan.runLength} of ${lessonCount} same ${plan.runDayName} ${plan.runStart} ⚠️ NOT every week — skipped: ${gapWeekDates.join(", ")} (${plan.instructor} unavailable those dates)`;
+        } else if (plan.runLength > 1 && !runHasGap) {
+          runText = `Run: ${plan.runLength} of ${lessonCount} consecutive ${plan.runDayName} ${plan.runStart} • ${plan.lessonsPlanned.length - plan.runLength} sporadic`;
+        } else if (plan.runLength > 1 && runHasGap) {
+          runText = `Run: ${plan.runLength} of ${lessonCount} same ${plan.runDayName} ${plan.runStart} ⚠️ skipped: ${gapWeekDates.join(", ")} • ${plan.lessonsPlanned.length - plan.runLength} sporadic`;
+        } else {
+          runText = `Run: no continuous block possible — ${plan.lessonsPlanned.length} sporadic lessons`;
+        }
 
         const lessonLines = plan.lessonsPlanned.map((s, i) => {
           const lessonNum = i + 1;
@@ -2348,7 +2410,7 @@ Continuous lessons requested — same instructor across all bookings`;
 
         return `═══════════════════════════════════════════════════════════════
 PLAN ${planLetter} — ${plan.instructor}${idx === 0 ? "  (recommended)" : "  (alternative)"}
-Starts: ${formatDate(plan.earliestStartDate)} (${startInText})  •  ${fitText}
+Starts: ${formatDate(plan.earliestStartDate)} (${startInText})  •  ${fitText}${durationSummary}
 ${runText}
 
 ${lessonLines}${unfitWarning}`;
@@ -2918,7 +2980,7 @@ DO NOT:
 
 ═══ OUTPUT FORMAT — FOLLOW EXACTLY ═══
 
-Start with the CLIENT line copied verbatim from the user message.
+Start with the CLIENT line copied verbatim from the user message. Then on the next line copy the AVAILABILITY: line verbatim. Both lines must always appear — they confirm to admin that the search ran with the correct constraints.
 
 If there is an "⚠️ Client address couldn't be found on the map..." warning, include it immediately after.
 
@@ -3170,7 +3232,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-27-custom-windows-deadline-course-plans-v6.1";
+const BUILD_ID = "2026-04-29-output-polish-v6.2";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -3226,7 +3288,11 @@ app.get("/health", (req, res) => {
       "show-unselected-eligible-instructors-in-not-offered",
       "custom-time-windows-hh-mm-ranges",
       "funding-deadline-caps-scan-window",
-      "course-plan-mode-multi-instructor-options"
+      "course-plan-mode-multi-instructor-options",
+      "course-plan-warn-when-run-skips-weeks",
+      "course-plan-duration-summary",
+      "deadline-aware-no-slots-message",
+      "always-show-availability-line"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,

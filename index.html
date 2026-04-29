@@ -130,13 +130,6 @@ textarea{height:72px;resize:vertical;}
 
 <script>
 const DAYS = ["Monday","Tuesday","Wednesday","Thursday","Friday"];
-const BLOCKS = [
-  { value:"early-morning", label:"Early Morning (8am – 10am)" },
-  { value:"mid-morning",   label:"Mid Morning (10am – 12pm)" },
-  { value:"afternoon",     label:"Afternoon (12pm – 2pm)" },
-  { value:"late-afternoon",label:"Late Afternoon (2pm – 5:30pm)" },
-  { value:"all-day",       label:"All Day" },
-];
 
 // Short day name for backend
 const DAY_SHORT = { Monday:"Mon", Tuesday:"Tue", Wednesday:"Wed", Thursday:"Thu", Friday:"Fri" };
@@ -154,7 +147,6 @@ function addSlot() {
   div.id = `slot-${idx}`;
 
   const dayOpts = DAYS.map(d => `<option value="${d}">${d}</option>`).join("");
-  const blockOpts = BLOCKS.map(b => `<option value="${b.value}">${b.label}</option>`).join("");
 
   div.innerHTML = `
     <button class="remove-slot" onclick="removeSlot(${idx})" title="Remove">×</button>
@@ -164,27 +156,14 @@ function addSlot() {
         <label>Day</label>
         <select id="slot-day-${idx}">${dayOpts}</select>
       </div>
-      <div class="field">
-        <label>Time</label>
-        <select id="slot-mode-${idx}" onchange="onModeChange(${idx})">
-          <option value="block">Choose a time block</option>
-          <option value="custom">Specific window (start–end)</option>
-        </select>
-      </div>
     </div>
-    <div class="avail-slot-row" id="slot-block-row-${idx}">
-      <div class="field" style="grid-column:1/-1;">
-        <label>Time Block</label>
-        <select id="slot-block-${idx}">${blockOpts}</select>
-      </div>
-    </div>
-    <div class="avail-slot-row" id="slot-custom-row-${idx}" style="display:none;">
+    <div class="avail-slot-row">
       <div class="field">
-        <label>Start time</label>
+        <label>Earliest start time</label>
         <select id="slot-start-${idx}">${timeOpts("08:00")}</select>
       </div>
       <div class="field">
-        <label>End time</label>
+        <label>Latest end time</label>
         <select id="slot-end-${idx}">${timeOpts("17:30")}</select>
       </div>
     </div>
@@ -196,12 +175,6 @@ function addSlot() {
   container.appendChild(div);
 
   if (slotCount >= 5) document.getElementById("addSlotBtn").style.display = "none";
-}
-
-function onModeChange(idx) {
-  const mode = document.getElementById(`slot-mode-${idx}`).value;
-  document.getElementById(`slot-block-row-${idx}`).style.display = mode === "block" ? "" : "none";
-  document.getElementById(`slot-custom-row-${idx}`).style.display = mode === "custom" ? "" : "none";
 }
 
 // Generate 30-min time options from 08:00 to 18:00
@@ -229,24 +202,13 @@ function collectAvailability() {
   const notes = {};
   for (let i = 1; i <= 10; i++) {
     const dayEl = document.getElementById(`slot-day-${i}`);
-    const modeEl = document.getElementById(`slot-mode-${i}`);
-    if (!dayEl || !modeEl) continue;
+    const startEl = document.getElementById(`slot-start-${i}`);
+    const endEl = document.getElementById(`slot-end-${i}`);
+    if (!dayEl || !startEl || !endEl) continue;
     const shortDay = DAY_SHORT[dayEl.value];
-    let timePart = "";
-    if (modeEl.value === "custom") {
-      const startEl = document.getElementById(`slot-start-${i}`);
-      const endEl = document.getElementById(`slot-end-${i}`);
-      if (startEl && endEl) {
-        const s = startEl.value, e = endEl.value;
-        // Don't submit when end <= start (admin error — skip the row silently)
-        if (s < e) timePart = `${s}-${e}`;
-      }
-    } else {
-      const blockEl = document.getElementById(`slot-block-${i}`);
-      if (blockEl) timePart = blockEl.value;
-    }
-    if (!timePart) continue;
-    const key = `${shortDay}:${timePart}`;
+    const s = startEl.value, e = endEl.value;
+    if (s >= e) continue; // skip invalid windows silently
+    const key = `${shortDay}:${s}-${e}`;
     parts.push(key);
     const notesEl = document.getElementById(`slot-notes-${i}`);
     if (notesEl && notesEl.value.trim()) {
