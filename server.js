@@ -1998,13 +1998,50 @@ function buildInstructorCoursePlan(instructorName, instructorPool, lessonCount) 
     runCandidates.get(key).push(s);
   }
 
-  // Find the best run: maximises run length, breaks ties on earliest start date
+  // For each (dayName, suggestedStart) group, find the LONGEST UNBROKEN sub-run.
+  // A sub-run breaks when consecutive slots are more than 14 days apart.
+  // Without this, a single isolated lesson today + 5 lessons in 3 months would be
+  // tagged as a "6-lesson continuous course" with a 12-week skip — admin sees
+  // "Plan recommended, starts today" but lesson 2 is months away. Not a usable
+  // course. Better to drop the isolated outlier and present the genuine 5-lesson
+  // run starting in 3 months.
+  function findBestSubRun(slotsAtKey) {
+    if (slotsAtKey.length === 0) return [];
+    const MAX_GAP_DAYS = 14;
+    const subRuns = [];
+    let current = [slotsAtKey[0]];
+    for (let i = 1; i < slotsAtKey.length; i++) {
+      const prevDate = new Date(slotsAtKey[i - 1].date);
+      const currDate = new Date(slotsAtKey[i].date);
+      const daysBetween = Math.round((currDate - prevDate) / (1000 * 60 * 60 * 24));
+      if (daysBetween > MAX_GAP_DAYS) {
+        // Break — start a new sub-run
+        subRuns.push(current);
+        current = [slotsAtKey[i]];
+      } else {
+        current.push(slotsAtKey[i]);
+      }
+    }
+    subRuns.push(current);
+    // Pick the longest sub-run; tie-break on earliest start
+    let best = subRuns[0];
+    for (const sr of subRuns) {
+      if (sr.length > best.length ||
+          (sr.length === best.length && sr[0].date < best[0].date)) {
+        best = sr;
+      }
+    }
+    return best;
+  }
+
+  // Find the best run across all (day, time) groupings. Largest unbroken sub-run
+  // wins; ties break on earliest start date.
   let bestRun = [];
   let bestRunStartDate = "9999-99-99";
   for (const [key, slotsAtKey] of runCandidates) {
     if (slotsAtKey.length === 0) continue;
-    // slotsAtKey is already chronological because eligible was sorted
-    const runSlots = slotsAtKey.slice(0, lessonCount);
+    const subRun = findBestSubRun(slotsAtKey);
+    const runSlots = subRun.slice(0, lessonCount);
     if (runSlots.length > bestRun.length ||
         (runSlots.length === bestRun.length && runSlots[0].date < bestRunStartDate)) {
       bestRun = runSlots;
@@ -2041,6 +2078,12 @@ function buildInstructorCoursePlan(instructorName, instructorPool, lessonCount) 
     runLength: bestRun.length,
     runDayName: bestRun.length > 0 ? bestRun[0].dayName : null,
     runStart: bestRun.length > 0 ? bestRun[0].suggestedStart : null,
+    // Set of "YYYY-MM-DD" strings — the dates that are actually part of the
+    // continuous run (not sporadic fill-ins). Used by the renderer to tag
+    // each lesson correctly. Without this, sporadic lessons that happen
+    // chronologically between run lessons get incorrectly labeled "Run X of Y"
+    // because position-based tagging assumes the first N entries are all run.
+    runDates: new Set(bestRun.map(s => s.date)),
     fitsAll,
     unfitCount,
     reasonNotAllFit,
@@ -2411,10 +2454,22 @@ Continuous lessons requested — same instructor across all bookings`;
           runText = `Run: no continuous block possible — ${plan.lessonsPlanned.length} sporadic lessons`;
         }
 
+        // Track run-position separately so sporadic lessons interleaved between
+        // run dates don't shift the run numbering. Walk the chronological plan,
+        // increment runIdx only when the lesson date is in the run's date set.
+        let runIdx = 0;
+        let sporadicIdx = 0;
         const lessonLines = plan.lessonsPlanned.map((s, i) => {
           const lessonNum = i + 1;
-          const isInRun = i < plan.runLength;
-          const tag = isInRun ? `Run ${lessonNum} of ${plan.runLength}` : `Sporadic`;
+          const isInRun = plan.runDates && plan.runDates.has(s.date);
+          let tag;
+          if (isInRun) {
+            runIdx += 1;
+            tag = `Run ${runIdx} of ${plan.runLength}`;
+          } else {
+            sporadicIdx += 1;
+            tag = `Sporadic ${sporadicIdx}`;
+          }
           const tierTag = s.tier === 1 ? "Tier 1"
             : s.tier === 2 ? "Tier 2"
             : s.tier === 3 && s.nearbyOnDay ? "Tier 3 area"
@@ -3271,7 +3326,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-29-realworld-polish-v6.3";
+const BUILD_ID = "2026-04-29-course-plan-fixes-v6.4";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -3334,7 +3389,9 @@ app.get("/health", (req, res) => {
       "always-show-availability-line",
       "course-plan-travel-quality-rebalanced",
       "far-out-start-date-warning",
-      "sherri-all-areas-flag"
+      "sherri-all-areas-flag",
+      "course-run-breaks-on-2week-gap",
+      "course-lesson-tagging-by-group-membership"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
