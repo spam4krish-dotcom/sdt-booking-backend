@@ -1369,35 +1369,82 @@ const TIME_BLOCKS = {
   "all-day": [480, 1050]
 };
 
+// Parses availability strings like:
+//   "Mon:mid-morning,Wed:afternoon"             — named blocks (legacy)
+//   "Mon:11:00-14:00,Wed:09:00-12:00"           — custom HH:MM-HH:MM windows
+//   "Mon:11:00-14:00,Mon:mid-morning"           — mix of both
+// Returns { Mon: [{start: 660, end: 840}], Wed: [{start: 540, end: 720}] }
+// where start/end are minutes-since-midnight.
+//
+// Normalising both formats to {start,end} ranges means downstream logic
+// doesn't need to care which way admin entered the data.
 function parseAvailability(availString) {
   if (!availString || typeof availString !== "string") return {};
   const result = {};
   availString.split(",").forEach(part => {
-    const [day, block] = part.trim().split(":");
-    if (!day || !block) return;
-    const dayKey = day.trim().slice(0, 3);
-    const blockKey = block.trim().toLowerCase();
-    if (!result[dayKey]) result[dayKey] = [];
-    result[dayKey].push(blockKey);
+    part = part.trim();
+    if (!part) return;
+    // The day prefix is everything before the FIRST colon. Custom time format
+    // contains its own colons (e.g. "Mon:11:00-14:00") so we can't just split
+    // on every ":".
+    const firstColon = part.indexOf(":");
+    if (firstColon === -1) return;
+    const dayKey = part.slice(0, firstColon).trim().slice(0, 3);
+    const rest = part.slice(firstColon + 1).trim();
+    if (!dayKey || !rest) return;
+
+    let range = null;
+
+    // Try custom HH:MM-HH:MM format first
+    const customMatch = rest.match(/^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/);
+    if (customMatch) {
+      const startM = parseInt(customMatch[1]) * 60 + parseInt(customMatch[2]);
+      const endM = parseInt(customMatch[3]) * 60 + parseInt(customMatch[4]);
+      if (endM > startM && startM >= 0 && endM <= 24 * 60) {
+        range = { start: startM, end: endM };
+      }
+    }
+
+    // Fall back to named block lookup
+    if (!range) {
+      const blockName = rest.toLowerCase();
+      const named = TIME_BLOCKS[blockName];
+      if (named) {
+        range = { start: named[0], end: named[1] };
+      }
+    }
+
+    if (range) {
+      if (!result[dayKey]) result[dayKey] = [];
+      result[dayKey].push(range);
+    }
   });
   return result;
 }
 
-// Does a time range [startTime, endTime] (HH:MM strings) overlap any of the
-// given block names (e.g. ["mid-morning", "late-afternoon"])? Used to filter
+// Format a {start, end} range as a human-readable label for display.
+// If the range matches a known named block, return the block name; otherwise
+// return "HH:MM-HH:MM". Used when surfacing the slot's matched window to admin.
+function matchBlockNameForRange(range) {
+  for (const [name, [s, e]] of Object.entries(TIME_BLOCKS)) {
+    if (s === range.start && e === range.end) return name;
+  }
+  // Custom range — format as HH:MM-HH:MM
+  const fmt = (m) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+  return `${fmt(range.start)}-${fmt(range.end)}`;
+}
+
+
 // clinic-hold alerts so we only surface holds that actually conflict with the
 // client's requested time windows — not noon holds when the client asked for
 // late afternoon only.
-function timeRangeOverlapsBlocks(startTime, endTime, blockNames) {
-  if (!blockNames || blockNames.length === 0) return true; // no preference = any time ok
+function timeRangeOverlapsBlocks(startTime, endTime, ranges) {
+  if (!ranges || ranges.length === 0) return true; // no preference = any time ok
   const startM = timeToMins(startTime.slice(0, 5));
   const endM = timeToMins(endTime.slice(0, 5));
-  for (const blockName of blockNames) {
-    const range = TIME_BLOCKS[blockName];
-    if (!range) continue;
-    const [bStart, bEnd] = range;
+  for (const r of ranges) {
     // overlap test: ranges [a,b] and [c,d] overlap iff a < d AND c < b
-    if (startM < bEnd && bStart < endM) return true;
+    if (startM < r.end && r.start < endM) return true;
   }
   return false;
 }
@@ -1424,12 +1471,16 @@ function smartTruncate(str, limit) {
 }
 
 // ─── Core matcher ────────────────────────────────────────────────────────────
-async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, weeksToScan = 17) {
+async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, weeksToScan = 17, deadlineDate = null) {
   const slots = [];
   const allClinicHolds = []; // [{date, dayName, startTime, endTime, label, clinic}]
   const now = new Date();
   const startDate = toMelbDateStr(now);
-  const endDate = toMelbDateStr(new Date(now.getTime() + weeksToScan * 7 * 24 * 3600 * 1000));
+  // Scan window ends at the earlier of: weeksToScan from now, OR the deadline.
+  // When NDIS funding has a hard expiry, no point looking past it — slots after
+  // the deadline can't actually be booked.
+  const defaultEndDate = toMelbDateStr(new Date(now.getTime() + weeksToScan * 7 * 24 * 3600 * 1000));
+  const endDate = deadlineDate && deadlineDate < defaultEndDate ? deadlineDate : defaultEndDate;
 
   // Extract client's suburb from the address for zone checks
   const clientSuburbName = extractSuburbFromLocation(clientSuburb) || clientSuburb;
@@ -1738,14 +1789,22 @@ async function findAvailableSlots(inst, clientSuburb, durationMins, availPref, w
 
       if (minStart > maxStart) continue;
 
-      const blocksToCheck = prefBlocks && prefBlocks.length > 0 ? prefBlocks : ["all-day"];
+      // Build the list of time-range constraints to fit. After parseAvailability's
+      // rewrite, `prefBlocks` is a list of {start, end} ranges (in minutes).
+      // Empty list = no constraint (treat as full working day).
+      const blocksToCheck = prefBlocks && prefBlocks.length > 0
+        ? prefBlocks
+        : [{ start: 480, end: 1050 }];
       let matchedBlock = null;
-      for (const blockName of blocksToCheck) {
-        const [blockStart, blockEnd] = TIME_BLOCKS[blockName] || [480, 1050];
-        const intersectStart = Math.max(minStart, blockStart);
-        const intersectMaxStart = Math.min(maxStart, blockEnd - durationMins);
+      for (const range of blocksToCheck) {
+        const intersectStart = Math.max(minStart, range.start);
+        const intersectMaxStart = Math.min(maxStart, range.end - durationMins);
         if (intersectStart <= intersectMaxStart) {
-          matchedBlock = { block: blockName, start: snapTo15(intersectStart) };
+          // Format the block label admin sees in the slot output:
+          //   12:00-14:00  ← when admin entered a custom range
+          //   mid-morning  ← when admin chose a named block (matched to standard windows)
+          const label = matchBlockNameForRange(range);
+          matchedBlock = { block: label, start: snapTo15(intersectStart), range };
           break;
         }
       }
@@ -1892,6 +1951,124 @@ function scoreSlot(slot) {
   return score;
 }
 
+// ─── Course plan builder ─────────────────────────────────────────────────────
+// Given an instructor's pool of slots (already gap-fitted by findAvailableSlots),
+// build the best multi-lesson course plan for them. Returns:
+//   {
+//     instructor: name,
+//     lessonsPlanned: array of slots (chronological),
+//     runLength: how many initial lessons share same dayName + suggestedStart,
+//     fitsAll: did we fit all N lessons,
+//     unfitCount: how many couldn't fit,
+//     reasonNotAllFit: human-readable explanation if unfitCount > 0
+//   }
+//
+// Strategy:
+// 1. Filter pool to Tier 1-3 only (Tier 4 is too punishing for course bookings —
+//    if the only fits are Tier 4 cross-town drives, the plan isn't realistic).
+// 2. Try each (dayName, suggestedStart) starting-pair as a candidate run anchor.
+//    The run is the maximal consecutive set of slots with that exact day+time,
+//    each spaced at least 3 days apart (handles week-skip if a date is blocked).
+// 3. The longest run wins. After the run, fill remaining lessons with the same
+//    instructor's other Tier 1-3 slots, in chronological order.
+// 4. Cap total lessons at lessonCount.
+function buildInstructorCoursePlan(instructorName, instructorPool, lessonCount) {
+  // Tier 1-3 only — Tier 4 stretches don't make sense for course continuity
+  const eligible = instructorPool
+    .filter(s => s.tier <= 3)
+    .sort((a, b) => a.date.localeCompare(b.date) || a.suggestedStart.localeCompare(b.suggestedStart));
+
+  if (eligible.length === 0) {
+    return {
+      instructor: instructorName,
+      lessonsPlanned: [],
+      runLength: 0,
+      fitsAll: false,
+      unfitCount: lessonCount,
+      reasonNotAllFit: `No Tier 1-3 slots available for ${instructorName} in scan window`
+    };
+  }
+
+  // Group slots by (dayName, suggestedStart) for run-anchor candidates
+  const runCandidates = new Map(); // "Tue|11:00" -> array of slots in that group
+  for (const s of eligible) {
+    const key = `${s.dayName}|${s.suggestedStart}`;
+    if (!runCandidates.has(key)) runCandidates.set(key, []);
+    runCandidates.get(key).push(s);
+  }
+
+  // Find the best run: maximises run length, breaks ties on earliest start date
+  let bestRun = [];
+  let bestRunStartDate = "9999-99-99";
+  for (const [key, slotsAtKey] of runCandidates) {
+    if (slotsAtKey.length === 0) continue;
+    // slotsAtKey is already chronological because eligible was sorted
+    const runSlots = slotsAtKey.slice(0, lessonCount);
+    if (runSlots.length > bestRun.length ||
+        (runSlots.length === bestRun.length && runSlots[0].date < bestRunStartDate)) {
+      bestRun = runSlots;
+      bestRunStartDate = runSlots[0].date;
+    }
+  }
+
+  // Build the final plan: run lessons first, then fill remaining slots
+  // chronologically with non-run slots, avoiding date overlap.
+  const planned = [...bestRun];
+  const usedDates = new Set(planned.map(s => s.date));
+
+  for (const s of eligible) {
+    if (planned.length >= lessonCount) break;
+    if (usedDates.has(s.date)) continue;
+    // Don't double up on dates — one lesson per date max
+    planned.push(s);
+    usedDates.add(s.date);
+  }
+
+  // Re-sort full plan chronologically for output
+  planned.sort((a, b) => a.date.localeCompare(b.date) || a.suggestedStart.localeCompare(b.suggestedStart));
+
+  const fitsAll = planned.length === lessonCount;
+  const unfitCount = lessonCount - planned.length;
+  let reasonNotAllFit = null;
+  if (!fitsAll) {
+    reasonNotAllFit = `Could only fit ${planned.length} of ${lessonCount} lessons within ${instructorName}'s diary and the scan window. Consider extending availability days/times, lowering lesson count, or extending funding deadline.`;
+  }
+
+  return {
+    instructor: instructorName,
+    lessonsPlanned: planned,
+    runLength: bestRun.length,
+    runDayName: bestRun.length > 0 ? bestRun[0].dayName : null,
+    runStart: bestRun.length > 0 ? bestRun[0].suggestedStart : null,
+    fitsAll,
+    unfitCount,
+    reasonNotAllFit,
+    earliestStartDate: planned.length > 0 ? planned[0].date : null
+  };
+}
+
+// Score a course plan for ranking. Higher = better. Priorities:
+//   1. Fits all N lessons (huge bonus)
+//   2. Length of continuous run (more = better)
+//   3. How soon they can start (earlier = better)
+//   4. Average travel quality (less = better)
+function scoreCoursePlan(plan, lessonCount) {
+  if (plan.lessonsPlanned.length === 0) return -100000;
+  let score = 0;
+  if (plan.fitsAll) score += 1000;
+  else score += plan.lessonsPlanned.length * 50; // partial credit per fitted lesson
+  score += plan.runLength * 30;
+  // Earliest start: 5 points per day-earlier-than-now is favored
+  const daysOut = plan.earliestStartDate
+    ? (new Date(plan.earliestStartDate) - new Date()) / (1000 * 60 * 60 * 24)
+    : 999;
+  score -= daysOut * 5;
+  // Average travel-in across the planned lessons (less = better)
+  const avgTravel = plan.lessonsPlanned.reduce((sum, s) => sum + s.travelIn, 0) / plan.lessonsPlanned.length;
+  score -= avgTravel * 0.5;
+  return score;
+}
+
 // ─── Analyse endpoint ────────────────────────────────────────────────────────
 app.post("/analyse", async (req, res) => {
   const debugLog = [];
@@ -1906,6 +2083,28 @@ app.post("/analyse", async (req, res) => {
     if (!Array.isArray(requiredMods)) requiredMods = [];
     const durationMins = parseInt(booking.lessonDuration || booking.duration || 60);
     const availString = booking.availability || "";
+
+    // ─── New: course plan inputs ───
+    // continuousLessons: when true, admin wants a multi-lesson course plan
+    //   with the same instructor, ideally same day-of-week + same time.
+    // lessonCount: total lessons funded (default 1 = single lesson booking).
+    // fundingDeadline: ISO date "YYYY-MM-DD" — caps the scan window so no slots
+    //   suggested past funding expiry. Optional.
+    const continuousLessons = booking.continuousLessons === true || booking.continuousLessons === "true";
+    let lessonCount = parseInt(booking.lessonCount || 1);
+    if (isNaN(lessonCount) || lessonCount < 1) lessonCount = 1;
+    if (lessonCount > 30) lessonCount = 30; // safety cap; 30+ lessons is a year of weekly
+    const fundingDeadline = (booking.fundingDeadline || "").trim() || null;
+    // Parse and validate deadline format YYYY-MM-DD
+    let deadlineDate = null;
+    if (fundingDeadline) {
+      if (/^\d{4}-\d{2}-\d{2}$/.test(fundingDeadline)) {
+        deadlineDate = fundingDeadline;
+      }
+    }
+    // For continuous courses, scan further ahead so multi-instructor plans have
+    // realistic windows to compare. Single-lesson scans stay at 17 weeks.
+    const weeksToScan = continuousLessons ? 26 : 17;
 
     if (!clientSuburb) {
       return res.status(400).json({ error: "Client suburb is required", errorType: "validation" });
@@ -1978,7 +2177,7 @@ app.post("/analyse", async (req, res) => {
     const fetchErrors = [];
     for (const inst of eligibleInstructors) {
       try {
-        const result = await findAvailableSlots(inst, clientSuburb, durationMins, availPref);
+        const result = await findAvailableSlots(inst, clientSuburb, durationMins, availPref, weeksToScan, deadlineDate);
         allSlots.push(...result.slots);
         if (result.adminAlerts?.length) {
           for (const alert of result.adminAlerts) {
@@ -2053,6 +2252,127 @@ Suggested actions for admin:
         _debug: debugLog
       });
     }
+
+    // ─── Course plan branch ───
+    // When admin wants a continuous course (e.g. "10 lessons same instructor"),
+    // skip the single-slot bucketing pipeline entirely and produce up to 3
+    // instructor course-plan options for admin to compare.
+    if (continuousLessons && lessonCount > 1) {
+      // Group all slots by instructor name
+      const slotsByInstructor = {};
+      for (const s of allSlots) {
+        if (!slotsByInstructor[s.instructor]) slotsByInstructor[s.instructor] = [];
+        slotsByInstructor[s.instructor].push(s);
+      }
+
+      // Build a course plan per instructor who has any slots
+      const allPlans = [];
+      for (const [instName, instSlots] of Object.entries(slotsByInstructor)) {
+        const plan = buildInstructorCoursePlan(instName, instSlots, lessonCount);
+        if (plan.lessonsPlanned.length > 0) {
+          allPlans.push(plan);
+        }
+      }
+
+      // Sort by score, take top 3
+      allPlans.sort((a, b) => scoreCoursePlan(b, lessonCount) - scoreCoursePlan(a, lessonCount));
+      const topPlans = allPlans.slice(0, 3);
+
+      // Build the rendered output
+      const clientName = booking.clientName || "(not specified)";
+      const sessionType = booking.sessionType || booking.serviceType || "";
+      const modsText = normalisedMods.length > 0 ? normalisedMods.join(", ") : "no mods required";
+      const deadlineText = deadlineDate
+        ? `\nFunding deadline: ${formatDate(deadlineDate)}` : "";
+      const sessionTypeText = sessionType ? `\nSession type: ${sessionType}` : "";
+
+      const clientSummary =
+`COURSE PLAN — ${clientName}
+${clientSuburb}  •  ${lessonCount} × ${durationMins}min lessons  •  ${modsText}
+Availability: ${availString || "(none specified)"}${deadlineText}${sessionTypeText}
+Continuous lessons requested — same instructor across all bookings`;
+
+      if (topPlans.length === 0) {
+        return res.json({
+          content: [{
+            type: "text",
+            text: `${clientSummary}\n\n⚠️ No instructor could fit any lessons of this course within the scan window and client's availability.\n\nNot offered:\n${excludedInstructors.map(ex => `- ${ex.name}: ${ex.reason}`).join("\n") || "(no eligible instructors)"}\n\nSuggested actions for admin:\n1. Broaden the client's availability windows\n2. Reduce the number of lessons in the course\n3. Extend the funding deadline (if applicable)`
+          }],
+          _debug: debugLog
+        });
+      }
+
+      // Render each plan
+      const planSections = topPlans.map((plan, idx) => {
+        const planLetter = String.fromCharCode(65 + idx); // A, B, C
+        const today = new Date();
+        const startDate = new Date(plan.earliestStartDate);
+        const daysFromNow = Math.round((startDate - today) / (1000 * 60 * 60 * 24));
+        const startInText = daysFromNow <= 0 ? "today"
+          : daysFromNow === 1 ? "tomorrow"
+          : daysFromNow < 14 ? `in ${daysFromNow} days`
+          : `in ${Math.round(daysFromNow / 7)} weeks`;
+
+        const fitText = plan.fitsAll
+          ? `All ${lessonCount} lessons fit ✓`
+          : `⚠️ Only ${plan.lessonsPlanned.length} of ${lessonCount} lessons fit`;
+        const runText = plan.runLength === lessonCount
+          ? `Run: fully continuous (${plan.runLength} of ${lessonCount} same ${plan.runDayName} ${plan.runStart}) ✓`
+          : plan.runLength > 1
+            ? `Run: ${plan.runLength} of ${lessonCount} same ${plan.runDayName} ${plan.runStart} • ${plan.lessonsPlanned.length - plan.runLength} sporadic`
+            : `Run: no continuous block possible — ${plan.lessonsPlanned.length} sporadic lessons`;
+
+        const lessonLines = plan.lessonsPlanned.map((s, i) => {
+          const lessonNum = i + 1;
+          const isInRun = i < plan.runLength;
+          const tag = isInRun ? `Run ${lessonNum} of ${plan.runLength}` : `Sporadic`;
+          const tierTag = s.tier === 1 ? "Tier 1"
+            : s.tier === 2 ? "Tier 2"
+            : s.tier === 3 && s.nearbyOnDay ? "Tier 3 area"
+            : "Tier 3 stretch";
+          const inKm = s.travelInKm !== null ? ` / ${s.travelInKm} km` : "";
+          let fromBit;
+          if (s.prevAppointmentKind === "lesson" && s.prevClientName) {
+            fromBit = `from ${s.prevClientName} lesson (${s.travelIn}min${inKm})`;
+          } else if (s.prevAppointmentKind === "clinic-hold") {
+            fromBit = `from ${stripEventPrefix(s.prevAppointmentLabel)} (${s.travelIn}min${inKm})`;
+          } else if (s.prevAppointmentKind === "private-hold") {
+            fromBit = `from ${stripEventPrefix(s.prevAppointmentLabel)} (~${s.travelIn}min${inKm} est.)`;
+          } else {
+            fromBit = `from ${s.base} base (${s.travelIn}min${inKm})`;
+          }
+          return `  Lesson ${lessonNum}: ${formatDate(s.date)} (${s.dayName}) at ${s.suggestedStart} [${tierTag}, ${tag}]\n    ${fromBit}`;
+        }).join("\n");
+
+        const unfitWarning = plan.reasonNotAllFit ? `\n\n  ⚠️ ${plan.reasonNotAllFit}` : "";
+
+        return `═══════════════════════════════════════════════════════════════
+PLAN ${planLetter} — ${plan.instructor}${idx === 0 ? "  (recommended)" : "  (alternative)"}
+Starts: ${formatDate(plan.earliestStartDate)} (${startInText})  •  ${fitText}
+${runText}
+
+${lessonLines}${unfitWarning}`;
+      }).join("\n\n");
+
+      // Not-offered list (instructors who couldn't make a plan at all)
+      const planInstructors = new Set(topPlans.map(p => p.instructor));
+      const notOfferedFromPlans = excludedInstructors.filter(ex => !planInstructors.has(ex.name));
+      const notOfferedText = notOfferedFromPlans.length > 0
+        ? `\n\nNot offered\n${notOfferedFromPlans.map(ex => `- ${ex.name}: ${ex.reason}`).join("\n")}`
+        : "";
+
+      // Log course plan summary
+      console.log(`[coursePlan] ${clientName} ${lessonCount}lessons in ${clientSuburb}: ${topPlans.map(p => `${p.instructor}(${p.lessonsPlanned.length}/${lessonCount},run=${p.runLength})`).join(' | ')}`);
+
+      return res.json({
+        content: [{
+          type: "text",
+          text: `${clientSummary}\n\n${planSections}${notOfferedText}`
+        }],
+        _debug: debugLog
+      });
+    }
+    // ─── End course plan branch ───
 
     // Split slots into two buckets before scoring/selection:
     //   Main: Tier 1, 2, 3 — these are the proper recommendations.
@@ -2569,9 +2889,16 @@ Suggested actions for admin:
     const clientName = booking.clientName || "(not specified)";
     const sessionType = booking.sessionType || booking.serviceType || "";
     const modsText = normalisedMods.length > 0 ? normalisedMods.join(", ") : "no mods required";
+    // Funding metadata banner — only shown when admin entered them. Provides
+    // context to admin without affecting scheduling logic for one-off bookings.
+    const fundingBits = [];
+    if (lessonCount > 1) fundingBits.push(`${lessonCount} lessons funded — book each as you go`);
+    if (deadlineDate) fundingBits.push(`Funding deadline ${formatDate(deadlineDate)}`);
+    const fundingLine = fundingBits.length > 0 ? `\nFunding: ${fundingBits.join(" • ")}` : "";
     const clientSummary =
       `CLIENT: ${clientName} • ${clientSuburb} • ${durationMins}min • ${modsText}\n` +
-      (sessionType ? `Session type: ${sessionType}\n` : "");
+      (sessionType ? `Session type: ${sessionType}\n` : "") +
+      (fundingLine ? fundingLine + "\n" : "");
 
     const systemPrompt = `You are the SDT Booking Assistant for Specialised Driver Training. You prepare a compact scannable summary for office staff to act on — NOT a narrative.
 
@@ -2843,7 +3170,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-27-show-unselected-instructors-v6.0";
+const BUILD_ID = "2026-04-27-custom-windows-deadline-course-plans-v6.1";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -2896,7 +3223,10 @@ app.get("/health", (req, res) => {
       "squeeze-detection-for-tight-schedules",
       "stronger-same-instructor-diversity-penalty",
       "all-areas-flag-active-for-christian-greg",
-      "show-unselected-eligible-instructors-in-not-offered"
+      "show-unselected-eligible-instructors-in-not-offered",
+      "custom-time-windows-hh-mm-ranges",
+      "funding-deadline-caps-scan-window",
+      "course-plan-mode-multi-instructor-options"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
@@ -3371,14 +3701,17 @@ app.get("/test-ics", async (req, res) => {
 //   mods=LFA,Electronic+Spinner
 app.get("/test", async (req, res) => {
   try {
-    const { name, suburb, mods, duration, availability } = req.query;
+    const { name, suburb, mods, duration, availability, lessons, continuous, deadline } = req.query;
 
     if (!suburb) {
       res.type("text/plain").send(
         "Usage: /test?name=<client>&suburb=<address>&mods=<mod1,mod2>&duration=<60|90>&availability=<Day:block,Day:block>\n\n" +
         "Example: /test?name=Jenna+Frost&suburb=14+Davey+Street,+Frankston+VIC+3199&mods=LFA&duration=60&availability=Wed:mid-morning\n\n" +
         "Day codes: Mon Tue Wed Thu Fri\n" +
-        "Block codes: early-morning mid-morning afternoon late-afternoon all-day"
+        "Block codes (legacy): early-morning mid-morning afternoon late-afternoon all-day\n" +
+        "Custom time windows: HH:MM-HH:MM (e.g. Wed:11:00-14:00)\n" +
+        "Multi-lesson course: &lessons=10&continuous=true\n" +
+        "Funding deadline: &deadline=2026-09-30"
       );
       return;
     }
@@ -3389,7 +3722,10 @@ app.get("/test", async (req, res) => {
       suburb: suburb,
       modifications: mods || "",
       duration: duration || "60",
-      availability: availability || ""
+      availability: availability || "",
+      lessonCount: lessons ? parseInt(lessons) : 1,
+      continuousLessons: continuous === "true" || continuous === "1",
+      fundingDeadline: deadline || ""
     };
 
     // Self-call /analyse via HTTP so we reuse its exact pipeline (no duplication).
