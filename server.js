@@ -133,8 +133,9 @@ const INSTRUCTORS = [
   {
     name: "Sherri", base: "Wandin North", locationID: 5, providerID: 38,
     mods: [],
+    allAreas: true,
     maxTravelFromBase: 50,
-    maxRadiusKm: 35,
+    maxRadiusKm: 50,
     coreZone: [
       "Wandin North", "Wandin", "Lilydale", "Chirnside Park", "Park Orchards",
       "Montrose", "Kilsyth", "Mooroolbark", "Croydon", "Rowville",
@@ -2048,24 +2049,36 @@ function buildInstructorCoursePlan(instructorName, instructorPool, lessonCount) 
 }
 
 // Score a course plan for ranking. Higher = better. Priorities:
-//   1. Fits all N lessons (huge bonus)
+//   1. Fits all N lessons (large bonus, but not so large that a long-haul
+//      fully-fitting plan beats a much shorter-travel partial-fit plan)
 //   2. Length of continuous run (more = better)
 //   3. How soon they can start (earlier = better)
-//   4. Average travel quality (less = better)
+//   4. Sustained travel quality (long drives across many lessons hurt a lot)
 function scoreCoursePlan(plan, lessonCount) {
   if (plan.lessonsPlanned.length === 0) return -100000;
   let score = 0;
-  if (plan.fitsAll) score += 1000;
-  else score += plan.lessonsPlanned.length * 50; // partial credit per fitted lesson
+  if (plan.fitsAll) score += 600;
+  else score += plan.lessonsPlanned.length * 60; // partial credit per fitted lesson
   score += plan.runLength * 30;
   // Earliest start: 5 points per day-earlier-than-now is favored
   const daysOut = plan.earliestStartDate
     ? (new Date(plan.earliestStartDate) - new Date()) / (1000 * 60 * 60 * 24)
     : 999;
   score -= daysOut * 5;
-  // Average travel-in across the planned lessons (less = better)
+
+  // Travel-in across the planned lessons. The "average × count" version
+  // (replaces the old "× 0.5") penalises plans that send the instructor on
+  // long drives every lesson. A 50km/45-min weekly course becomes a real
+  // quality-of-life burden over 10 weeks; the tool should prefer a slightly
+  // less-fitting closer plan.
+  //
+  // Penalty is 1.5 points per minute × number of lessons. So for 10 lessons
+  // averaging 50min travel → 750 point penalty. That outweighs the +600
+  // "fitsAll" bonus, putting a fully-fitting 50min-each plan BELOW a
+  // partial-fit 15min-each plan (which would only lose ~225 points).
   const avgTravel = plan.lessonsPlanned.reduce((sum, s) => sum + s.travelIn, 0) / plan.lessonsPlanned.length;
-  score -= avgTravel * 0.5;
+  score -= avgTravel * plan.lessonsPlanned.length * 1.5;
+
   return score;
 }
 
@@ -2311,6 +2324,20 @@ ${clientSuburb}  •  ${lessonCount} × ${durationMins}min lessons  •  ${modsT
 Availability: ${availString || "(none specified)"}${deadlineText}${sessionTypeText}
 Continuous lessons requested — same instructor across all bookings`;
 
+      // Detect when even the BEST plan starts a long way out — admin should know
+      // to manage client expectations or consider asking instructors to reshuffle.
+      // Threshold: 6 weeks. If even Plan A is more than 6 weeks out, surface a
+      // banner above all plans.
+      let farOutBanner = "";
+      if (topPlans.length > 0 && topPlans[0].earliestStartDate) {
+        const today = new Date();
+        const bestStart = new Date(topPlans[0].earliestStartDate);
+        const weeksOut = Math.round((bestStart - today) / (1000 * 60 * 60 * 24 * 7));
+        if (weeksOut >= 6) {
+          farOutBanner = `\n\n⚠️ Earliest plan starts in ${weeksOut} weeks — long wait for the client. Consider phoning the instructor about earlier availability, expanding the client's days/times, or breaking the course into smaller blocks.`;
+        }
+      }
+
       if (topPlans.length === 0) {
         return res.json({
           content: [{
@@ -2429,7 +2456,7 @@ ${lessonLines}${unfitWarning}`;
       return res.json({
         content: [{
           type: "text",
-          text: `${clientSummary}\n\n${planSections}${notOfferedText}`
+          text: `${clientSummary}${farOutBanner}\n\n${planSections}${notOfferedText}`
         }],
         _debug: debugLog
       });
@@ -3011,10 +3038,22 @@ If the user message has a "Note: Private-hold entries above..." footer, copy it 
 
 Admin-facing. Fast to scan. No filler. No client-facing language. No markdown formatting anywhere — no **bold**, no _italics_, no # headings. Use plain text with the exact line format from VERIFIED SLOTS. Your goal is to RENDER, not to WRITE.`;
 
+    // Detect when even the FIRST suggested slot is far out (>6 weeks). Same
+    // logic as the course-plan version — alert admin to consider reshuffling
+    // or expanding availability.
+    let farOutWarning = "";
+    if (toPresent.length > 0) {
+      const firstSlotDate = new Date(toPresent[0].date);
+      const weeksOut = Math.round((firstSlotDate - new Date()) / (1000 * 60 * 60 * 24 * 7));
+      if (weeksOut >= 6) {
+        farOutWarning = `⚠️ Earliest available slot is ${weeksOut} weeks away — long wait for the client. Consider phoning the instructor about earlier availability, or expanding the client's days/times.\n\n`;
+      }
+    }
+
     const userMessage = `${clientSummary}
 AVAILABILITY: ${availString || "not specified"}
 
-${addressWarning}VERIFIED SLOTS:
+${addressWarning}${farOutWarning}VERIFIED SLOTS:
 ${slotDescriptions}${privateHoldFooter}${notOfferedText}${adminAlertsText}`;
 
     const aiRes = await axios.post("https://api.anthropic.com/v1/messages", {
@@ -3232,7 +3271,7 @@ app.post("/debug-selected", async (req, res) => {
 
 // ─── Health check ────────────────────────────────────────────────────────────
 // BUILD_ID changes whenever significant updates ship so we can verify deploys
-const BUILD_ID = "2026-04-29-output-polish-v6.2";
+const BUILD_ID = "2026-04-29-realworld-polish-v6.3";
 const BUILD_STARTED = new Date().toISOString();
 
 app.get("/health", (req, res) => {
@@ -3292,7 +3331,10 @@ app.get("/health", (req, res) => {
       "course-plan-warn-when-run-skips-weeks",
       "course-plan-duration-summary",
       "deadline-aware-no-slots-message",
-      "always-show-availability-line"
+      "always-show-availability-line",
+      "course-plan-travel-quality-rebalanced",
+      "far-out-start-date-warning",
+      "sherri-all-areas-flag"
     ],
     cacheSize: {
       clientAddresses: Object.keys(clientAddressCache).length,
